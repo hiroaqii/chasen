@@ -8,6 +8,9 @@ pub const surface = @import("surface.zig");
 pub const Surface = surface.Surface;
 pub const Column = surface.Column;
 
+pub const ctx = @import("ctx.zig");
+pub const Ctx = ctx.Ctx;
+
 test {
     std.testing.refAllDecls(@This());
 }
