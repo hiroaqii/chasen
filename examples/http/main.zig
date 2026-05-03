@@ -137,7 +137,7 @@ const HttpDemo = struct {
         quit,
     };
 
-    pub fn update(self: *HttpDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) void {
+    pub fn update(self: *HttpDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .fetch => switch (self.state) {
                 .loading => {},
@@ -239,7 +239,7 @@ const HttpDemo = struct {
         return .{ .got_response = display };
     }
 
-    pub fn view(self: *const HttpDemo, sfc: *chasen.Surface) void {
+    pub fn view(self: *const HttpDemo, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
         col.text("HTTP Demo", .{ .bold = true });
 

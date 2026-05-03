@@ -10,7 +10,7 @@ const Counter = struct {
         quit,
     };
 
-    pub fn update(self: *Counter, msg: Msg, ctx: *chasen.Ctx(Msg)) void {
+    pub fn update(self: *Counter, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .increment => self.count += 1,
             .decrement => self.count -= 1,
@@ -18,10 +18,10 @@ const Counter = struct {
         }
     }
 
-    pub fn view(self: *const Counter, sfc: *chasen.Surface) void {
+    pub fn view(self: *const Counter, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
         col.text("Counter Example", .{ .bold = true });
-        col.textf("Count: {d}", .{self.count});
+        try col.textf("Count: {d}", .{self.count});
         col.text("Press +/- to change, q to quit", .{ .fg = .gray });
     }
 

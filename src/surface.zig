@@ -44,8 +44,9 @@ pub const Column = struct {
     }
 
     /// Format and print text using the default style.
-    pub fn textf(self: *Column, comptime fmt: []const u8, args: anytype) void {
-        const str = std.fmt.allocPrint(self.arena, fmt, args) catch return;
+    /// Returns an error if formatting allocation fails.
+    pub fn textf(self: *Column, comptime fmt: []const u8, args: anytype) !void {
+        const str = try std.fmt.allocPrint(self.arena, fmt, args);
         self.text(str, .{});
     }
 };

@@ -119,7 +119,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     }
 
     if (@hasDecl(App, "init")) {
-        app.init(&app_ctx);
+        try app.init(&app_ctx);
         // Process tasks, ticks, and everys spawned during init
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
@@ -137,7 +137,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         switch (event) {
             .key_press => |key| {
                 if (App.handleKey(key)) |msg| {
-                    app.update(msg, &app_ctx);
+                    try app.update(msg, &app_ctx);
                     needs_render = true;
                 }
             },
@@ -146,7 +146,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 needs_render = true;
             },
             .user_msg => |msg| {
-                app.update(msg, &app_ctx);
+                try app.update(msg, &app_ctx);
                 needs_render = true;
             },
             .mouse => {},
@@ -245,7 +245,7 @@ fn render(
         .window = win,
         .arena = frame_arena.allocator(),
     };
-    app.view(&sfc);
+    try app.view(&sfc);
     try vx.render(writer);
 }
 

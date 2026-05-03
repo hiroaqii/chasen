@@ -24,12 +24,12 @@ const Stopwatch = struct {
         quit,
     };
 
-    pub fn init(self: *Stopwatch, ctx: *chasen.Ctx(Msg)) void {
+    pub fn init(self: *Stopwatch, ctx: *chasen.Ctx(Msg)) !void {
         _ = self;
         ctx.every(refresh_interval_ns, .tick);
     }
 
-    pub fn update(self: *Stopwatch, msg: Msg, ctx: *chasen.Ctx(Msg)) void {
+    pub fn update(self: *Stopwatch, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .tick => if (self.running) {
                 const now = ctx.now().nanoseconds;
@@ -56,7 +56,7 @@ const Stopwatch = struct {
         }
     }
 
-    pub fn view(self: *const Stopwatch, sfc: *chasen.Surface) void {
+    pub fn view(self: *const Stopwatch, sfc: *chasen.Surface) !void {
         const total_ms: u64 = @intCast(@divFloor(self.display_ns, 1_000_000));
         const minutes = total_ms / 60_000;
         const seconds = (total_ms / 1_000) % 60;
@@ -64,7 +64,7 @@ const Stopwatch = struct {
 
         var col = sfc.column(.{ .gap = 1 });
         col.text("Stopwatch", .{ .bold = true });
-        col.textf("{d:0>2}:{d:0>2}.{d:0>3}", .{ minutes, seconds, millis });
+        try col.textf("{d:0>2}:{d:0>2}.{d:0>3}", .{ minutes, seconds, millis });
 
         const status: []const u8 = if (self.running) "Running" else "Stopped";
         col.text(status, .{ .fg = .gray });
