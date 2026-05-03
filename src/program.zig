@@ -34,6 +34,22 @@ fn SpawnHelper(comptime Msg: type) type {
     };
 }
 
+/// Sleeps for `after_ns` then posts `msg` once.
+fn TickHelper(comptime Msg: type) type {
+    const Event = InternalEvent(Msg);
+    return struct {
+        fn run(
+            after_ns: u64,
+            msg: Msg,
+            tick_io: std.Io,
+            loop_ptr: *vaxis.Loop(Event),
+        ) void {
+            tick_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
+            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+        }
+    };
+}
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -79,8 +95,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
     if (@hasDecl(App, "init")) {
         app.init(&app_ctx);
-        // Process tasks spawned during init
+        // Process tasks and ticks spawned during init
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
     }
 
     // Initial render
@@ -111,8 +128,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             .focus_out => {},
         }
 
-        // Process tasks spawned during update
+        // Process tasks and ticks spawned during update
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
 
         if (needs_render) {
             try render(App, &vx, &frame_arena, &app, tty.writer());
@@ -140,6 +158,28 @@ fn spawnPendingTasks(
         };
     }
     app_ctx.pending_tasks_len = 0;
+}
+
+/// Starts tick timers queued in Ctx and tracks their futures for shutdown.
+fn spawnPendingTicks(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+) !void {
+    for (app_ctx.pendingTickSlice()) |entry| {
+        var future = io.concurrent(
+            TickHelper(Msg).run,
+            .{ entry.after_ns, entry.msg, io, loop },
+        ) catch continue;
+        pending_futures.append(allocator, future) catch {
+            _ = future.cancel(io);
+            continue;
+        };
+    }
+    app_ctx.pending_ticks_len = 0;
 }
 
 fn render(
