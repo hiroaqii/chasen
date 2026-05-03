@@ -1,4 +1,5 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 
 pub const style = @import("style.zig");
 pub const TextStyle = style.TextStyle;
@@ -11,18 +12,42 @@ pub const Column = surface.Column;
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
 
-/// Run the application.
+const program = @import("program.zig");
+
+/// Keyboard input type (re-exported from libvaxis).
+pub const Key = vaxis.Key;
+
+/// Options for the low-level `runWith` entry point.
+pub const RunOptions = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+};
+
+/// Run the application (Juicy Main API).
 ///
-/// `app` must satisfy the App contract:
-///   - `pub const Msg: type` — message union
-///   - `pub fn update(*Self, Msg, *Ctx(Msg)) void`
-///   - `pub fn view(*const Self, *Surface) void`
-///   - `pub fn handleKey(Key) ?Msg`
-pub fn run(allocator: std.mem.Allocator, io: std.Io, app: anytype) !void {
+/// Usage:
+/// ```
+/// pub fn main(init: std.process.Init) !void {
+///     try chasen.run(init, Counter{});
+/// }
+/// ```
+pub fn run(init: std.process.Init, app: anytype) !void {
+    return runWith(.{
+        .allocator = init.gpa,
+        .io = init.io,
+        .env_map = init.environ_map,
+    }, app);
+}
+
+/// Run the application with explicit options.
+///
+/// Use this when you need a custom allocator, Io, or Environ.Map
+/// (e.g. tests, custom `Io.Threaded` setup).
+pub fn runWith(opts: RunOptions, app: anytype) !void {
     const App = @TypeOf(app);
     comptime validateApp(App);
-    _ = allocator;
-    _ = io;
+    try program.run(App, opts, app);
 }
 
 fn validateApp(comptime App: type) void {
@@ -42,4 +67,5 @@ fn validateApp(comptime App: type) void {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("program.zig");
 }
