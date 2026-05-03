@@ -136,22 +136,41 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
         switch (event) {
             .key_press => |key| {
-                if (App.handleKey(key)) |msg| {
+                if (app.handleEvent(.{ .key_press = key })) |msg| {
                     try app.update(msg, &app_ctx);
                     needs_render = true;
                 }
             },
             .winsize => |ws| {
+                // Keep the vaxis screen in sync first, then let the app react to resize.
                 try vx.resize(allocator, tty.writer(), ws);
+                if (app.handleEvent(.{ .winsize = ws })) |msg| {
+                    try app.update(msg, &app_ctx);
+                }
                 needs_render = true;
             },
             .user_msg => |msg| {
                 try app.update(msg, &app_ctx);
                 needs_render = true;
             },
-            .mouse => {},
-            .focus_in => {},
-            .focus_out => {},
+            .mouse => |m| {
+                if (app.handleEvent(.{ .mouse = m })) |msg| {
+                    try app.update(msg, &app_ctx);
+                    needs_render = true;
+                }
+            },
+            .focus_in => {
+                if (app.handleEvent(.focus_in)) |msg| {
+                    try app.update(msg, &app_ctx);
+                    needs_render = true;
+                }
+            },
+            .focus_out => {
+                if (app.handleEvent(.focus_out)) |msg| {
+                    try app.update(msg, &app_ctx);
+                    needs_render = true;
+                }
+            },
         }
 
         // Process tasks, ticks, and everys spawned during update

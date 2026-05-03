@@ -71,11 +71,15 @@ const Stopwatch = struct {
         col.text("space: start/stop  r: reset  q: quit", .{ .dim = true });
     }
 
-    pub fn handleKey(key: chasen.Key) ?Msg {
-        return switch (key.codepoint) {
-            ' ' => .toggle,
-            'r' => .reset,
-            'q' => .quit,
+    pub fn handleEvent(self: *const Stopwatch, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .toggle,
+                'r' => .reset,
+                'q' => .quit,
+                else => null,
+            },
             else => null,
         };
     }

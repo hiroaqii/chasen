@@ -263,10 +263,14 @@ const HttpDemo = struct {
         col.text("space: fetch  q: quit", .{ .dim = true });
     }
 
-    pub fn handleKey(key: chasen.Key) ?Msg {
-        return switch (key.codepoint) {
-            ' ' => .fetch,
-            'q' => .quit,
+    pub fn handleEvent(self: *const HttpDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .fetch,
+                'q' => .quit,
+                else => null,
+            },
             else => null,
         };
     }

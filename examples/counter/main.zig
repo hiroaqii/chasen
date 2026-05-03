@@ -25,11 +25,15 @@ const Counter = struct {
         col.text("Press +/- to change, q to quit", .{ .fg = .gray });
     }
 
-    pub fn handleKey(key: chasen.Key) ?Msg {
-        return switch (key.codepoint) {
-            '+', '=' => .increment,
-            '-' => .decrement,
-            'q' => .quit,
+    pub fn handleEvent(self: *const Counter, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                '+', '=' => .increment,
+                '-' => .decrement,
+                'q' => .quit,
+                else => null,
+            },
             else => null,
         };
     }

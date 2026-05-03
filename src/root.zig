@@ -20,6 +20,17 @@ const program = @import("program.zig");
 /// Keyboard input type (re-exported from libvaxis).
 pub const Key = vaxis.Key;
 
+/// Terminal event type passed to `handleEvent`.
+pub const Event = union(enum) {
+    key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
+    winsize: vaxis.Winsize,
+    /// Bracketed paste content. Only valid during the current event dispatch.
+    paste: []const u8,
+    focus_in,
+    focus_out,
+};
+
 /// Options for the low-level `runWith` entry point.
 pub const RunOptions = struct {
     allocator: std.mem.Allocator,
@@ -63,8 +74,8 @@ fn validateApp(comptime App: type) void {
     if (!@hasDecl(App, "view")) {
         @compileError("App must declare `pub fn view`");
     }
-    if (!@hasDecl(App, "handleKey")) {
-        @compileError("App must declare `pub fn handleKey`");
+    if (!@hasDecl(App, "handleEvent")) {
+        @compileError("App must declare `pub fn handleEvent`");
     }
 }
 
