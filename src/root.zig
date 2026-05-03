@@ -12,6 +12,9 @@ pub const Column = surface.Column;
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
 
+pub const cmd = @import("cmd.zig");
+pub const Cmd = cmd.Cmd;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).
