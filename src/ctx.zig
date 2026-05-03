@@ -21,8 +21,9 @@ pub fn Ctx(comptime Msg: type) type {
             msg: Msg,
         };
 
-        // Private runtime handle used by Ctx methods such as now().
+        // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
+        _allocator: std.mem.Allocator = undefined,
         should_quit: bool = false,
         pending_tasks: [max_tasks]TaskFn = undefined,
         pending_tasks_len: u8 = 0,
@@ -39,9 +40,9 @@ pub fn Ctx(comptime Msg: type) type {
         /// Spawn an async task. The task function will be called concurrently
         /// and its return value delivered as a message to `update`.
         /// The task is queued here and started by the runtime after `update` returns.
-        pub fn spawn(self: *@This(), task: TaskFn) void {
-            std.debug.assert(self.pending_tasks_len < max_tasks);
-            if (self.pending_tasks_len >= max_tasks) return;
+        /// Returns `error.TaskLimitExceeded` if the pending task queue is full.
+        pub fn spawn(self: *@This(), task: TaskFn) error{TaskLimitExceeded}!void {
+            if (self.pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
             self.pending_tasks[self.pending_tasks_len] = task;
             self.pending_tasks_len += 1;
         }
@@ -53,9 +54,9 @@ pub fn Ctx(comptime Msg: type) type {
 
         /// Schedule a one-shot delayed message.
         /// The message will be delivered once after `after_ns` nanoseconds.
-        pub fn tick(self: *@This(), after_ns: u64, msg: Msg) void {
-            std.debug.assert(self.pending_ticks_len < max_ticks);
-            if (self.pending_ticks_len >= max_ticks) return;
+        /// Returns `error.TimerLimitExceeded` if the pending timer queue is full.
+        pub fn tick(self: *@This(), after_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+            if (self.pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
             self.pending_ticks[self.pending_ticks_len] = .{ .after_ns = after_ns, .msg = msg };
             self.pending_ticks_len += 1;
         }
@@ -70,9 +71,9 @@ pub fn Ctx(comptime Msg: type) type {
         /// until the future is cancelled.
         /// Each call starts a new repeating timer; call this from `init` or guard it
         /// so repeated `update` calls do not create duplicate timers.
-        pub fn every(self: *@This(), interval_ns: u64, msg: Msg) void {
-            std.debug.assert(self.pending_everys_len < max_everys);
-            if (self.pending_everys_len >= max_everys) return;
+        /// Returns `error.TimerLimitExceeded` if the pending timer queue is full.
+        pub fn every(self: *@This(), interval_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+            if (self.pending_everys_len >= max_everys) return error.TimerLimitExceeded;
             self.pending_everys[self.pending_everys_len] = .{ .interval_ns = interval_ns, .msg = msg };
             self.pending_everys_len += 1;
         }
@@ -80,6 +81,16 @@ pub fn Ctx(comptime Msg: type) type {
         /// Return the current monotonic timestamp.
         pub fn now(self: *const @This()) std.Io.Timestamp {
             return std.Io.Clock.now(.awake, self._io);
+        }
+
+        /// Return the program-level allocator.
+        pub fn allocator(self: *const @This()) std.mem.Allocator {
+            return self._allocator;
+        }
+
+        /// Return the runtime I/O handle.
+        pub fn io(self: *const @This()) std.Io {
+            return self._io;
         }
 
         /// Return a slice of pending every entries.
@@ -99,24 +110,38 @@ test "Ctx spawn accumulates tasks" {
         }
     }.run;
 
-    ctx_val.spawn(task1);
+    try ctx_val.spawn(task1);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
 
-    ctx_val.spawn(task1);
+    try ctx_val.spawn(task1);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_len);
 
     const slice = ctx_val.pendingSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
 }
 
+test "Ctx spawn returns error when task queue is full" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const task = &struct {
+        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+            return .hello;
+        }
+    }.run;
+
+    for (0..16) |_| try ctx_val.spawn(task);
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawn(task));
+}
+
 test "Ctx tick accumulates entries" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    ctx_val.tick(1_000_000_000, .timeout);
+    try ctx_val.tick(1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
 
-    ctx_val.tick(500_000_000, .ping);
+    try ctx_val.tick(500_000_000, .ping);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_ticks_len);
 
     const slice = ctx_val.pendingTickSlice();
@@ -127,14 +152,22 @@ test "Ctx tick accumulates entries" {
     try std.testing.expect(slice[1].msg == .ping);
 }
 
+test "Ctx tick returns error when timer queue is full" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    for (0..8) |_| try ctx_val.tick(1_000_000_000, .timeout);
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.tick(1_000_000_000, .timeout));
+}
+
 test "Ctx every accumulates entries" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    ctx_val.every(1_000_000_000, .tick_msg);
+    try ctx_val.every(1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    ctx_val.every(500_000_000, .heartbeat);
+    try ctx_val.every(500_000_000, .heartbeat);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_everys_len);
 
     const slice = ctx_val.pendingEverySlice();
@@ -143,4 +176,12 @@ test "Ctx every accumulates entries" {
     try std.testing.expect(slice[0].msg == .tick_msg);
     try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].interval_ns);
     try std.testing.expect(slice[1].msg == .heartbeat);
+}
+
+test "Ctx every returns error when timer queue is full" {
+    const TestMsg = union(enum) { tick_msg };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    for (0..8) |_| try ctx_val.every(1_000_000_000, .tick_msg);
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.every(1_000_000_000, .tick_msg));
 }

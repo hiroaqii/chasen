@@ -103,7 +103,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var app = initial_app;
     // Ctx keeps Io privately so user code can call ctx.now() without receiving
     // direct access to the runtime Io handle.
-    var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io };
+    var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
 
     // --- Pending futures (for spawned async tasks) ---
     // Completed one-shot futures (spawn/tick) remain in this list until
