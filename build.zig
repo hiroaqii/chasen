@@ -131,6 +131,26 @@ pub fn build(b: *std.Build) void {
     const run_counter_step = b.step("run-counter", "Run the counter example");
     run_counter_step.dependOn(&run_counter.step);
 
+    // --- examples/stopwatch ---
+    const stopwatch_exe = b.addExecutable(.{
+        .name = "stopwatch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/stopwatch/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen", .module = mod },
+            },
+        }),
+    });
+
+    const check_stopwatch = b.step("check-stopwatch", "Build the stopwatch example");
+    check_stopwatch.dependOn(&stopwatch_exe.step);
+
+    const run_stopwatch = b.addRunArtifact(stopwatch_exe);
+    const run_stopwatch_step = b.step("run-stopwatch", "Run the stopwatch example");
+    run_stopwatch_step.dependOn(&run_stopwatch.step);
+
     const io_threaded_check = b.addExecutable(.{
         .name = "io-threaded-check",
         .root_module = b.createModule(.{
