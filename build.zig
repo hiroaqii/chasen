@@ -151,6 +151,26 @@ pub fn build(b: *std.Build) void {
     const run_stopwatch_step = b.step("run-stopwatch", "Run the stopwatch example");
     run_stopwatch_step.dependOn(&run_stopwatch.step);
 
+    // --- examples/http ---
+    const http_exe = b.addExecutable(.{
+        .name = "http",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen", .module = mod },
+            },
+        }),
+    });
+
+    const check_http = b.step("check-http", "Build the http example");
+    check_http.dependOn(&http_exe.step);
+
+    const run_http = b.addRunArtifact(http_exe);
+    const run_http_step = b.step("run-http", "Run the http example");
+    run_http_step.dependOn(&run_http.step);
+
     const io_threaded_check = b.addExecutable(.{
         .name = "io-threaded-check",
         .root_module = b.createModule(.{

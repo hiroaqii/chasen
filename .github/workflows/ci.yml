@@ -32,3 +32,6 @@ jobs:
 
       - name: Check stopwatch example
         run: zig build check-stopwatch
+
+      - name: Check HTTP example
+        run: zig build check-http
