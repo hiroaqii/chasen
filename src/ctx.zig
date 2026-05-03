@@ -21,6 +21,8 @@ pub fn Ctx(comptime Msg: type) type {
             msg: Msg,
         };
 
+        // Private runtime handle used by Ctx methods such as now().
+        _io: std.Io = undefined,
         should_quit: bool = false,
         pending_tasks: [max_tasks]TaskFn = undefined,
         pending_tasks_len: u8 = 0,
@@ -73,6 +75,11 @@ pub fn Ctx(comptime Msg: type) type {
             if (self.pending_everys_len >= max_everys) return;
             self.pending_everys[self.pending_everys_len] = .{ .interval_ns = interval_ns, .msg = msg };
             self.pending_everys_len += 1;
+        }
+
+        /// Return the current monotonic timestamp.
+        pub fn now(self: *const @This()) std.Io.Timestamp {
+            return std.Io.Clock.now(.awake, self._io);
         }
 
         /// Return a slice of pending every entries.
