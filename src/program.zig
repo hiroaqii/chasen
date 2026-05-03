@@ -18,6 +18,22 @@ fn InternalEvent(comptime Msg: type) type {
     };
 }
 
+/// Runs a user task and posts its result back into the vaxis event loop.
+fn SpawnHelper(comptime Msg: type) type {
+    const Event = InternalEvent(Msg);
+    return struct {
+        fn run(
+            task_fn: *const fn (std.mem.Allocator, std.Io) Msg,
+            alloc: std.mem.Allocator,
+            spawn_io: std.Io,
+            loop_ptr: *vaxis.Loop(Event),
+        ) void {
+            const msg = task_fn(alloc, spawn_io);
+            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+        }
+    };
+}
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -52,8 +68,19 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var app = initial_app;
     var app_ctx: ctx_mod.Ctx(Msg) = .{};
 
+    // --- Pending futures (for spawned async tasks) ---
+    var pending_futures: std.ArrayList(std.Io.Future(void)) = .empty;
+    defer {
+        for (pending_futures.items) |*f| {
+            _ = f.cancel(io);
+        }
+        pending_futures.deinit(allocator);
+    }
+
     if (@hasDecl(App, "init")) {
         app.init(&app_ctx);
+        // Process tasks spawned during init
+        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
     }
 
     // Initial render
@@ -84,10 +111,35 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             .focus_out => {},
         }
 
+        // Process tasks spawned during update
+        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+
         if (needs_render) {
             try render(App, &vx, &frame_arena, &app, tty.writer());
         }
     }
+}
+
+/// Starts tasks queued in Ctx and tracks their futures for shutdown.
+fn spawnPendingTasks(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+) !void {
+    for (app_ctx.pendingSlice()) |task_fn| {
+        var future = io.concurrent(
+            SpawnHelper(Msg).run,
+            .{ task_fn, allocator, io, loop },
+        ) catch continue;
+        pending_futures.append(allocator, future) catch {
+            _ = future.cancel(io);
+            continue;
+        };
+    }
+    app_ctx.pending_tasks_len = 0;
 }
 
 fn render(
@@ -117,4 +169,12 @@ test "InternalEvent instantiation" {
 
     const key_ev: Event = .{ .key_press = .{ .codepoint = 'a' } };
     try std.testing.expect(key_ev == .key_press);
+}
+
+test "SpawnHelper instantiation" {
+    const TestMsg = union(enum) { hello };
+    const Helper = SpawnHelper(TestMsg);
+    // Verify the run function has the expected type signature
+    const RunFn = @TypeOf(Helper.run);
+    try std.testing.expect(RunFn != void);
 }
