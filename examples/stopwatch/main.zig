@@ -26,7 +26,7 @@ const Stopwatch = struct {
 
     pub fn init(self: *Stopwatch, ctx: *chasen.Ctx(Msg)) !void {
         _ = self;
-        try ctx.every(refresh_interval_ns, .tick);
+        try ctx.every("refresh", refresh_interval_ns, .tick);
     }
 
     pub fn update(self: *Stopwatch, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {

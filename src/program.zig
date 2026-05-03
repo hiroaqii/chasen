@@ -69,6 +69,12 @@ fn EveryHelper(comptime Msg: type) type {
     };
 }
 
+/// A running timer tracked by id so it can be cancelled.
+const TimerHandle = struct {
+    id: []const u8,
+    future: std.Io.Future(void),
+};
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -118,12 +124,22 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         pending_futures.deinit(allocator);
     }
 
+    // --- Running timers (id-tracked for cancel support) ---
+    var running_timers: std.ArrayList(TimerHandle) = .empty;
+    defer {
+        for (running_timers.items) |*h| {
+            _ = h.future.cancel(io);
+        }
+        running_timers.deinit(allocator);
+    }
+
     if (@hasDecl(App, "init")) {
         try app.init(&app_ctx);
         // Process tasks, ticks, and everys spawned during init
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingEvery(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        processPendingCancels(Msg, &app_ctx, &running_timers, io);
     }
 
     // Initial render
@@ -175,8 +191,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
         // Process tasks, ticks, and everys spawned during update
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingEvery(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        processPendingCancels(Msg, &app_ctx, &running_timers, io);
 
         if (needs_render) {
             try render(App, &vx, &frame_arena, &app, tty.writer());
@@ -207,20 +224,24 @@ fn spawnPendingTasks(
 }
 
 /// Starts tick timers queued in Ctx and tracks their futures for shutdown.
+/// If a running timer with the same id exists, it is cancelled first.
 fn spawnPendingTicks(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
-    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    running_timers: *std.ArrayList(TimerHandle),
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
 ) !void {
     for (app_ctx.pendingTickSlice()) |entry| {
+        // Cancel existing timer with the same id.
+        cancelRunningTimer(running_timers, entry.id, io);
+
         var future = io.concurrent(
             TickHelper(Msg).run,
             .{ entry.after_ns, entry.msg, io, loop },
         ) catch continue;
-        pending_futures.append(allocator, future) catch {
+        running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
             continue;
         };
@@ -229,25 +250,55 @@ fn spawnPendingTicks(
 }
 
 /// Starts repeating timers queued in Ctx and tracks their futures for shutdown.
+/// If a running timer with the same id exists, it is cancelled first.
 fn spawnPendingEvery(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
-    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    running_timers: *std.ArrayList(TimerHandle),
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
 ) !void {
     for (app_ctx.pendingEverySlice()) |entry| {
+        // Cancel existing timer with the same id.
+        cancelRunningTimer(running_timers, entry.id, io);
+
         var future = io.concurrent(
             EveryHelper(Msg).run,
             .{ entry.interval_ns, entry.msg, io, loop },
         ) catch continue;
-        pending_futures.append(allocator, future) catch {
+        running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
             continue;
         };
     }
     app_ctx.pending_everys_len = 0;
+}
+
+/// Cancel a running timer by id (swap-remove).
+fn cancelRunningTimer(running_timers: *std.ArrayList(TimerHandle), id: []const u8, io: std.Io) void {
+    var i: usize = 0;
+    while (i < running_timers.items.len) {
+        if (std.mem.eql(u8, running_timers.items[i].id, id)) {
+            _ = running_timers.items[i].future.cancel(io);
+            _ = running_timers.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Process pending cancel requests from Ctx.
+fn processPendingCancels(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    running_timers: *std.ArrayList(TimerHandle),
+    io: std.Io,
+) void {
+    for (app_ctx.pendingCancelSlice()) |id| {
+        cancelRunningTimer(running_timers, id, io);
+    }
+    app_ctx.pending_cancels_len = 0;
 }
 
 fn render(
