@@ -111,6 +111,26 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // --- examples/counter ---
+    const counter_exe = b.addExecutable(.{
+        .name = "counter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/counter/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen", .module = mod },
+            },
+        }),
+    });
+
+    const check_counter = b.step("check-counter", "Build the counter example");
+    check_counter.dependOn(&counter_exe.step);
+
+    const run_counter = b.addRunArtifact(counter_exe);
+    const run_counter_step = b.step("run-counter", "Run the counter example");
+    run_counter_step.dependOn(&run_counter.step);
+
     const io_threaded_check = b.addExecutable(.{
         .name = "io-threaded-check",
         .root_module = b.createModule(.{
