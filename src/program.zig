@@ -50,6 +50,25 @@ fn TickHelper(comptime Msg: type) type {
     };
 }
 
+/// Repeating timer: sleeps for `interval_ns`, posts `msg`, and loops forever.
+/// Stops when the future is cancelled (sleep returns error).
+fn EveryHelper(comptime Msg: type) type {
+    const Event = InternalEvent(Msg);
+    return struct {
+        fn run(
+            interval_ns: u64,
+            msg: Msg,
+            every_io: std.Io,
+            loop_ptr: *vaxis.Loop(Event),
+        ) void {
+            while (true) {
+                every_io.sleep(.fromNanoseconds(@intCast(interval_ns)), .awake) catch return;
+                loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+            }
+        }
+    };
+}
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -95,9 +114,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
     if (@hasDecl(App, "init")) {
         app.init(&app_ctx);
-        // Process tasks and ticks spawned during init
+        // Process tasks, ticks, and everys spawned during init
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingEvery(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
     }
 
     // Initial render
@@ -128,9 +148,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             .focus_out => {},
         }
 
-        // Process tasks and ticks spawned during update
+        // Process tasks, ticks, and everys spawned during update
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingEvery(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
 
         if (needs_render) {
             try render(App, &vx, &frame_arena, &app, tty.writer());
@@ -180,6 +201,28 @@ fn spawnPendingTicks(
         };
     }
     app_ctx.pending_ticks_len = 0;
+}
+
+/// Starts repeating timers queued in Ctx and tracks their futures for shutdown.
+fn spawnPendingEvery(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+) !void {
+    for (app_ctx.pendingEverySlice()) |entry| {
+        var future = io.concurrent(
+            EveryHelper(Msg).run,
+            .{ entry.interval_ns, entry.msg, io, loop },
+        ) catch continue;
+        pending_futures.append(allocator, future) catch {
+            _ = future.cancel(io);
+            continue;
+        };
+    }
+    app_ctx.pending_everys_len = 0;
 }
 
 fn render(

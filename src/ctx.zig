@@ -8,10 +8,16 @@ pub fn Ctx(comptime Msg: type) type {
     const TaskFn = *const fn (std.mem.Allocator, std.Io) Msg;
     const max_tasks = 16;
     const max_ticks = 8;
+    const max_everys = 8;
 
     return struct {
         pub const TickEntry = struct {
             after_ns: u64,
+            msg: Msg,
+        };
+
+        pub const EveryEntry = struct {
+            interval_ns: u64,
             msg: Msg,
         };
 
@@ -20,6 +26,8 @@ pub fn Ctx(comptime Msg: type) type {
         pending_tasks_len: u8 = 0,
         pending_ticks: [max_ticks]TickEntry = undefined,
         pending_ticks_len: u8 = 0,
+        pending_everys: [max_everys]EveryEntry = undefined,
+        pending_everys_len: u8 = 0,
 
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
@@ -53,6 +61,23 @@ pub fn Ctx(comptime Msg: type) type {
         /// Return a slice of pending tick entries.
         pub fn pendingTickSlice(self: *@This()) []const TickEntry {
             return self.pending_ticks[0..self.pending_ticks_len];
+        }
+
+        /// Schedule a repeating timer.
+        /// The message will be delivered every `interval_ns` nanoseconds
+        /// until the future is cancelled.
+        /// Each call starts a new repeating timer; call this from `init` or guard it
+        /// so repeated `update` calls do not create duplicate timers.
+        pub fn every(self: *@This(), interval_ns: u64, msg: Msg) void {
+            std.debug.assert(self.pending_everys_len < max_everys);
+            if (self.pending_everys_len >= max_everys) return;
+            self.pending_everys[self.pending_everys_len] = .{ .interval_ns = interval_ns, .msg = msg };
+            self.pending_everys_len += 1;
+        }
+
+        /// Return a slice of pending every entries.
+        pub fn pendingEverySlice(self: *@This()) []const EveryEntry {
+            return self.pending_everys[0..self.pending_everys_len];
         }
     };
 }
@@ -93,4 +118,22 @@ test "Ctx tick accumulates entries" {
     try std.testing.expect(slice[0].msg == .timeout);
     try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].after_ns);
     try std.testing.expect(slice[1].msg == .ping);
+}
+
+test "Ctx every accumulates entries" {
+    const TestMsg = union(enum) { tick_msg, heartbeat };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    ctx_val.every(1_000_000_000, .tick_msg);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+
+    ctx_val.every(500_000_000, .heartbeat);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_everys_len);
+
+    const slice = ctx_val.pendingEverySlice();
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].interval_ns);
+    try std.testing.expect(slice[0].msg == .tick_msg);
+    try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].interval_ns);
+    try std.testing.expect(slice[1].msg == .heartbeat);
 }
