@@ -1,4 +1,5 @@
 const std = @import("std");
+const cmd_mod = @import("cmd.zig");
 
 /// Context object passed to `update`, providing side-effect methods.
 ///
@@ -200,6 +201,30 @@ pub fn Ctx(comptime Msg: type) type {
         pub fn pendingCancelSlice(self: *@This()) []const []const u8 {
             return self.pending_cancels[0..self.pending_cancels_len];
         }
+
+        /// Dispatch a command descriptor.
+        ///
+        /// Maps each `Cmd` variant to the corresponding `Ctx` method.
+        /// `batch` and `sequence` are dispatched recursively.
+        /// Note: `sequence` currently dispatches all commands immediately
+        /// (true async sequencing is not yet supported).
+        pub fn dispatch(self: *@This(), command: cmd_mod.Cmd(Msg)) (error{TaskLimitExceeded} || error{TimerLimitExceeded})!void {
+            switch (command) {
+                .none => {},
+                .quit => self.quit(),
+                .cancel_timer => |id| self.cancelTimer(id),
+                .task => |task_fn| try self.spawn(task_fn),
+                .task_with => |tw| try self.spawnWith(tw.ctx, tw.run),
+                .tick => |t| try self.tick(t.id, t.after_ns, t.msg),
+                .every => |e| try self.every(e.id, e.interval_ns, e.msg),
+                .batch => |cmds| {
+                    for (cmds) |c| try self.dispatch(c);
+                },
+                .sequence => |cmds| {
+                    for (cmds) |c| try self.dispatch(c);
+                },
+            }
+        }
     };
 }
 
@@ -375,6 +400,119 @@ test "Ctx spawnWith accumulates tasks" {
 
     const slice = ctx_val.pendingTaskWithSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
+}
+
+test "dispatch .none does nothing" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.none);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_tasks_len);
+    try std.testing.expectEqual(false, ctx_val.should_quit);
+}
+
+test "dispatch .quit sets should_quit" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.quit);
+
+    try std.testing.expectEqual(true, ctx_val.should_quit);
+}
+
+test "dispatch .task queues a task" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.{ .task = &struct {
+        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+            return .hello;
+        }
+    }.run });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
+}
+
+test "dispatch .task_with queues a task_with" {
+    const TestMsg = union(enum) { done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    var dummy: u32 = 42;
+    try ctx_val.dispatch(.{ .task_with = .{
+        .ctx = @ptrCast(&dummy),
+        .run = &struct {
+            fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
+                return .done;
+            }
+        }.run,
+    } });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_with_len);
+}
+
+test "dispatch .tick queues a tick" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .timeout } });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+}
+
+test "dispatch .every queues an every" {
+    const TestMsg = union(enum) { tick_msg };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.{ .every = .{ .id = "e1", .interval_ns = 500_000, .msg = .tick_msg } });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+}
+
+test "dispatch .cancel_timer queues a cancel" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.{ .cancel_timer = "timer1" });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
+    try std.testing.expectEqualStrings("timer1", ctx_val.pendingCancelSlice()[0]);
+}
+
+test "dispatch .batch processes multiple commands" {
+    const TestMsg = union(enum) { hello, timeout };
+    const C = cmd_mod.Cmd(TestMsg);
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const cmds = [_]C{
+        .quit,
+        .{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .timeout } },
+        .{ .task = &struct {
+            fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+                return .hello;
+            }
+        }.run },
+    };
+    try ctx_val.dispatch(.{ .batch = &cmds });
+
+    try std.testing.expectEqual(true, ctx_val.should_quit);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
+}
+
+test "dispatch .sequence processes multiple commands" {
+    const TestMsg = union(enum) { hello, timeout };
+    const C = cmd_mod.Cmd(TestMsg);
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const cmds = [_]C{
+        .quit,
+        .{ .every = .{ .id = "e1", .interval_ns = 500_000, .msg = .timeout } },
+    };
+    try ctx_val.dispatch(.{ .sequence = &cmds });
+
+    try std.testing.expectEqual(true, ctx_val.should_quit);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 }
 
 test "Ctx spawn and spawnWith share task limit" {
