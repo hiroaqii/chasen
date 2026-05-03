@@ -106,6 +106,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io };
 
     // --- Pending futures (for spawned async tasks) ---
+    // Completed one-shot futures (spawn/tick) remain in this list until
+    // shutdown because std.Io.Future has no non-blocking completion check.
+    // Memory impact is expected to be small for typical TUI usage.
+    // All futures are cancelled in the defer block below.
     var pending_futures: std.ArrayList(std.Io.Future(void)) = .empty;
     defer {
         for (pending_futures.items) |*f| {
