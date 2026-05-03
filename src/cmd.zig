@@ -14,6 +14,13 @@ pub fn Cmd(comptime Msg: type) type {
         /// Request the application to exit.
         quit,
 
+        /// Cancel a running or pending timer by id.
+        /// If the pending cancel queue is full, the cancel request is silently dropped.
+        ///
+        /// `id` must point to memory that remains valid until the cancel is processed
+        /// (e.g. a string literal or application-owned slice).
+        cancel_timer: []const u8,
+
         /// Run multiple commands concurrently.
         batch: []const Cmd(Msg),
 
@@ -39,6 +46,9 @@ pub fn Cmd(comptime Msg: type) type {
 
 fn Tick(comptime Msg: type) type {
     return struct {
+        /// `id` must point to memory that remains valid for the lifetime of the timer
+        /// (e.g. a string literal or application-owned slice).
+        id: []const u8,
         after_ns: u64,
         msg: Msg,
     };
@@ -46,6 +56,9 @@ fn Tick(comptime Msg: type) type {
 
 fn Every(comptime Msg: type) type {
     return struct {
+        /// `id` must point to memory that remains valid for the lifetime of the timer
+        /// (e.g. a string literal or application-owned slice).
+        id: []const u8,
         interval_ns: u64,
         msg: Msg,
     };
@@ -75,13 +88,19 @@ test "Cmd instantiation" {
     try std.testing.expect(quit_cmd == .quit);
 
     // Verify tick
-    const tick_cmd: C = .{ .tick = .{ .after_ns = 1_000_000, .msg = .hello } };
+    const tick_cmd: C = .{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .hello } };
     try std.testing.expectEqual(@as(u64, 1_000_000), tick_cmd.tick.after_ns);
+    try std.testing.expectEqualStrings("t1", tick_cmd.tick.id);
 
     // Verify every
-    const every_cmd: C = .{ .every = .{ .interval_ns = 100_000_000, .msg = .{ .value = 42 } } };
+    const every_cmd: C = .{ .every = .{ .id = "e1", .interval_ns = 100_000_000, .msg = .{ .value = 42 } } };
     try std.testing.expectEqual(@as(u64, 100_000_000), every_cmd.every.interval_ns);
     try std.testing.expectEqual(@as(u32, 42), every_cmd.every.msg.value);
+    try std.testing.expectEqualStrings("e1", every_cmd.every.id);
+
+    // Verify cancel_timer
+    const cancel_cmd: C = .{ .cancel_timer = "t1" };
+    try std.testing.expectEqualStrings("t1", cancel_cmd.cancel_timer);
 
     // Verify batch
     const cmds = [_]C{ .none, .quit };
