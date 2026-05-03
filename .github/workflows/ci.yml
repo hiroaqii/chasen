@@ -27,11 +27,5 @@ jobs:
       - name: Check Io.Threaded example
         run: zig build check-io-threaded
 
-      - name: Check counter example
-        run: zig build check-counter
-
-      - name: Check stopwatch example
-        run: zig build check-stopwatch
-
-      - name: Check HTTP example
-        run: zig build check-http
+      - name: Check examples
+        run: zig build check-examples

@@ -111,65 +111,37 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // --- examples/counter ---
-    const counter_exe = b.addExecutable(.{
-        .name = "counter",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/counter/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chasen", .module = mod },
-            },
-        }),
-    });
+    const example_names = [_][]const u8{ "counter", "stopwatch", "http" };
 
-    const check_counter = b.step("check-counter", "Build the counter example");
-    check_counter.dependOn(&counter_exe.step);
+    const check_examples_step = b.step("check-examples", "Build all examples");
 
-    const run_counter = b.addRunArtifact(counter_exe);
-    const run_counter_step = b.step("run-counter", "Run the counter example");
-    run_counter_step.dependOn(&run_counter.step);
+    for (example_names) |name| {
+        const example_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "chasen", .module = mod },
+                },
+            }),
+        });
 
-    // --- examples/stopwatch ---
-    const stopwatch_exe = b.addExecutable(.{
-        .name = "stopwatch",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/stopwatch/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chasen", .module = mod },
-            },
-        }),
-    });
+        const check_example_step = b.step(
+            b.fmt("check-{s}", .{name}),
+            b.fmt("Build the {s} example", .{name}),
+        );
+        check_example_step.dependOn(&example_exe.step);
+        check_examples_step.dependOn(&example_exe.step);
 
-    const check_stopwatch = b.step("check-stopwatch", "Build the stopwatch example");
-    check_stopwatch.dependOn(&stopwatch_exe.step);
-
-    const run_stopwatch = b.addRunArtifact(stopwatch_exe);
-    const run_stopwatch_step = b.step("run-stopwatch", "Run the stopwatch example");
-    run_stopwatch_step.dependOn(&run_stopwatch.step);
-
-    // --- examples/http ---
-    const http_exe = b.addExecutable(.{
-        .name = "http",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chasen", .module = mod },
-            },
-        }),
-    });
-
-    const check_http = b.step("check-http", "Build the http example");
-    check_http.dependOn(&http_exe.step);
-
-    const run_http = b.addRunArtifact(http_exe);
-    const run_http_step = b.step("run-http", "Run the http example");
-    run_http_step.dependOn(&run_http.step);
+        const run_example = b.addRunArtifact(example_exe);
+        const run_example_step = b.step(
+            b.fmt("run-{s}", .{name}),
+            b.fmt("Run the {s} example", .{name}),
+        );
+        run_example_step.dependOn(&run_example.step);
+    }
 
     const io_threaded_check = b.addExecutable(.{
         .name = "io-threaded-check",
