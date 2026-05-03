@@ -25,12 +25,19 @@ pub fn Ctx(comptime Msg: type) type {
             msg: Msg,
         };
 
+        pub const TaskWithEntry = struct {
+            ctx: *anyopaque,
+            run: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
+        };
+
         // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
         _allocator: std.mem.Allocator = undefined,
         should_quit: bool = false,
         pending_tasks: [max_tasks]TaskFn = undefined,
         pending_tasks_len: u8 = 0,
+        pending_tasks_with: [max_tasks]TaskWithEntry = undefined,
+        pending_tasks_with_len: u8 = 0,
         pending_ticks: [max_ticks]TickEntry = undefined,
         pending_ticks_len: u8 = 0,
         pending_everys: [max_everys]EveryEntry = undefined,
@@ -48,7 +55,7 @@ pub fn Ctx(comptime Msg: type) type {
         /// The task is queued here and started by the runtime after `update` returns.
         /// Returns `error.TaskLimitExceeded` if the pending task queue is full.
         pub fn spawn(self: *@This(), task: TaskFn) error{TaskLimitExceeded}!void {
-            if (self.pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
+            if (self.pending_tasks_len + self.pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
             self.pending_tasks[self.pending_tasks_len] = task;
             self.pending_tasks_len += 1;
         }
@@ -56,6 +63,31 @@ pub fn Ctx(comptime Msg: type) type {
         /// Return a slice of pending tasks.
         pub fn pendingSlice(self: *@This()) []const TaskFn {
             return self.pending_tasks[0..self.pending_tasks_len];
+        }
+
+        /// Spawn an async task with captured context.
+        ///
+        /// The caller must ensure `ctx` remains valid until the task finishes
+        /// or is cancelled.
+        /// The task is queued here and started by the runtime after `update` returns.
+        /// Returns `error.TaskLimitExceeded` if the combined pending task queue is full.
+        pub fn spawnWith(
+            self: *@This(),
+            ctx_ptr: *anyopaque,
+            run_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
+        ) error{TaskLimitExceeded}!void {
+            if (self.pending_tasks_len + self.pending_tasks_with_len >= max_tasks)
+                return error.TaskLimitExceeded;
+            self.pending_tasks_with[self.pending_tasks_with_len] = .{
+                .ctx = ctx_ptr,
+                .run = run_fn,
+            };
+            self.pending_tasks_with_len += 1;
+        }
+
+        /// Return a slice of pending task-with entries.
+        pub fn pendingTaskWithSlice(self: *@This()) []const TaskWithEntry {
+            return self.pending_tasks_with[0..self.pending_tasks_with_len];
         }
 
         /// Schedule a one-shot delayed message.
@@ -322,4 +354,51 @@ test "Ctx cancelTimer queues id for runtime cancellation" {
     const cancels = ctx_val.pendingCancelSlice();
     try std.testing.expectEqual(@as(usize, 1), cancels.len);
     try std.testing.expectEqualStrings("running_timer", cancels[0]);
+}
+
+test "Ctx spawnWith accumulates tasks" {
+    const TestMsg = union(enum) { done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    var dummy_ctx: u32 = 42;
+    const run_fn = &struct {
+        fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
+            return .done;
+        }
+    }.run;
+
+    try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_fn);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_with_len);
+
+    try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_fn);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_with_len);
+
+    const slice = ctx_val.pendingTaskWithSlice();
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+}
+
+test "Ctx spawn and spawnWith share task limit" {
+    const TestMsg = union(enum) { hello, done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const task = &struct {
+        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+            return .hello;
+        }
+    }.run;
+
+    var dummy_ctx: u32 = 0;
+    const run_with = &struct {
+        fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
+            return .done;
+        }
+    }.run;
+
+    // Fill 10 with spawn, 6 with spawnWith = 16 total (max_tasks)
+    for (0..10) |_| try ctx_val.spawn(task);
+    for (0..6) |_| try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_with);
+
+    // Both should fail now
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawn(task));
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_with));
 }

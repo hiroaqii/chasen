@@ -34,6 +34,23 @@ fn SpawnHelper(comptime Msg: type) type {
     };
 }
 
+/// Runs a user task with captured context and posts its result back.
+fn SpawnWithHelper(comptime Msg: type) type {
+    const Event = InternalEvent(Msg);
+    return struct {
+        fn run(
+            ctx_ptr: *anyopaque,
+            run_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
+            alloc: std.mem.Allocator,
+            spawn_io: std.Io,
+            loop_ptr: *vaxis.Loop(Event),
+        ) void {
+            const msg = run_fn(ctx_ptr, alloc, spawn_io);
+            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+        }
+    };
+}
+
 /// Sleeps for `after_ns` then posts `msg` once.
 fn TickHelper(comptime Msg: type) type {
     const Event = InternalEvent(Msg);
@@ -202,6 +219,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
+/// Ctx.spawn/spawnWith only guarantee queueing; runtime start failures
+/// are currently dropped and may become observable via a future error hook.
 fn spawnPendingTasks(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
@@ -221,6 +240,18 @@ fn spawnPendingTasks(
         };
     }
     app_ctx.pending_tasks_len = 0;
+
+    for (app_ctx.pendingTaskWithSlice()) |entry| {
+        var future = io.concurrent(
+            SpawnWithHelper(Msg).run,
+            .{ entry.ctx, entry.run, allocator, io, loop },
+        ) catch continue;
+        pending_futures.append(allocator, future) catch {
+            _ = future.cancel(io);
+            continue;
+        };
+    }
+    app_ctx.pending_tasks_with_len = 0;
 }
 
 /// Starts tick timers queued in Ctx and tracks their futures for shutdown.
