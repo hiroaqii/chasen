@@ -5,8 +5,22 @@ const Surface = surface_mod.Surface;
 const ctx_mod = @import("ctx.zig");
 const root = @import("root.zig");
 
+fn InternalEvent(comptime Msg: type) type {
+    return union(enum) {
+        key_press: vaxis.Key,
+        winsize: vaxis.Winsize,
+        mouse: vaxis.Mouse,
+        focus_in,
+        focus_out,
+
+        /// Async task result injected via postEvent.
+        user_msg: Msg,
+    };
+}
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
+    const Event = InternalEvent(Msg);
     const allocator = opts.allocator;
     const io = opts.io;
 
@@ -21,7 +35,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // --- Event loop setup ---
     // Start the loop before querying the terminal. queryTerminal waits for
     // terminal capability responses, which are read and processed by the loop.
-    var loop: vaxis.Loop(vaxis.Event) = .init(io, &tty, &vx);
+    var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
     try loop.start();
     defer loop.stop();
 
@@ -61,8 +75,13 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 try vx.resize(allocator, tty.writer(), ws);
                 needs_render = true;
             },
+            .user_msg => |msg| {
+                app.update(msg, &app_ctx);
+                needs_render = true;
+            },
             .mouse => {},
-            else => {},
+            .focus_in => {},
+            .focus_out => {},
         }
 
         if (needs_render) {
@@ -87,4 +106,15 @@ fn render(
     };
     app.view(&sfc);
     try vx.render(writer);
+}
+
+test "InternalEvent instantiation" {
+    const TestMsg = union(enum) { hello, value: u32 };
+    const Event = InternalEvent(TestMsg);
+
+    const ev: Event = .{ .user_msg = .hello };
+    try std.testing.expect(ev == .user_msg);
+
+    const key_ev: Event = .{ .key_press = .{ .codepoint = 'a' } };
+    try std.testing.expect(key_ev == .key_press);
 }
