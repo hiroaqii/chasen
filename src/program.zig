@@ -18,13 +18,16 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{});
     defer vx.deinit(allocator, tty.writer());
 
-    try vx.enterAltScreen(tty.writer());
-    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
-
     // --- Event loop setup ---
+    // Start the loop before querying the terminal. queryTerminal waits for
+    // terminal capability responses, which are read and processed by the loop.
     var loop: vaxis.Loop(vaxis.Event) = .init(io, &tty, &vx);
     try loop.start();
     defer loop.stop();
+
+    try vx.enterAltScreen(tty.writer());
+    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+
     if (!vx.state.in_band_resize) try loop.installResizeHandler();
 
     // --- Frame arena ---
