@@ -132,6 +132,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{
         .system_clipboard_allocator = allocator,
     });
+    useUnicodeWidth(&vx);
     defer vx.deinit(allocator, tty.writer());
 
     // --- Event loop setup ---
@@ -217,6 +218,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 // Resize always redraws so the screen buffer matches the new
                 // terminal size; suppressRedraw only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
+                useUnicodeWidth(&vx);
                 if (app.handleEvent(.{ .winsize = ws })) |msg| {
                     try app.update(msg, &app_ctx);
                 }
@@ -430,6 +432,11 @@ fn timestampNs(io: std.Io) u64 {
 fn deltaNs(previous_ns: u64, now_ns: u64) u64 {
     if (now_ns <= previous_ns) return 0;
     return now_ns - previous_ns;
+}
+
+fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
+    vx.caps.unicode = .unicode;
+    vx.screen.width_method = .unicode;
 }
 
 fn render(

@@ -27,6 +27,8 @@ pub const StateStore = state_store.StateStore;
 pub const StateInitContext = state_store.StateInitContext;
 pub const StateDeinitContext = state_store.StateDeinitContext;
 
+pub const text = @import("text.zig");
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).

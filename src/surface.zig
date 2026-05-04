@@ -231,12 +231,13 @@ const TestSurface = struct {
 };
 
 fn testSurface(width: u16, height: u16) !TestSurface {
-    const screen = try vaxis.Screen.init(std.testing.allocator, .{
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
         .cols = width,
         .rows = height,
         .x_pixel = 0,
         .y_pixel = 0,
     });
+    screen.width_method = .unicode;
     const window: vaxis.Window = .{
         .x_off = 0,
         .y_off = 0,
@@ -318,6 +319,16 @@ test "Surface.displayWidth handles wide characters" {
     defer ts.deinit();
 
     try std.testing.expectEqual(@as(u16, 2), ts.surface.displayWidth("あ"));
+}
+
+test "Surface.displayWidth matches chasen text unicode width" {
+    var ts = try testSurface(10, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    const text = @import("text.zig");
+    try std.testing.expectEqual(text.displayWidth("👩‍🚀"), ts.surface.displayWidth("👩‍🚀"));
+    try std.testing.expectEqual(text.displayWidth("🇯🇵"), ts.surface.displayWidth("🇯🇵"));
 }
 
 test "Surface.textAt prints unwrapped styled text at coordinates" {
