@@ -97,6 +97,19 @@ pub const Surface = struct {
         self.fill(rect, .{ .default = true });
     }
 
+    /// Create a child surface clipped to `rect`.
+    pub fn child(self: *Surface, rect: Rect) Surface {
+        return .{
+            .window = self.window.child(.{
+                .x_off = @intCast(rect.col),
+                .y_off = @intCast(rect.row),
+                .width = rect.width,
+                .height = rect.height,
+            }),
+            .arena = self.arena,
+        };
+    }
+
     /// Fill the entire surface with `cell`.
     pub fn fillAll(self: *Surface, cell: Cell) void {
         self.window.fill(cell);
@@ -258,6 +271,53 @@ test "Surface.fill and clear affect a rect" {
     const cleared = ts.surface.window.readCell(2, 2).?;
     try std.testing.expectEqualStrings(" ", cleared.char.grapheme);
     try std.testing.expect(!cleared.style.dim);
+}
+
+test "Surface.child returns a clipped child surface" {
+    var ts = try testSurface(4, 3);
+    ts.bind();
+    defer ts.deinit();
+
+    var child = ts.surface.child(.{ .col = 1, .row = 1, .width = 2, .height = 1 });
+
+    const child_size = child.size();
+    try std.testing.expectEqual(@as(u16, 2), child_size.width);
+    try std.testing.expectEqual(@as(u16, 1), child_size.height);
+    try std.testing.expectEqual(ts.surface.frameAllocator().ptr, child.frameAllocator().ptr);
+
+    child.writeCell(0, 0, .{ .char = .{ .grapheme = "a", .width = 1 } });
+    child.writeCell(1, 0, .{ .char = .{ .grapheme = "b", .width = 1 } });
+    child.writeCell(2, 0, .{ .char = .{ .grapheme = "x", .width = 1 } });
+
+    const outside = ts.surface.window.readCell(0, 1).?;
+    const a = ts.surface.window.readCell(1, 1).?;
+    const b = ts.surface.window.readCell(2, 1).?;
+    const clipped = ts.surface.window.readCell(3, 1).?;
+
+    try std.testing.expectEqualStrings(" ", outside.char.grapheme);
+    try std.testing.expectEqualStrings("a", a.char.grapheme);
+    try std.testing.expectEqualStrings("b", b.char.grapheme);
+    try std.testing.expectEqualStrings(" ", clipped.char.grapheme);
+}
+
+test "Surface.child clamps rect to parent bounds" {
+    var ts = try testSurface(4, 3);
+    ts.bind();
+    defer ts.deinit();
+
+    var child = ts.surface.child(.{ .col = 3, .row = 2, .width = 5, .height = 5 });
+
+    const child_size = child.size();
+    try std.testing.expectEqual(@as(u16, 1), child_size.width);
+    try std.testing.expectEqual(@as(u16, 1), child_size.height);
+
+    child.fillAll(.{ .char = .{ .grapheme = "x", .width = 1 } });
+
+    const outside = ts.surface.window.readCell(2, 2).?;
+    const inside = ts.surface.window.readCell(3, 2).?;
+
+    try std.testing.expectEqualStrings(" ", outside.char.grapheme);
+    try std.testing.expectEqualStrings("x", inside.char.grapheme);
 }
 
 test "Surface.fillAll and clearAll affect the whole surface" {
