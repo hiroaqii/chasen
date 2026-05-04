@@ -42,7 +42,7 @@ pub const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
-    /// Bracketed paste content. Only valid during the current event dispatch.
+    /// Clipboard paste content. Only valid during the current event dispatch.
     paste: []const u8,
     focus_in,
     focus_out,

@@ -14,6 +14,7 @@ fn InternalEvent(comptime Msg: type) type {
         mouse: vaxis.Mouse,
         focus_in,
         focus_out,
+        paste: []const u8,
         frame: root.Frame,
 
         /// Async task result injected via postEvent.
@@ -128,7 +129,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();
 
-    var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{});
+    var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{
+        .system_clipboard_allocator = allocator,
+    });
     defer vx.deinit(allocator, tty.writer());
 
     // --- Event loop setup ---
@@ -240,6 +243,14 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             },
             .focus_out => {
                 if (app.handleEvent(.focus_out)) |msg| {
+                    app_ctx.redraw_suppressed = false;
+                    try app.update(msg, &app_ctx);
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
+                }
+            },
+            .paste => |text| {
+                defer allocator.free(text);
+                if (app.handleEvent(.{ .paste = text })) |msg| {
                     app_ctx.redraw_suppressed = false;
                     try app.update(msg, &app_ctx);
                     if (!app_ctx.redraw_suppressed) needs_render = true;
@@ -448,6 +459,9 @@ test "InternalEvent instantiation" {
 
     const key_ev: Event = .{ .key_press = .{ .codepoint = 'a' } };
     try std.testing.expect(key_ev == .key_press);
+
+    const paste_ev: Event = .{ .paste = "hello" };
+    try std.testing.expect(paste_ev == .paste);
 
     const frame_ev: Event = .{ .frame = .{ .now_ns = 100, .delta_ns = 16, .index = 2 } };
     try std.testing.expect(frame_ev == .frame);
