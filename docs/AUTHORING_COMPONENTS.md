@@ -1,8 +1,8 @@
 # Authoring Components
 
 This document describes the current component authoring contract for Chasen
-packages such as `chasen-dogu`, `chasen-anim`, `chasen-media`, and third-party
-component libraries.
+packages such as [`chasen-ui`](https://github.com/hiroaqii/chasen-ui),
+`chasen-anim`, `chasen-media`, and third-party component libraries.
 
 Chasen intentionally keeps the core small. A component is not a framework-owned
 object and does not need to implement a trait. Prefer plain Zig structs and
@@ -150,8 +150,8 @@ fn listState(
 State ids should include a package/component/path prefix:
 
 ```zig
-"dogu/text_input/search"
-"dogu/list/search/results"
+"ui/text_input/search"
+"ui/list/search/results"
 "anim/transition/main"
 "bgg/detail/comments"
 ```
