@@ -111,7 +111,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const example_names = [_][]const u8{ "counter", "stopwatch", "http" };
+    const example_names = [_][]const u8{ "counter", "stopwatch", "http", "animation" };
 
     const check_examples_step = b.step("check-examples", "Build all examples");
 

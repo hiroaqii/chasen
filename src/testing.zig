@@ -32,6 +32,7 @@ pub fn TestCtx(comptime Msg: type) type {
             self.ctx.pending_everys_len = 0;
             self.ctx.pending_cancels_len = 0;
             self.ctx.redraw_suppressed = false;
+            self.ctx.frame_requested = false;
         }
     };
 }
@@ -65,12 +66,14 @@ test "resetTransient clears pending queues and redraw_suppressed" {
     try tc.ctx.every("e1", 2_000, .dec);
     tc.ctx.cancelTimer("x");
     tc.ctx.suppressRedraw();
+    tc.ctx.requestFrame();
 
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_tasks_len);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_everys_len);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_cancels_len);
     try std.testing.expectEqual(true, tc.ctx.redraw_suppressed);
+    try std.testing.expectEqual(true, tc.ctx.frame_requested);
 
     tc.resetTransient();
 
@@ -80,6 +83,7 @@ test "resetTransient clears pending queues and redraw_suppressed" {
     try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_everys_len);
     try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_cancels_len);
     try std.testing.expectEqual(false, tc.ctx.redraw_suppressed);
+    try std.testing.expectEqual(false, tc.ctx.frame_requested);
 }
 
 test "resetTransient preserves should_quit" {

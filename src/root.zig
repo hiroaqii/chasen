@@ -8,6 +8,11 @@ pub const Color = style.Color;
 pub const surface = @import("surface.zig");
 pub const Surface = surface.Surface;
 pub const Column = surface.Column;
+pub const Cell = surface.Cell;
+pub const CursorShape = surface.CursorShape;
+pub const Size = surface.Size;
+pub const Rect = surface.Rect;
+pub const PrintResult = surface.PrintResult;
 
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
@@ -17,20 +22,37 @@ pub const Cmd = cmd.Cmd;
 
 pub const testing = @import("testing.zig");
 
+pub const state_store = @import("state_store.zig");
+pub const StateStore = state_store.StateStore;
+pub const StateInitContext = state_store.StateInitContext;
+pub const StateDeinitContext = state_store.StateDeinitContext;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).
 pub const Key = vaxis.Key;
+
+/// Frame timing delivered by `Event.frame`.
+pub const Frame = struct {
+    /// Monotonic timestamp for this frame, in nanoseconds.
+    now_ns: u64,
+    /// Nanoseconds since the previous frame timestamp.
+    delta_ns: u64,
+    /// Monotonic frame counter starting at 0.
+    index: u64,
+};
 
 /// Terminal event type passed to `handleEvent`.
 pub const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
-    /// Bracketed paste content. Only valid during the current event dispatch.
+    /// Clipboard paste content. Only valid during the current event dispatch.
     paste: []const u8,
     focus_in,
     focus_out,
+    /// Requested animation/media frame.
+    frame: Frame,
 };
 
 /// Options for the low-level `runWith` entry point.
@@ -84,4 +106,5 @@ fn validateApp(comptime App: type) void {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("program.zig");
+    _ = @import("state_store.zig");
 }

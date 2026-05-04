@@ -5,6 +5,8 @@ const Surface = surface_mod.Surface;
 const ctx_mod = @import("ctx.zig");
 const root = @import("root.zig");
 
+const frame_interval_ns: u64 = std.time.ns_per_s / 60;
+
 fn InternalEvent(comptime Msg: type) type {
     return union(enum) {
         key_press: vaxis.Key,
@@ -12,6 +14,8 @@ fn InternalEvent(comptime Msg: type) type {
         mouse: vaxis.Mouse,
         focus_in,
         focus_out,
+        paste: []const u8,
+        frame: root.Frame,
 
         /// Async task result injected via postEvent.
         user_msg: Msg,
@@ -86,6 +90,28 @@ fn EveryHelper(comptime Msg: type) type {
     };
 }
 
+/// Sleeps until the next frame slot then posts a frame event.
+fn FrameHelper(comptime Msg: type) type {
+    const Event = InternalEvent(Msg);
+    return struct {
+        fn run(
+            after_ns: u64,
+            last_frame_ns: u64,
+            index: u64,
+            frame_io: std.Io,
+            loop_ptr: *vaxis.Loop(Event),
+        ) void {
+            frame_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
+            const now_ns = timestampNs(frame_io);
+            loop_ptr.postEvent(.{ .frame = .{
+                .now_ns = now_ns,
+                .delta_ns = deltaNs(last_frame_ns, now_ns),
+                .index = index,
+            } }) catch {};
+        }
+    };
+}
+
 /// A running timer tracked by id so it can be cancelled.
 const TimerHandle = struct {
     id: []const u8,
@@ -103,7 +129,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();
 
-    var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{});
+    var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{
+        .system_clipboard_allocator = allocator,
+    });
     defer vx.deinit(allocator, tty.writer());
 
     // --- Event loop setup ---
@@ -127,6 +155,15 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // Ctx keeps Io privately so user code can call ctx.now() without receiving
     // direct access to the runtime Io handle.
     var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
+    var frame_in_flight = false;
+    var frame_future: ?std.Io.Future(void) = null;
+    defer {
+        if (frame_future) |*f| {
+            _ = f.cancel(io);
+        }
+    }
+    var last_frame_ns = timestampNs(io);
+    var next_frame_index: u64 = 0;
 
     // --- Pending futures (for spawned async tasks) ---
     // Completed one-shot futures (spawn/tick) remain in this list until
@@ -157,6 +194,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
     }
 
     // Initial render
@@ -210,6 +248,28 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                     if (!app_ctx.redraw_suppressed) needs_render = true;
                 }
             },
+            .paste => |text| {
+                defer allocator.free(text);
+                if (app.handleEvent(.{ .paste = text })) |msg| {
+                    app_ctx.redraw_suppressed = false;
+                    try app.update(msg, &app_ctx);
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
+                }
+            },
+            .frame => |frame| {
+                if (frame_future) |*f| {
+                    _ = f.await(io);
+                    frame_future = null;
+                }
+                frame_in_flight = false;
+                last_frame_ns = frame.now_ns;
+                next_frame_index = frame.index + 1;
+                if (app.handleEvent(.{ .frame = frame })) |msg| {
+                    app_ctx.redraw_suppressed = false;
+                    try app.update(msg, &app_ctx);
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
+                }
+            },
         }
 
         // Process tasks, ticks, and everys spawned during update
@@ -217,6 +277,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
 
         if (needs_render) {
             try render(App, &vx, &frame_arena, &app, tty.writer());
@@ -258,6 +319,28 @@ fn spawnPendingTasks(
         };
     }
     app_ctx.pending_tasks_with_len = 0;
+}
+
+fn startPendingFrame(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+    frame_in_flight: *bool,
+    frame_future: *?std.Io.Future(void),
+    last_frame_ns: u64,
+    next_frame_index: u64,
+) void {
+    if (!app_ctx.frame_requested) return;
+    app_ctx.frame_requested = false;
+
+    if (frame_in_flight.*) return;
+
+    frame_future.* = io.concurrent(
+        FrameHelper(Msg).run,
+        .{ frame_interval_ns, last_frame_ns, next_frame_index, io, loop },
+    ) catch return;
+    frame_in_flight.* = true;
 }
 
 /// Starts tick timers queued in Ctx and tracks their futures for shutdown.
@@ -338,6 +421,17 @@ fn processPendingCancels(
     app_ctx.pending_cancels_len = 0;
 }
 
+fn timestampNs(io: std.Io) u64 {
+    const ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    if (ns <= 0) return 0;
+    return std.math.lossyCast(u64, ns);
+}
+
+fn deltaNs(previous_ns: u64, now_ns: u64) u64 {
+    if (now_ns <= previous_ns) return 0;
+    return now_ns - previous_ns;
+}
+
 fn render(
     comptime App: type,
     vx: *vaxis.Vaxis,
@@ -365,6 +459,12 @@ test "InternalEvent instantiation" {
 
     const key_ev: Event = .{ .key_press = .{ .codepoint = 'a' } };
     try std.testing.expect(key_ev == .key_press);
+
+    const paste_ev: Event = .{ .paste = "hello" };
+    try std.testing.expect(paste_ev == .paste);
+
+    const frame_ev: Event = .{ .frame = .{ .now_ns = 100, .delta_ns = 16, .index = 2 } };
+    try std.testing.expect(frame_ev == .frame);
 }
 
 test "SpawnHelper instantiation" {
@@ -373,4 +473,17 @@ test "SpawnHelper instantiation" {
     // Verify the run function has the expected type signature
     const RunFn = @TypeOf(Helper.run);
     try std.testing.expect(RunFn != void);
+}
+
+test "FrameHelper instantiation" {
+    const TestMsg = union(enum) { hello };
+    const Helper = FrameHelper(TestMsg);
+    const RunFn = @TypeOf(Helper.run);
+    try std.testing.expect(RunFn != void);
+}
+
+test "deltaNs clamps non-monotonic timestamps" {
+    try std.testing.expectEqual(@as(u64, 5), deltaNs(10, 15));
+    try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 10));
+    try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 9));
 }

@@ -46,6 +46,7 @@ pub fn Ctx(comptime Msg: type) type {
         pending_cancels: [max_cancels][]const u8 = undefined,
         pending_cancels_len: u8 = 0,
         redraw_suppressed: bool = false,
+        frame_requested: bool = false,
 
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
@@ -212,6 +213,14 @@ pub fn Ctx(comptime Msg: type) type {
             self.redraw_suppressed = true;
         }
 
+        /// Request one future frame event.
+        ///
+        /// The runtime coalesces repeated calls while a frame is already
+        /// pending. Call this again from the frame update to keep animating.
+        pub fn requestFrame(self: *@This()) void {
+            self.frame_requested = true;
+        }
+
         /// Dispatch a command descriptor.
         ///
         /// Maps each `Cmd` variant to the corresponding `Ctx` method.
@@ -256,6 +265,15 @@ test "Ctx spawn accumulates tasks" {
 
     const slice = ctx_val.pendingSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
+}
+
+test "Ctx requestFrame marks a pending frame request" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try std.testing.expectEqual(false, ctx_val.frame_requested);
+    ctx_val.requestFrame();
+    try std.testing.expectEqual(true, ctx_val.frame_requested);
 }
 
 test "Ctx spawn returns error when task queue is full" {
