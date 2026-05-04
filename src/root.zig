@@ -22,6 +22,11 @@ pub const Cmd = cmd.Cmd;
 
 pub const testing = @import("testing.zig");
 
+pub const state_store = @import("state_store.zig");
+pub const StateStore = state_store.StateStore;
+pub const StateInitContext = state_store.StateInitContext;
+pub const StateDeinitContext = state_store.StateDeinitContext;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).
@@ -101,4 +106,5 @@ fn validateApp(comptime App: type) void {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("program.zig");
+    _ = @import("state_store.zig");
 }
