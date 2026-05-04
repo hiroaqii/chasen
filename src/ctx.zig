@@ -45,6 +45,7 @@ pub fn Ctx(comptime Msg: type) type {
         pending_everys_len: u8 = 0,
         pending_cancels: [max_cancels][]const u8 = undefined,
         pending_cancels_len: u8 = 0,
+        redraw_suppressed: bool = false,
 
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
@@ -200,6 +201,15 @@ pub fn Ctx(comptime Msg: type) type {
         /// Return a slice of pending cancel ids.
         pub fn pendingCancelSlice(self: *@This()) []const []const u8 {
             return self.pending_cancels[0..self.pending_cancels_len];
+        }
+
+        /// Suppress the default redraw for the current update cycle.
+        ///
+        /// By default, `view` is called after every `update`. Call this
+        /// method inside `update` when the message does not affect
+        /// the visual state and a redraw would be wasteful.
+        pub fn suppressRedraw(self: *@This()) void {
+            self.redraw_suppressed = true;
         }
 
         /// Dispatch a command descriptor.
@@ -513,6 +523,21 @@ test "dispatch .sequence processes multiple commands" {
 
     try std.testing.expectEqual(true, ctx_val.should_quit);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+}
+
+test "Ctx redraw_suppressed defaults to false" {
+    const TestMsg = union(enum) { hello };
+    const ctx_val: Ctx(TestMsg) = .{};
+
+    try std.testing.expectEqual(false, ctx_val.redraw_suppressed);
+}
+
+test "Ctx suppressRedraw sets redraw_suppressed to true" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    ctx_val.suppressRedraw();
+    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
 }
 
 test "Ctx spawn and spawnWith share task limit" {

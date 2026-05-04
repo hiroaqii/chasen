@@ -170,12 +170,14 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         switch (event) {
             .key_press => |key| {
                 if (app.handleEvent(.{ .key_press = key })) |msg| {
+                    app_ctx.redraw_suppressed = false;
                     try app.update(msg, &app_ctx);
-                    needs_render = true;
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
                 }
             },
             .winsize => |ws| {
-                // Keep the vaxis screen in sync first, then let the app react to resize.
+                // Resize always redraws so the screen buffer matches the new
+                // terminal size; suppressRedraw only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
                 if (app.handleEvent(.{ .winsize = ws })) |msg| {
                     try app.update(msg, &app_ctx);
@@ -183,25 +185,29 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 needs_render = true;
             },
             .user_msg => |msg| {
+                app_ctx.redraw_suppressed = false;
                 try app.update(msg, &app_ctx);
-                needs_render = true;
+                if (!app_ctx.redraw_suppressed) needs_render = true;
             },
             .mouse => |m| {
                 if (app.handleEvent(.{ .mouse = m })) |msg| {
+                    app_ctx.redraw_suppressed = false;
                     try app.update(msg, &app_ctx);
-                    needs_render = true;
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
                 }
             },
             .focus_in => {
                 if (app.handleEvent(.focus_in)) |msg| {
+                    app_ctx.redraw_suppressed = false;
                     try app.update(msg, &app_ctx);
-                    needs_render = true;
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
                 }
             },
             .focus_out => {
                 if (app.handleEvent(.focus_out)) |msg| {
+                    app_ctx.redraw_suppressed = false;
                     try app.update(msg, &app_ctx);
-                    needs_render = true;
+                    if (!app_ctx.redraw_suppressed) needs_render = true;
                 }
             },
         }
