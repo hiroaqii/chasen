@@ -8,6 +8,10 @@ pub const Color = style.Color;
 pub const surface = @import("surface.zig");
 pub const Surface = surface.Surface;
 pub const Column = surface.Column;
+pub const Cell = surface.Cell;
+pub const Size = surface.Size;
+pub const Rect = surface.Rect;
+pub const PrintResult = surface.PrintResult;
 
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
