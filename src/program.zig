@@ -222,114 +222,31 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
         switch (event) {
             .key_press => |key| {
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.{ .key_press = key })) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats);
             },
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
                 // terminal size; suppressRedraw only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
                 useUnicodeWidth(&vx);
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.{ .winsize = ws })) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &stats);
                 needs_render = true;
             },
             .user_msg => |msg| {
-                app_ctx.redraw_suppressed = false;
-                const update_start = timingStart(stats_enabled, io);
-                try app.update(msg, &app_ctx);
-                if (stats) |*s| {
-                    s.update_ns = timingElapsed(update_start, io);
-                    s.did_update = true;
-                }
-                if (!app_ctx.redraw_suppressed) needs_render = true;
+                needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats);
             },
             .mouse => |m| {
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.{ .mouse = m })) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .{ .mouse = m }, &app_ctx, io, &stats);
             },
             .focus_in => {
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.focus_in)) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .focus_in, &app_ctx, io, &stats);
             },
             .focus_out => {
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.focus_out)) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats);
             },
             .paste => |text| {
                 defer allocator.free(text);
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.{ .paste = text })) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats);
             },
             .frame => |frame| {
                 frame_count += 1;
@@ -341,20 +258,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 frame_in_flight = false;
                 last_frame_ns = frame.now_ns;
                 next_frame_index = frame.index + 1;
-                const handle_start = timingStart(stats_enabled, io);
-                if (app.handleEvent(.{ .frame = frame })) |msg| {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                    app_ctx.redraw_suppressed = false;
-                    const update_start = timingStart(stats_enabled, io);
-                    try app.update(msg, &app_ctx);
-                    if (stats) |*s| {
-                        s.update_ns = timingElapsed(update_start, io);
-                        s.did_update = true;
-                    }
-                    if (!app_ctx.redraw_suppressed) needs_render = true;
-                } else {
-                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
-                }
+                needs_render = try dispatchAppEvent(App, &app, .{ .frame = frame }, &app_ctx, io, &stats);
             },
         }
 
@@ -380,6 +284,63 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             stats_fn(opts.stats_context, stats.?);
         }
     }
+}
+
+/// Route an app-facing event through `handleEvent`, then apply the returned
+/// message if the app handled it.
+///
+/// This keeps the common handleEvent/update/stat timing path in one place.
+/// Event-specific runtime work, such as terminal resize or frame-future
+/// cleanup, stays in the switch branch before this helper is called.
+fn dispatchAppEvent(
+    comptime App: type,
+    app: *App,
+    event: root.Event,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    io: std.Io,
+    stats: *?root.RuntimeStats,
+) !bool {
+    const measure = stats.* != null;
+    const handle_start = timingStart(measure, io);
+    const maybe_msg = app.handleEvent(event);
+
+    if (stats.*) |*s| {
+        s.handle_event_ns = timingElapsed(handle_start, io);
+    }
+
+    if (maybe_msg) |msg| {
+        return try applyMsg(App, app, msg, app_ctx, io, stats);
+    }
+
+    return false;
+}
+
+/// Apply one app message and return whether the app requested a redraw.
+///
+/// `Ctx.suppressRedraw()` is message-scoped, so the flag is reset immediately
+/// before each app update. The helper also owns update timing and the
+/// `did_update` stats flag, which avoids duplicating that bookkeeping across
+/// every event kind.
+fn applyMsg(
+    comptime App: type,
+    app: *App,
+    msg: App.Msg,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    io: std.Io,
+    stats: *?root.RuntimeStats,
+) !bool {
+    const measure = stats.* != null;
+    app_ctx.redraw_suppressed = false;
+
+    const update_start = timingStart(measure, io);
+    try app.update(msg, app_ctx);
+
+    if (stats.*) |*s| {
+        s.update_ns = timingElapsed(update_start, io);
+        s.did_update = true;
+    }
+
+    return !app_ctx.redraw_suppressed;
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
