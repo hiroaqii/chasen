@@ -118,6 +118,11 @@ const TimerHandle = struct {
     future: std.Io.Future(void),
 };
 
+const RenderTimings = struct {
+    view_ns: u64 = 0,
+    render_ns: u64 = 0,
+};
+
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -165,6 +170,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     }
     var last_frame_ns = timestampNs(io);
     var next_frame_index: u64 = 0;
+    var event_count: u64 = 0;
+    var frame_count: u64 = 0;
+    const stats_enabled = opts.stats_fn != null;
 
     // --- Pending futures (for spawned async tasks) ---
     // Completed one-shot futures (spawn/tick) remain in this list until
@@ -199,19 +207,34 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     }
 
     // Initial render
-    try render(App, &vx, &frame_arena, &app, tty.writer());
+    _ = try render(App, &vx, &frame_arena, &app, tty.writer(), io, false);
 
     // --- Main loop ---
     while (!app_ctx.should_quit) {
         const event = try loop.nextEvent();
+        event_count += 1;
         var needs_render = false;
+        var stats: ?root.RuntimeStats = if (stats_enabled) .{
+            .event_kind = eventKind(event),
+            .event_count = event_count,
+            .frame_count = frame_count,
+        } else null;
 
         switch (event) {
             .key_press => |key| {
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.{ .key_press = key })) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
             .winsize => |ws| {
@@ -219,46 +242,98 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 // terminal size; suppressRedraw only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
                 useUnicodeWidth(&vx);
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.{ .winsize = ws })) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
                 needs_render = true;
             },
             .user_msg => |msg| {
                 app_ctx.redraw_suppressed = false;
+                const update_start = timingStart(stats_enabled, io);
                 try app.update(msg, &app_ctx);
+                if (stats) |*s| {
+                    s.update_ns = timingElapsed(update_start, io);
+                    s.did_update = true;
+                }
                 if (!app_ctx.redraw_suppressed) needs_render = true;
             },
             .mouse => |m| {
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.{ .mouse = m })) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
             .focus_in => {
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.focus_in)) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
             .focus_out => {
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.focus_out)) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
             .paste => |text| {
                 defer allocator.free(text);
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.{ .paste = text })) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
             .frame => |frame| {
+                frame_count += 1;
+                if (stats) |*s| s.frame_count = frame_count;
                 if (frame_future) |*f| {
                     _ = f.await(io);
                     frame_future = null;
@@ -266,23 +341,43 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 frame_in_flight = false;
                 last_frame_ns = frame.now_ns;
                 next_frame_index = frame.index + 1;
+                const handle_start = timingStart(stats_enabled, io);
                 if (app.handleEvent(.{ .frame = frame })) |msg| {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                     app_ctx.redraw_suppressed = false;
+                    const update_start = timingStart(stats_enabled, io);
                     try app.update(msg, &app_ctx);
+                    if (stats) |*s| {
+                        s.update_ns = timingElapsed(update_start, io);
+                        s.did_update = true;
+                    }
                     if (!app_ctx.redraw_suppressed) needs_render = true;
+                } else {
+                    if (stats) |*s| s.handle_event_ns = timingElapsed(handle_start, io);
                 }
             },
         }
 
         // Process tasks, ticks, and everys spawned during update
+        const effect_drain_start = timingStart(stats_enabled, io);
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
 
         if (needs_render) {
-            try render(App, &vx, &frame_arena, &app, tty.writer());
+            const timings = try render(App, &vx, &frame_arena, &app, tty.writer(), io, stats_enabled);
+            if (stats) |*s| {
+                s.view_ns = timings.view_ns;
+                s.render_ns = timings.render_ns;
+                s.did_render = true;
+            }
+        }
+
+        if (opts.stats_fn) |stats_fn| {
+            stats_fn(opts.stats_context, stats.?);
         }
     }
 }
@@ -434,6 +529,31 @@ fn deltaNs(previous_ns: u64, now_ns: u64) u64 {
     return now_ns - previous_ns;
 }
 
+fn eventKind(event: anytype) root.RuntimeEventKind {
+    return switch (event) {
+        .key_press => .key_press,
+        .winsize => .winsize,
+        .user_msg => .user_msg,
+        .mouse => .mouse,
+        .focus_in => .focus_in,
+        .focus_out => .focus_out,
+        .paste => .paste,
+        .frame => .frame,
+    };
+}
+
+fn timingStart(enabled: bool, io: std.Io) u64 {
+    return if (enabled) timestampNs(io) else 0;
+}
+
+fn timingElapsed(start_ns: u64, io: std.Io) u64 {
+    return elapsedNs(start_ns, timestampNs(io));
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    return deltaNs(start_ns, end_ns);
+}
+
 fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
     vx.caps.unicode = .unicode;
     vx.screen.width_method = .unicode;
@@ -445,7 +565,9 @@ fn render(
     frame_arena: *std.heap.ArenaAllocator,
     app: *const App,
     writer: *std.Io.Writer,
-) !void {
+    io: std.Io,
+    measure: bool,
+) !RenderTimings {
     _ = frame_arena.reset(.retain_capacity);
     const win = vx.window();
     win.clear();
@@ -453,8 +575,17 @@ fn render(
         .window = win,
         .arena = frame_arena.allocator(),
     };
+    const view_start = timingStart(measure, io);
     try app.view(&sfc);
+    const view_ns = if (measure) timingElapsed(view_start, io) else 0;
+    const render_start = timingStart(measure, io);
     try vx.render(writer);
+    const render_ns = if (measure) timingElapsed(render_start, io) else 0;
+
+    return .{
+        .view_ns = view_ns,
+        .render_ns = render_ns,
+    };
 }
 
 test "InternalEvent instantiation" {
@@ -493,4 +624,14 @@ test "deltaNs clamps non-monotonic timestamps" {
     try std.testing.expectEqual(@as(u64, 5), deltaNs(10, 15));
     try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 10));
     try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 9));
+}
+
+test "elapsedNs uses deltaNs clamping" {
+    try std.testing.expectEqual(@as(u64, 5), elapsedNs(10, 15));
+    try std.testing.expectEqual(@as(u64, 0), elapsedNs(10, 9));
+}
+
+test "timingStart returns zero when timing is disabled" {
+    const io: std.Io = undefined;
+    try std.testing.expectEqual(@as(u64, 0), timingStart(false, io));
 }

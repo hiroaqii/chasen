@@ -29,6 +29,11 @@ pub const StateDeinitContext = state_store.StateDeinitContext;
 
 pub const text = @import("text.zig");
 
+pub const stats = @import("stats.zig");
+pub const RuntimeEventKind = stats.RuntimeEventKind;
+pub const RuntimeStats = stats.RuntimeStats;
+pub const StatsFn = stats.StatsFn;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).
@@ -62,6 +67,14 @@ pub const RunOptions = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     env_map: *std.process.Environ.Map,
+    /// Optional callback called after each runtime event loop iteration.
+    ///
+    /// The callback receives lightweight timing information. Chasen does not
+    /// store, aggregate, format, or export these stats. When this is `null`,
+    /// Chasen skips runtime timing measurements.
+    stats_fn: ?StatsFn = null,
+    /// Optional caller-owned context passed to `stats_fn`.
+    stats_context: ?*anyopaque = null,
 };
 
 /// Run the application (Juicy Main API).
