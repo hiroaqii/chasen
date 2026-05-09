@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const example_names = [_][]const u8{ "counter", "stopwatch", "http", "animation" };
+    const example_names = [_][]const u8{ "counter", "stopwatch", "http", "animation", "runtime_stats" };
 
     const check_examples_step = b.step("check-examples", "Build all examples");
 
