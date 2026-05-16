@@ -263,6 +263,27 @@ The `surface_basics` example shows these rules in a runnable app:
 zig build run-surface_basics
 ```
 
+## Testing Surface Drawing
+
+Use `chasen.testing.TestSurface` when a component test needs to verify drawing
+without starting a terminal runtime.
+
+```zig
+var ts: chasen.testing.TestSurface = undefined;
+try ts.init(6, 3);
+defer ts.deinit();
+
+myComponent.view(&ts.surface, .{});
+
+try ts.expectCellText(0, 0, "t");
+try ts.expectSnapshot("title \nbody  \nfooter");
+```
+
+`expectSnapshot` compares a row-major text snapshot. It is intentionally small
+and includes padding spaces out to the full surface width. Use
+`ts.surface.readCell` or `ts.expectCellText` directly when a test needs to
+inspect style, cursor behavior, wide-character layout, or individual cells.
+
 ## Animation
 
 Animation and media packages should drive rendering with `ctx.requestFrame()`.

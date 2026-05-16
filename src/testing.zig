@@ -1,5 +1,114 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ctx_mod = @import("ctx.zig");
+const surface_mod = @import("surface.zig");
+
+/// Headless `Surface` test fixture backed by a libvaxis `Screen`.
+///
+/// Use this from core and component tests that need to verify rendered cells
+/// without starting a terminal runtime.
+///
+/// Usage:
+/// ```
+/// var ts: chasen.testing.TestSurface = undefined;
+/// try ts.init(20, 4);
+/// defer ts.deinit();
+///
+/// _ = ts.surface.textAt(0, 0, "ok", .{});
+/// try ts.expectSnapshot("ok                  \n                    \n                    \n                    ");
+/// ```
+pub const TestSurface = struct {
+    screen: vaxis.Screen,
+    arena: std.heap.ArenaAllocator,
+    surface: surface_mod.Surface,
+
+    /// Initialize this fixture in its final memory location.
+    ///
+    /// `Surface` stores a window that points at `screen`, so `TestSurface`
+    /// should not be moved after `init`.
+    pub fn init(self: *TestSurface, width: u16, height: u16) !void {
+        const screen = try vaxis.Screen.init(std.testing.allocator, .{
+            .cols = width,
+            .rows = height,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+
+        self.* = .{
+            .screen = screen,
+            .arena = .init(std.testing.allocator),
+            .surface = .{
+                .window = .{
+                    .x_off = 0,
+                    .y_off = 0,
+                    .parent_x_off = 0,
+                    .parent_y_off = 0,
+                    .width = width,
+                    .height = height,
+                    .screen = undefined,
+                },
+                .arena = undefined,
+            },
+        };
+        self.screen.width_method = .unicode;
+        self.bind();
+    }
+
+    /// Release resources owned by this fixture.
+    pub fn deinit(self: *TestSurface) void {
+        self.arena.deinit();
+        self.screen.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+
+    fn bind(self: *TestSurface) void {
+        self.surface.window.screen = &self.screen;
+        self.surface.arena = self.arena.allocator();
+    }
+
+    /// Return the grapheme stored at one cell, or a space for an empty/default
+    /// cell.
+    pub fn cellText(self: *const TestSurface, col: u16, row: u16) []const u8 {
+        const cell = self.surface.readCell(col, row) orelse return " ";
+        if (cell.char.grapheme.len == 0) return " ";
+        return cell.char.grapheme;
+    }
+
+    /// Assert that one cell contains `expected`.
+    pub fn expectCellText(self: *const TestSurface, col: u16, row: u16, expected: []const u8) !void {
+        try std.testing.expectEqualStrings(expected, self.cellText(col, row));
+    }
+
+    /// Create a row-major text snapshot of the current surface contents.
+    ///
+    /// Rows are separated with `\n`. The final row has no trailing newline.
+    /// This helper is intended for compact ASCII-focused render tests; use
+    /// `readCell` directly when style or wide-character cell layout matters.
+    pub fn snapshot(self: *const TestSurface, allocator: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        const size = self.surface.size();
+
+        var row: u16 = 0;
+        while (row < size.height) : (row += 1) {
+            var col: u16 = 0;
+            while (col < size.width) : (col += 1) {
+                try out.appendSlice(allocator, self.cellText(col, row));
+            }
+            if (row + 1 < size.height) {
+                try out.append(allocator, '\n');
+            }
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Assert the row-major text snapshot.
+    pub fn expectSnapshot(self: *const TestSurface, expected: []const u8) !void {
+        const actual = try self.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+};
 
 /// Lightweight test wrapper around `Ctx(Msg)`.
 ///
@@ -129,3 +238,26 @@ test "update call pattern with a counter app" {
 }
 
 const TestMsg = union(enum) { inc, dec };
+
+test "TestSurface exposes a drawable headless surface" {
+    var ts: TestSurface = undefined;
+    try ts.init(6, 2);
+    defer ts.deinit();
+
+    _ = ts.surface.textAt(1, 0, "ok", .{});
+
+    try ts.expectCellText(1, 0, "o");
+    try ts.expectCellText(2, 0, "k");
+    try ts.expectSnapshot(" ok   \n      ");
+}
+
+test "TestSurface snapshot captures child clipping" {
+    var ts: TestSurface = undefined;
+    try ts.init(5, 2);
+    defer ts.deinit();
+
+    var child = ts.surface.child(.{ .col = 1, .row = 0, .width = 3, .height = 1 });
+    _ = child.textAt(0, 0, "abcd", .{});
+
+    try ts.expectSnapshot(" abc \n     ");
+}
