@@ -350,6 +350,80 @@ pub fn handleEvent(self: *const Self, event: chasen.Event) ?Msg {
 Idle apps remain event-driven. Continuous rendering only happens while code
 keeps requesting frames.
 
+## Effect Lifecycle
+
+`Ctx` queues effects; it does not execute them immediately. The runtime drains
+pending effects after `init` and after each `update`.
+
+Startup order:
+
+```text
+app.init?(*Ctx)
+runtime drains effects queued during init
+app.view(*Surface)
+render
+```
+
+Terminal event path:
+
+```text
+terminal event
+app.handleEvent(Event) ?Msg
+if handleEvent returns Msg:
+  app.update(Msg, *Ctx)
+  runtime drains effects queued during update
+  app.view(*Surface), unless the app suppressed redraw
+  render
+else:
+  no update and no redraw from that event
+```
+
+Runtime message path:
+
+```text
+spawn/tick/every completes
+runtime receives user Msg
+app.update(Msg, *Ctx)
+runtime drains effects queued during update
+app.view(*Surface), unless the app suppressed redraw
+render
+```
+
+Effect-produced messages bypass `handleEvent`; they are already app `Msg`
+values. Terminal-facing events call `handleEvent`, and `update` only runs when
+`handleEvent` returns a message.
+
+Terminal resize is the exception: after a winsize event, the runtime redraws
+even if `handleEvent` returns `null` or the app suppresses redraw. This keeps
+the screen buffer matched to the new terminal size.
+
+Effect drain currently processes pending work in this order:
+
+1. `spawn` / `spawnWith`
+2. `tick`
+3. `every`
+4. `cancelTimer`
+5. `requestFrame`
+
+`tick(id, after_ns, msg)` schedules one future message. `every(id,
+interval_ns, msg)` schedules repeated messages until cancelled. Scheduling a
+new `tick` or `every` with the same id replaces the existing running timer with
+that id.
+
+`cancelTimer(id)` removes matching timers queued in the current `Ctx` and also
+queues cancellation for matching timers already running in the runtime. Timer
+ids are borrowed text and must remain valid until the runtime drains the cancel
+request.
+
+`requestFrame()` requests one future `Event.frame`. It is coalesced while a
+frame request is already in flight; it does not create an idle render loop by
+itself. Re-request from `update` while animation should continue, and stop
+requesting when the animation is done.
+
+`suppressRedraw()` is message-scoped. The runtime resets that flag immediately
+before each `update`; if the update suppresses redraw, pending effects are still
+drained, but the redraw for that message is skipped.
+
 ## Msg Ownership
 
 `Msg` values cross the runtime boundary by value. Be explicit about ownership.
