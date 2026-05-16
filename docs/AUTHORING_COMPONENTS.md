@@ -213,8 +213,24 @@ surface.hideCursor();
 surface.setCursorShape(shape);
 ```
 
-Use `child(rect)` for clipping and nested layout. `fill`, `clear`, and `scroll`
-operate within the given rectangle and are safe for component-local drawing.
+Use `child(rect)` for clipping and nested layout. A child surface is clipped to
+the requested rectangle, clamped to the parent bounds, and shares the same frame
+allocator as its parent. Coordinates passed to drawing APIs on a child are local
+to that child. For example, `child.textAt(0, 0, ...)` draws at the top-left of
+the child rectangle, not the top-left of the root surface.
+
+`textAt` draws one unwrapped line and relies on the current surface for
+clipping. On a child surface, long text is clipped by the child width and does
+not draw into sibling or parent regions. Use this for component-local viewports
+such as panels, table cells, text fields, and scroll windows.
+
+`showCursor` also uses coordinates relative to the surface it is called on.
+Calling `child.showCursor(4, 2)` places the terminal cursor inside the child at
+local column 4, local row 2. This keeps input components from needing to convert
+local cursor positions back to root-surface coordinates.
+
+`fill`, `clear`, and `scroll` operate within the given rectangle and are safe
+for component-local drawing.
 
 `textAt` and `Column.text` are borrowed text APIs. They do not copy the string;
 the bytes must stay valid until the current frame finishes rendering. Static
@@ -240,6 +256,12 @@ panel.view(surface, .{ .title = title });
 `frameAllocator()` is reset after the current frame. Use it only for temporary
 formatting or layout buffers during `view`. Never store memory from the frame
 allocator in `Model`, `Msg`, or `StateStore`.
+
+The `surface_basics` example shows these rules in a runnable app:
+
+```sh
+zig build run-surface_basics
+```
 
 ## Animation
 
