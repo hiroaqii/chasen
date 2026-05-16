@@ -410,6 +410,13 @@ interval_ns, msg)` schedules repeated messages until cancelled. Scheduling a
 new `tick` or `every` with the same id replaces the existing running timer with
 that id.
 
+The `tick` example shows a one-shot timer, same-id replacement, and
+`cancelTimer` in a runnable app:
+
+```sh
+zig build run-tick
+```
+
 `cancelTimer(id)` removes matching timers queued in the current `Ctx` and also
 queues cancellation for matching timers already running in the runtime. Timer
 ids are borrowed text and must remain valid until the runtime drains the cancel

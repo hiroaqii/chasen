@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     const example_names = [_][]const u8{
         "counter",
         "stopwatch",
+        "tick",
         "http",
         "animation",
         "runtime_stats",
