@@ -200,6 +200,9 @@ surface.frameAllocator();
 surface.writeCell(col, row, cell);
 surface.readCell(col, row);
 surface.textAt(col, row, text, style);
+surface.copyText(text);
+surface.copyTextAt(col, row, text, style);
+surface.printAt(col, row, style, "value: {d}", .{value});
 surface.displayWidth(text);
 surface.fill(rect, cell);
 surface.clear(rect);
@@ -212,6 +215,27 @@ surface.setCursorShape(shape);
 
 Use `child(rect)` for clipping and nested layout. `fill`, `clear`, and `scroll`
 operate within the given rectangle and are safe for component-local drawing.
+
+`textAt` and `Column.text` are borrowed text APIs. They do not copy the string;
+the bytes must stay valid until the current frame finishes rendering. Static
+strings, app-owned model text, and component-owned buffers are safe. Stack
+buffers created during `view` are not safe:
+
+```zig
+var buf: [32]u8 = undefined;
+const text = std.fmt.bufPrint(&buf, "count: {d}", .{count}) catch "";
+_ = surface.textAt(0, 0, text, .{}); // invalid: text dies before render
+```
+
+Use `printAt` for formatted text and `copyText` / `copyTextAt` for dynamic text
+that must be made frame-owned:
+
+```zig
+try surface.printAt(0, 0, .{}, "count: {d}", .{count});
+
+const title = try surface.copyText(dynamic_title);
+panel.view(surface, .{ .title = title });
+```
 
 `frameAllocator()` is reset after the current frame. Use it only for temporary
 formatting or layout buffers during `view`. Never store memory from the frame

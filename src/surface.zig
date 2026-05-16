@@ -78,7 +78,12 @@ pub const Surface = struct {
         return self.window.readCell(col, row);
     }
 
-    /// Print styled text at `col`, `row` without wrapping.
+    /// Print borrowed styled text at `col`, `row` without wrapping.
+    ///
+    /// The string is not copied. It must remain valid until the current frame's
+    /// render finishes. Static strings, app-owned state, and component-owned
+    /// buffers are appropriate inputs. Use `copyTextAt` or `printAt` for
+    /// temporary strings created during `view`.
     pub fn textAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) PrintResult {
         return .fromVaxis(self.window.printSegment(.{
             .text = str,
@@ -88,6 +93,38 @@ pub const Surface = struct {
             .row_offset = row,
             .wrap = .none,
         }));
+    }
+
+    /// Copy `str` into the frame allocator and return the copied text.
+    ///
+    /// The returned slice remains valid until the current frame finishes
+    /// rendering. It is intended for dynamic text that must be passed through a
+    /// borrowed API such as a component view option.
+    pub fn copyText(self: *Surface, str: []const u8) ![]const u8 {
+        return self.arena.dupe(u8, str);
+    }
+
+    /// Copy `str` into the frame allocator, then print it with `textAt`.
+    ///
+    /// Use this when the source text may not live until render completion.
+    pub fn copyTextAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) !PrintResult {
+        const copied = try self.copyText(str);
+        return self.textAt(col, row, copied, ts);
+    }
+
+    /// Format text into the frame allocator, then print it with `textAt`.
+    ///
+    /// This is the safe default for formatted text created during `view`.
+    pub fn printAt(
+        self: *Surface,
+        col: u16,
+        row: u16,
+        ts: TextStyle,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !PrintResult {
+        const str = try std.fmt.allocPrint(self.arena, fmt, args);
+        return self.textAt(col, row, str, ts);
     }
 
     /// Return the terminal display width of `str`.
@@ -197,8 +234,10 @@ pub const Column = struct {
     row: u16,
     gap: u16,
 
-    /// Print a styled text segment at the current row, then advance
+    /// Print a borrowed styled text segment at the current row, then advance
     /// the cursor by `gap` rows.
+    ///
+    /// The string has the same lifetime requirement as `Surface.textAt`.
     pub fn text(self: *Column, str: []const u8, ts: TextStyle) void {
         const result = self.window.printSegment(.{
             .text = str,
@@ -217,16 +256,20 @@ pub const Column = struct {
 
 const TestSurface = struct {
     screen: vaxis.Screen,
+    arena: std.heap.ArenaAllocator,
     surface: Surface,
 
     fn deinit(self: *@This()) void {
+        self.arena.deinit();
         self.screen.deinit(std.testing.allocator);
     }
 
-    /// Window stores a pointer to Screen, so bind after TestSurface has moved
-    /// into the caller's stack slot.
+    /// Window stores a pointer to Screen and Surface stores an allocator backed
+    /// by the arena, so bind after TestSurface has moved into the caller's
+    /// stack slot.
     fn bind(self: *@This()) void {
         self.surface.window.screen = &self.screen;
+        self.surface.arena = self.arena.allocator();
     }
 };
 
@@ -249,9 +292,10 @@ fn testSurface(width: u16, height: u16) !TestSurface {
     };
     return .{
         .screen = screen,
+        .arena = .init(std.testing.allocator),
         .surface = .{
             .window = window,
-            .arena = std.testing.allocator,
+            .arena = undefined,
         },
     };
 }
@@ -347,6 +391,54 @@ test "Surface.textAt prints unwrapped styled text at coordinates" {
     try std.testing.expectEqualStrings("a", a.char.grapheme);
     try std.testing.expectEqualStrings("c", c.char.grapheme);
     try std.testing.expect(a.style.fg.eql(.{ .index = 2 }));
+}
+
+test "Surface.copyText copies text into the frame allocator" {
+    var ts = try testSurface(4, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    var buf: [4]u8 = .{ 'a', 'b', 'c', 'd' };
+    const copied = try ts.surface.copyText(buf[0..]);
+    buf[0] = 'z';
+
+    try std.testing.expectEqualStrings("abcd", copied);
+}
+
+test "Surface.copyTextAt copies and prints dynamic text" {
+    var ts = try testSurface(8, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    var buf: [4]u8 = .{ 't', 'e', 's', 't' };
+    const result = try ts.surface.copyTextAt(1, 0, buf[0..], .{ .bold = true });
+    buf[0] = 'x';
+
+    try std.testing.expectEqual(@as(u16, 5), result.col);
+    try std.testing.expectEqual(@as(u16, 0), result.row);
+    try std.testing.expect(!result.overflow);
+
+    const first = ts.surface.window.readCell(1, 0).?;
+    try std.testing.expectEqualStrings("t", first.char.grapheme);
+    try std.testing.expect(first.style.bold);
+}
+
+test "Surface.printAt formats text into the frame allocator" {
+    var ts = try testSurface(12, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    const result = try ts.surface.printAt(0, 0, .{ .fg = .{ .index = 3 } }, "line {d}", .{3});
+
+    try std.testing.expectEqual(@as(u16, 6), result.col);
+    try std.testing.expectEqual(@as(u16, 0), result.row);
+    try std.testing.expect(!result.overflow);
+
+    const l = ts.surface.window.readCell(0, 0).?;
+    const three = ts.surface.window.readCell(5, 0).?;
+    try std.testing.expectEqualStrings("l", l.char.grapheme);
+    try std.testing.expectEqualStrings("3", three.char.grapheme);
+    try std.testing.expect(l.style.fg.eql(.{ .index = 3 }));
 }
 
 test "Surface.fill and clear affect a rect" {
