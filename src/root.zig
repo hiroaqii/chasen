@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 pub const style = @import("style.zig");
 pub const TextStyle = style.TextStyle;
 pub const Color = style.Color;
+pub const Underline = style.Underline;
 
 pub const surface = @import("surface.zig");
 pub const Surface = surface.Surface;

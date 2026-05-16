@@ -20,6 +20,28 @@ pub const Color = union(enum) {
     }
 };
 
+/// Terminal underline style.
+pub const Underline = enum {
+    off,
+    single,
+    double,
+    curly,
+    dotted,
+    dashed,
+
+    /// Convert to the underlying vaxis underline representation.
+    pub fn toVaxis(self: Underline) vaxis.Cell.Style.Underline {
+        return switch (self) {
+            .off => .off,
+            .single => .single,
+            .double => .double,
+            .curly => .curly,
+            .dotted => .dotted,
+            .dashed => .dashed,
+        };
+    }
+};
+
 /// Text styling attributes for use with `Column.text()`.
 /// All fields default to off/default, so `.{ .bold = true }` is sufficient
 /// to create a bold style with default colors.
@@ -27,8 +49,12 @@ pub const TextStyle = struct {
     bold: bool = false,
     italic: bool = false,
     dim: bool = false,
+    reverse: bool = false,
+    strikethrough: bool = false,
     fg: Color = .default,
     bg: Color = .default,
+    underline: Underline = .off,
+    underline_color: Color = .default,
 
     /// Convert to the underlying vaxis style representation.
     pub fn toVaxis(self: TextStyle) vaxis.Cell.Style {
@@ -36,8 +62,12 @@ pub const TextStyle = struct {
             .bold = self.bold,
             .italic = self.italic,
             .dim = self.dim,
+            .reverse = self.reverse,
+            .strikethrough = self.strikethrough,
             .fg = self.fg.toVaxis(),
             .bg = self.bg.toVaxis(),
+            .ul = self.underline_color.toVaxis(),
+            .ul_style = self.underline.toVaxis(),
         };
     }
 };
@@ -71,15 +101,23 @@ test "TextStyle.toVaxis preserves all fields" {
         .bold = true,
         .italic = true,
         .dim = true,
+        .reverse = true,
+        .strikethrough = true,
         .fg = .{ .rgb = .{ 255, 0, 0 } },
         .bg = .{ .index = 4 },
+        .underline = .curly,
+        .underline_color = .{ .index = 5 },
     };
     const vs = style.toVaxis();
     try @import("std").testing.expect(vs.bold);
     try @import("std").testing.expect(vs.italic);
     try @import("std").testing.expect(vs.dim);
+    try @import("std").testing.expect(vs.reverse);
+    try @import("std").testing.expect(vs.strikethrough);
     try @import("std").testing.expect(vs.fg.eql(.{ .rgb = .{ 255, 0, 0 } }));
     try @import("std").testing.expect(vs.bg.eql(.{ .index = 4 }));
+    try @import("std").testing.expect(vs.ul.eql(.{ .index = 5 }));
+    try @import("std").testing.expectEqual(vaxis.Cell.Style.Underline.curly, vs.ul_style);
 }
 
 test "TextStyle default is all false/default" {
@@ -88,6 +126,10 @@ test "TextStyle default is all false/default" {
     try @import("std").testing.expect(!vs.bold);
     try @import("std").testing.expect(!vs.italic);
     try @import("std").testing.expect(!vs.dim);
+    try @import("std").testing.expect(!vs.reverse);
+    try @import("std").testing.expect(!vs.strikethrough);
     try @import("std").testing.expect(vs.fg.eql(.default));
     try @import("std").testing.expect(vs.bg.eql(.default));
+    try @import("std").testing.expect(vs.ul.eql(.default));
+    try @import("std").testing.expectEqual(vaxis.Cell.Style.Underline.off, vs.ul_style);
 }

@@ -263,6 +263,34 @@ The `surface_basics` example shows these rules in a runnable app:
 zig build run-surface_basics
 ```
 
+## Text Style
+
+Use `chasen.TextStyle` for public component drawing options instead of exposing
+libvaxis style types directly.
+
+The stable style surface currently includes:
+
+- `fg` / `bg`
+- `bold` / `italic` / `dim`
+- `underline` / `underline_color`
+- `reverse`
+- `strikethrough`
+
+Example:
+
+```zig
+_ = surface.textAt(0, 0, "warning", .{
+    .bold = true,
+    .underline = .single,
+    .underline_color = .{ .index = 3 },
+    .fg = .{ .index = 3 },
+});
+```
+
+`blink` and `invisible` are intentionally not exposed yet. They are terminal
+dependent and have stronger UX implications, so add them only when a real
+component or app has a clear need.
+
 ## Testing Surface Drawing
 
 Use `chasen.testing.TestSurface` when a component test needs to verify drawing
