@@ -36,9 +36,47 @@ pub const DrawError = error{
 /// diagnostics can be added later without exposing libvaxis error sets through
 /// app messages.
 pub const LoadError = enum {
+    unsupported,
     load_failed,
     registry_full,
 };
+
+pub const PathLoadError = error{
+    Unsupported,
+    LoadFailed,
+};
+
+/// Backend Vaxis type used by `PathLoaderFn`.
+///
+/// External terminal adapters should name this alias instead of importing their
+/// own `vaxis` module, so the function signature matches Chasen's module
+/// instance exactly.
+pub const LoaderVaxis = vaxis.Vaxis;
+
+/// Backend image type returned by `PathLoaderFn`.
+pub const LoaderImage = vaxis.Image;
+
+/// Adapter hook used by terminal runners to turn a local path into a terminal
+/// image. Core keeps this opt-in so apps that do not use terminal images avoid
+/// compiling image decode/transmit code.
+pub const PathLoaderFn = *const fn (
+    ?*anyopaque,
+    *LoaderVaxis,
+    *std.Io.Writer,
+    std.mem.Allocator,
+    []const u8,
+) PathLoadError!LoaderImage;
+
+/// Default path loader used when terminal image loading is not configured.
+pub fn unsupportedPathLoader(
+    _: ?*anyopaque,
+    _: *LoaderVaxis,
+    _: *std.Io.Writer,
+    _: std.mem.Allocator,
+    _: []const u8,
+) PathLoadError!LoaderImage {
+    return error.Unsupported;
+}
 
 pub const Registry = struct {
     entries: std.ArrayList(Entry) = .empty,

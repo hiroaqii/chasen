@@ -20,6 +20,10 @@ pub const TerminalImageHandle = terminal_image.TerminalImageHandle;
 pub const TerminalImageFit = terminal_image.TerminalImageFit;
 pub const TerminalImageOptions = terminal_image.TerminalImageOptions;
 pub const TerminalImageLoadError = terminal_image.LoadError;
+pub const TerminalImagePathLoadError = terminal_image.PathLoadError;
+pub const TerminalImagePathLoaderFn = terminal_image.PathLoaderFn;
+pub const TerminalImageLoaderVaxis = terminal_image.LoaderVaxis;
+pub const TerminalImageLoaderImage = terminal_image.LoaderImage;
 
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
@@ -82,6 +86,14 @@ pub const RunOptions = struct {
     stats_fn: ?StatsFn = null,
     /// Optional caller-owned context passed to `stats_fn`.
     stats_context: ?*anyopaque = null,
+    /// Optional terminal image path loader.
+    ///
+    /// Leave null when the app does not load terminal images. Terminal-only
+    /// runners can provide an adapter outside core when image decode/transmit
+    /// support is needed.
+    terminal_image_path_loader: ?TerminalImagePathLoaderFn = null,
+    /// Optional caller-owned context passed to `terminal_image_path_loader`.
+    terminal_image_loader_context: ?*anyopaque = null,
 };
 
 /// Run the application (Juicy Main API).

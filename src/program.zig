@@ -209,7 +209,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop);
+        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
     }
@@ -275,7 +275,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop);
+        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
@@ -496,6 +496,7 @@ fn processPendingTerminalImages(
     tty: *std.Io.Writer,
     allocator: std.mem.Allocator,
     loop: *vaxis.Loop(InternalEvent(Msg)),
+    opts: root.RunOptions,
 ) !void {
     for (app_ctx.pendingTerminalImageUnloadSlice()) |handle| {
         _ = registry.unload(vx.*, tty, handle);
@@ -505,8 +506,9 @@ fn processPendingTerminalImages(
     for (app_ctx.pendingTerminalImageLoadSlice()) |entry| {
         defer allocator.free(entry.path);
 
-        const handle = loadTerminalImagePath(registry, vx, tty, allocator, entry.path) catch |err| {
+        const handle = loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts) catch |err| {
             const reason: terminal_image.LoadError = switch (err) {
+                error.Unsupported => .unsupported,
                 error.LoadFailed => .load_failed,
                 error.RegistryFull => .registry_full,
             };
@@ -524,16 +526,17 @@ fn loadTerminalImagePath(
     tty: *std.Io.Writer,
     allocator: std.mem.Allocator,
     path: []const u8,
-) error{ LoadFailed, RegistryFull }!terminal_image.TerminalImageHandle {
-    // Boundary is wired first. Directly compiling `vx.loadImage` from the
-    // generic app runner currently makes Zig 0.16 example builds SEGV, so the
-    // real terminal adapter stays as the next task.
-    _ = registry;
-    _ = vx;
-    _ = tty;
-    _ = allocator;
-    _ = path;
-    return error.LoadFailed;
+    opts: root.RunOptions,
+) error{ Unsupported, LoadFailed, RegistryFull }!terminal_image.TerminalImageHandle {
+    const loader = opts.terminal_image_path_loader orelse terminal_image.unsupportedPathLoader;
+    const image = loader(opts.terminal_image_loader_context, vx, tty, allocator, path) catch |err| switch (err) {
+        error.Unsupported => return error.Unsupported,
+        error.LoadFailed => return error.LoadFailed,
+    };
+    return registry.add(allocator, image) catch {
+        vx.freeImage(tty, image.id);
+        return error.RegistryFull;
+    };
 }
 
 fn timestampNs(io: std.Io) u64 {
