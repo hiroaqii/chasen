@@ -515,7 +515,9 @@ fn processPendingTerminalImages(
             loop.postEvent(.{ .user_msg = entry.failed(entry.ctx, reason) }) catch {};
             continue;
         };
-        loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {};
+        loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {
+            _ = registry.unload(vx.*, tty, handle);
+        };
     }
     app_ctx.pending_terminal_image_loads_len = 0;
 }
