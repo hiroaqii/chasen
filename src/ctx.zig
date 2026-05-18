@@ -1,5 +1,6 @@
 const std = @import("std");
 const cmd_mod = @import("cmd.zig");
+const terminal_image = @import("terminal_image.zig");
 
 /// Context object passed to `update`, providing side-effect methods.
 ///
@@ -10,10 +11,15 @@ pub fn Ctx(comptime Msg: type) type {
     const max_tasks = 16;
     const max_ticks = 8;
     const max_everys = 8;
+    const max_terminal_image_loads = 8;
+    const max_terminal_image_unloads = 8;
 
     const max_cancels = 8;
 
     return struct {
+        pub const TerminalImageLoadedFn = *const fn (*anyopaque, terminal_image.TerminalImageHandle) Msg;
+        pub const TerminalImageFailedFn = *const fn (*anyopaque, terminal_image.LoadError) Msg;
+
         pub const TickEntry = struct {
             id: []const u8,
             after_ns: u64,
@@ -31,6 +37,13 @@ pub fn Ctx(comptime Msg: type) type {
             run: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
         };
 
+        pub const TerminalImageLoadEntry = struct {
+            path: []const u8,
+            ctx: *anyopaque,
+            loaded: TerminalImageLoadedFn,
+            failed: TerminalImageFailedFn,
+        };
+
         // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
         _allocator: std.mem.Allocator = undefined,
@@ -45,6 +58,10 @@ pub fn Ctx(comptime Msg: type) type {
         pending_everys_len: u8 = 0,
         pending_cancels: [max_cancels][]const u8 = undefined,
         pending_cancels_len: u8 = 0,
+        pending_terminal_image_loads: [max_terminal_image_loads]TerminalImageLoadEntry = undefined,
+        pending_terminal_image_loads_len: u8 = 0,
+        pending_terminal_image_unloads: [max_terminal_image_unloads]terminal_image.TerminalImageHandle = undefined,
+        pending_terminal_image_unloads_len: u8 = 0,
         redraw_suppressed: bool = false,
         frame_requested: bool = false,
 
@@ -91,6 +108,50 @@ pub fn Ctx(comptime Msg: type) type {
         /// Return a slice of pending task-with entries.
         pub fn pendingTaskWithSlice(self: *@This()) []const TaskWithEntry {
             return self.pending_tasks_with[0..self.pending_tasks_with_len];
+        }
+
+        /// Queue a local terminal image path to be loaded by the runtime.
+        ///
+        /// The path is copied while queueing because effects are drained after
+        /// `init`/`update` returns. The runtime frees the copied path after it
+        /// posts either `loaded` or `failed`.
+        pub fn loadTerminalImagePath(
+            self: *@This(),
+            path: []const u8,
+            ctx_ptr: *anyopaque,
+            loaded_fn: TerminalImageLoadedFn,
+            failed_fn: TerminalImageFailedFn,
+        ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!void {
+            if (self.pending_terminal_image_loads_len >= max_terminal_image_loads)
+                return error.TerminalImageLoadLimitExceeded;
+
+            const copied_path = try self._allocator.dupe(u8, path);
+            self.pending_terminal_image_loads[self.pending_terminal_image_loads_len] = .{
+                .path = copied_path,
+                .ctx = ctx_ptr,
+                .loaded = loaded_fn,
+                .failed = failed_fn,
+            };
+            self.pending_terminal_image_loads_len += 1;
+        }
+
+        pub fn pendingTerminalImageLoadSlice(self: *@This()) []const TerminalImageLoadEntry {
+            return self.pending_terminal_image_loads[0..self.pending_terminal_image_loads_len];
+        }
+
+        /// Queue a terminal image handle for release by the runtime.
+        ///
+        /// Unlike timer cancellation, image unload is an explicit resource
+        /// lifecycle operation, so queue pressure is observable to the app.
+        pub fn unloadTerminalImage(self: *@This(), handle: terminal_image.TerminalImageHandle) error{TerminalImageUnloadLimitExceeded}!void {
+            if (self.pending_terminal_image_unloads_len >= max_terminal_image_unloads)
+                return error.TerminalImageUnloadLimitExceeded;
+            self.pending_terminal_image_unloads[self.pending_terminal_image_unloads_len] = handle;
+            self.pending_terminal_image_unloads_len += 1;
+        }
+
+        pub fn pendingTerminalImageUnloadSlice(self: *@This()) []const terminal_image.TerminalImageHandle {
+            return self.pending_terminal_image_unloads[0..self.pending_terminal_image_unloads_len];
         }
 
         /// Schedule a one-shot delayed message.
@@ -428,6 +489,56 @@ test "Ctx spawnWith accumulates tasks" {
 
     const slice = ctx_val.pendingTaskWithSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
+}
+
+test "Ctx loadTerminalImagePath copies queued path" {
+    const TestMsg = union(enum) { loaded, failed };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+
+    var path_buf = [_]u8{ 'a', '.', 'p', 'n', 'g' };
+    try ctx_val.loadTerminalImagePath(&path_buf, undefined, &struct {
+        fn loaded(_: *anyopaque, _: terminal_image.TerminalImageHandle) TestMsg {
+            return .loaded;
+        }
+    }.loaded, &struct {
+        fn failed(_: *anyopaque, _: terminal_image.LoadError) TestMsg {
+            return .failed;
+        }
+    }.failed);
+    defer {
+        for (ctx_val.pendingTerminalImageLoadSlice()) |entry| {
+            std.testing.allocator.free(entry.path);
+        }
+        ctx_val.pending_terminal_image_loads_len = 0;
+    }
+
+    path_buf[0] = 'b';
+
+    const pending = ctx_val.pendingTerminalImageLoadSlice();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("a.png", pending[0].path);
+}
+
+test "Ctx unloadTerminalImage queues handles" {
+    const TestMsg = union(enum) { done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const handle = terminal_image.TerminalImageHandle{ .id = 7, .generation = 2 };
+    try ctx_val.unloadTerminalImage(handle);
+
+    const pending = ctx_val.pendingTerminalImageUnloadSlice();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(handle, pending[0]);
+}
+
+test "Ctx unloadTerminalImage returns error when queue is full" {
+    const TestMsg = union(enum) { done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    const handle = terminal_image.TerminalImageHandle{ .id = 7, .generation = 2 };
+    for (0..8) |_| try ctx_val.unloadTerminalImage(handle);
+
+    try std.testing.expectError(error.TerminalImageUnloadLimitExceeded, ctx_val.unloadTerminalImage(handle));
 }
 
 test "dispatch .none does nothing" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const style = @import("style.zig");
+const terminal_image = @import("terminal_image.zig");
 const TextStyle = style.TextStyle;
 
 /// A terminal cell in the underlying screen buffer.
@@ -8,6 +9,9 @@ pub const Cell = vaxis.Cell;
 
 /// Terminal cursor shape.
 pub const CursorShape = vaxis.Cell.CursorShape;
+
+pub const TerminalImageHandle = terminal_image.TerminalImageHandle;
+pub const TerminalImageOptions = terminal_image.TerminalImageOptions;
 
 /// Size of a drawable surface, in terminal cells.
 pub const Size = struct {
@@ -49,6 +53,7 @@ pub const ColumnOptions = struct {
 pub const Surface = struct {
     window: vaxis.Window,
     arena: std.mem.Allocator,
+    image_registry: ?*terminal_image.Registry = null,
 
     /// Return the current drawable size in terminal cells.
     pub fn size(self: *const Surface) Size {
@@ -152,7 +157,17 @@ pub const Surface = struct {
         return .{
             .window = self.windowForRect(rect),
             .arena = self.arena,
+            .image_registry = self.image_registry,
         };
+    }
+
+    /// Draw a previously loaded terminal image into this surface.
+    ///
+    /// Loading/transmitting images is a runtime effect. `view` should only use
+    /// handles already delivered to the application model.
+    pub fn drawTerminalImage(self: *Surface, handle: TerminalImageHandle, opts: TerminalImageOptions) terminal_image.DrawError!void {
+        const registry = self.image_registry orelse return error.TerminalImageRegistryUnavailable;
+        return registry.draw(self.window, handle, opts);
     }
 
     /// Scroll `rect` upward by `rows`, inserting blank rows at the bottom.
@@ -489,6 +504,32 @@ test "Surface.child returns a clipped child surface" {
     try std.testing.expectEqualStrings("a", a.char.grapheme);
     try std.testing.expectEqualStrings("b", b.char.grapheme);
     try std.testing.expectEqualStrings(" ", clipped.char.grapheme);
+}
+
+test "Surface.child preserves terminal image registry reference" {
+    var ts = try testSurface(4, 3);
+    ts.bind();
+    defer ts.deinit();
+
+    var registry: terminal_image.Registry = .{};
+    defer registry.deinit(std.testing.allocator);
+    ts.surface.image_registry = &registry;
+
+    const child = ts.surface.child(.{ .col = 1, .row = 1, .width = 2, .height = 1 });
+
+    try std.testing.expect(child.image_registry != null);
+    try std.testing.expectEqual(&registry, child.image_registry.?);
+}
+
+test "Surface.drawTerminalImage reports missing registry" {
+    var ts = try testSurface(4, 3);
+    ts.bind();
+    defer ts.deinit();
+
+    try std.testing.expectError(
+        error.TerminalImageRegistryUnavailable,
+        ts.surface.drawTerminalImage(.{ .id = 1, .generation = 1 }, .{}),
+    );
 }
 
 test "Surface.child clamps rect to parent bounds" {

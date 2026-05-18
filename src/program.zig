@@ -4,6 +4,7 @@ const surface_mod = @import("surface.zig");
 const Surface = surface_mod.Surface;
 const ctx_mod = @import("ctx.zig");
 const root = @import("root.zig");
+const terminal_image = @import("terminal_image.zig");
 
 const frame_interval_ns: u64 = std.time.ns_per_s / 60;
 
@@ -140,6 +141,12 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     useUnicodeWidth(&vx);
     defer vx.deinit(allocator, tty.writer());
 
+    var terminal_images: terminal_image.Registry = .{};
+    defer {
+        terminal_images.freeAll(vx, tty.writer());
+        terminal_images.deinit(allocator);
+    }
+
     // --- Event loop setup ---
     // Start the loop before querying the terminal. queryTerminal waits for
     // terminal capability responses, which are read and processed by the loop.
@@ -202,12 +209,13 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
     }
 
     // Initial render
-    _ = try render(App, &vx, &frame_arena, &app, tty.writer(), io, false);
+    _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false);
 
     // --- Main loop ---
     while (!app_ctx.should_quit) {
@@ -267,12 +275,13 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
 
         if (needs_render) {
-            const timings = try render(App, &vx, &frame_arena, &app, tty.writer(), io, stats_enabled);
+            const timings = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, stats_enabled);
             if (stats) |*s| {
                 s.view_ns = timings.view_ns;
                 s.render_ns = timings.render_ns;
@@ -479,6 +488,54 @@ fn processPendingCancels(
     app_ctx.pending_cancels_len = 0;
 }
 
+fn processPendingTerminalImages(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    registry: *terminal_image.Registry,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+) !void {
+    for (app_ctx.pendingTerminalImageUnloadSlice()) |handle| {
+        _ = registry.unload(vx.*, tty, handle);
+    }
+    app_ctx.pending_terminal_image_unloads_len = 0;
+
+    for (app_ctx.pendingTerminalImageLoadSlice()) |entry| {
+        defer allocator.free(entry.path);
+
+        const handle = loadTerminalImagePath(registry, vx, tty, allocator, entry.path) catch |err| {
+            const reason: terminal_image.LoadError = switch (err) {
+                error.LoadFailed => .load_failed,
+                error.RegistryFull => .registry_full,
+            };
+            loop.postEvent(.{ .user_msg = entry.failed(entry.ctx, reason) }) catch {};
+            continue;
+        };
+        loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {};
+    }
+    app_ctx.pending_terminal_image_loads_len = 0;
+}
+
+fn loadTerminalImagePath(
+    registry: *terminal_image.Registry,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) error{ LoadFailed, RegistryFull }!terminal_image.TerminalImageHandle {
+    // Boundary is wired first. Directly compiling `vx.loadImage` from the
+    // generic app runner currently makes Zig 0.16 example builds SEGV, so the
+    // real terminal adapter stays as the next task.
+    _ = registry;
+    _ = vx;
+    _ = tty;
+    _ = allocator;
+    _ = path;
+    return error.LoadFailed;
+}
+
 fn timestampNs(io: std.Io) u64 {
     const ns = std.Io.Clock.now(.awake, io).nanoseconds;
     if (ns <= 0) return 0;
@@ -523,6 +580,7 @@ fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
 fn render(
     comptime App: type,
     vx: *vaxis.Vaxis,
+    terminal_images: *terminal_image.Registry,
     frame_arena: *std.heap.ArenaAllocator,
     app: *const App,
     writer: *std.Io.Writer,
@@ -535,6 +593,7 @@ fn render(
     var sfc: Surface = .{
         .window = win,
         .arena = frame_arena.allocator(),
+        .image_registry = terminal_images,
     };
     const view_start = timingStart(measure, io);
     try app.view(&sfc);
