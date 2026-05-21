@@ -2,7 +2,9 @@
 
 This document describes the current component authoring contract for Chasen
 packages such as [`chasen-ui`](https://github.com/hiroaqii/chasen-ui),
-`chasen-anim`, `chasen-media`, and third-party component libraries.
+[`chasen-anim`](https://github.com/hiroaqii/chasen-anim),
+[`chasen-graphics`](https://github.com/hiroaqii/chasen-graphics), and
+third-party component libraries.
 
 Chasen intentionally keeps the core small. A component is not a framework-owned
 object and does not need to implement a trait. Prefer plain Zig structs and
@@ -110,7 +112,7 @@ pub const TextInput = struct {
         surface: *chasen.Surface,
     ) !void {
         _ = state;
-        _ = surface.textAt(0, 0, opts.value, .{});
+        _ = try surface.copyTextAt(0, 0, opts.value, .{});
         if (opts.focused) surface.showCursor(0, 0);
     }
 };
@@ -199,7 +201,7 @@ surface.size();
 surface.frameAllocator();
 surface.writeCell(col, row, cell);
 surface.readCell(col, row);
-surface.textAt(col, row, text, style);
+surface.borrowTextAt(col, row, text, style);
 surface.copyText(text);
 surface.copyTextAt(col, row, text, style);
 surface.printAt(col, row, style, "value: {d}", .{value});
@@ -216,10 +218,11 @@ surface.setCursorShape(shape);
 Use `child(rect)` for clipping and nested layout. A child surface is clipped to
 the requested rectangle, clamped to the parent bounds, and shares the same frame
 allocator as its parent. Coordinates passed to drawing APIs on a child are local
-to that child. For example, `child.textAt(0, 0, ...)` draws at the top-left of
-the child rectangle, not the top-left of the root surface.
+to that child. For example, `child.copyTextAt(0, 0, ...)` draws at the top-left
+of the child rectangle, not the top-left of the root surface.
 
-`textAt` draws one unwrapped line and relies on the current surface for
+`borrowTextAt`, `copyTextAt`, and `printAt` draw one unwrapped line and rely on
+the current surface for
 clipping. On a child surface, long text is clipped by the child width and does
 not draw into sibling or parent regions. Use this for component-local viewports
 such as panels, table cells, text fields, and scroll windows.
@@ -232,15 +235,15 @@ local cursor positions back to root-surface coordinates.
 `fill`, `clear`, and `scroll` operate within the given rectangle and are safe
 for component-local drawing.
 
-`textAt` and `Column.text` are borrowed text APIs. They do not copy the string;
-the bytes must stay valid until the current frame finishes rendering. Static
-strings, app-owned model text, and component-owned buffers are safe. Stack
-buffers created during `view` are not safe:
+`borrowTextAt` and `Column.borrowText` are borrowed text APIs. They do not copy
+the string; the bytes must stay valid until the current frame finishes
+rendering. Static strings, app-owned model text, and component-owned buffers are
+safe. Stack buffers created during `view` are not safe:
 
 ```zig
 var buf: [32]u8 = undefined;
 const text = std.fmt.bufPrint(&buf, "count: {d}", .{count}) catch "";
-_ = surface.textAt(0, 0, text, .{}); // invalid: text dies before render
+_ = surface.borrowTextAt(0, 0, text, .{}); // invalid: text dies before render
 ```
 
 Use `printAt` for formatted text and `copyText` / `copyTextAt` for dynamic text
@@ -279,7 +282,7 @@ The stable style surface currently includes:
 Example:
 
 ```zig
-_ = surface.textAt(0, 0, "warning", .{
+_ = surface.borrowTextAt(0, 0, "warning", .{
     .bold = true,
     .underline = .single,
     .underline_color = .{ .index = 3 },
