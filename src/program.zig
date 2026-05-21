@@ -214,6 +214,20 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
     }
 
+    // Deliver the initial terminal size before the first render. Resize events
+    // only arrive after the terminal changes, but apps often need the current
+    // size for first-frame layout and scroll bounds.
+    if (tty.getWinsize()) |ws| {
+        var initial_stats: ?root.RuntimeStats = null;
+        _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats);
+        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
+        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
+        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
+        processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+    } else |_| {}
+
     // Initial render
     _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false);
 
