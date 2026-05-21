@@ -83,50 +83,50 @@ const RuntimeStatsDemo = struct {
         sfc.hideCursor();
 
         var col = sfc.column(.{ .gap = 1 });
-        col.text("RuntimeStats Example", .{ .bold = true });
-        col.text("space: pause/resume  q: quit", .{ .fg = .gray });
+        col.borrowText("RuntimeStats Example", .{ .bold = true });
+        col.borrowText("space: pause/resume  q: quit", .{ .fg = .gray });
 
         const status = if (self.running) "running" else "paused";
-        try col.textf("frame: {d}  {s}", .{ self.frame_index, status });
+        try col.print("frame: {d}  {s}", .{ self.frame_index, status });
 
-        col.text("", .{});
-        col.text("Latest completed runtime iteration:", .{ .bold = true });
+        col.borrowText("", .{});
+        col.borrowText("Latest completed runtime iteration:", .{ .bold = true });
         // stats_fn is called after an event loop iteration finishes. Since view
         // runs before that callback for the current iteration, the screen shows
         // the latest summary already stored by a previous callback.
         if (self.stats.last) |stats| {
-            try col.textf("event: {s}  events: {d}  frames: {d}", .{
+            try col.print("event: {s}  events: {d}  frames: {d}", .{
                 @tagName(stats.event_kind),
                 stats.event_count,
                 stats.frame_count,
             });
-            try col.textf("did_update: {}  did_render: {}", .{
+            try col.print("did_update: {}  did_render: {}", .{
                 stats.did_update,
                 stats.did_render,
             });
-            try col.textf("handleEvent: {d}us", .{nsToUs(stats.handle_event_ns)});
-            try col.textf("update:      {d}us", .{nsToUs(stats.update_ns)});
-            try col.textf("effects:     {d}us", .{nsToUs(stats.effect_drain_ns)});
-            try col.textf("view:        {d}us", .{nsToUs(stats.view_ns)});
-            try col.textf("render:      {d}us", .{nsToUs(stats.render_ns)});
+            try col.print("handleEvent: {d}us", .{nsToUs(stats.handle_event_ns)});
+            try col.print("update:      {d}us", .{nsToUs(stats.update_ns)});
+            try col.print("effects:     {d}us", .{nsToUs(stats.effect_drain_ns)});
+            try col.print("view:        {d}us", .{nsToUs(stats.view_ns)});
+            try col.print("render:      {d}us", .{nsToUs(stats.render_ns)});
         } else {
-            col.text("waiting for first runtime stats callback", .{ .dim = true });
+            col.borrowText("waiting for first runtime stats callback", .{ .dim = true });
         }
 
-        col.text("", .{});
-        col.text("Maximum observed durations:", .{ .bold = true });
+        col.borrowText("", .{});
+        col.borrowText("Maximum observed durations:", .{ .bold = true });
         // These values are accumulated by onStats. Chasen core does not store
         // or aggregate stats; the app chooses what summary it wants.
-        try col.textf("handleEvent: {d}us", .{nsToUs(self.stats.max_handle_event_ns)});
-        try col.textf("update:      {d}us", .{nsToUs(self.stats.max_update_ns)});
-        try col.textf("effects:     {d}us", .{nsToUs(self.stats.max_effect_drain_ns)});
-        try col.textf("view:        {d}us", .{nsToUs(self.stats.max_view_ns)});
-        try col.textf("render:      {d}us", .{nsToUs(self.stats.max_render_ns)});
-        try col.textf("slow views over 2ms: {d}", .{self.stats.slow_view_count});
+        try col.print("handleEvent: {d}us", .{nsToUs(self.stats.max_handle_event_ns)});
+        try col.print("update:      {d}us", .{nsToUs(self.stats.max_update_ns)});
+        try col.print("effects:     {d}us", .{nsToUs(self.stats.max_effect_drain_ns)});
+        try col.print("view:        {d}us", .{nsToUs(self.stats.max_view_ns)});
+        try col.print("render:      {d}us", .{nsToUs(self.stats.max_render_ns)});
+        try col.print("slow views over 2ms: {d}", .{self.stats.slow_view_count});
 
-        col.text("", .{});
-        col.text("The stats callback updates this summary after each event loop iteration.", .{ .dim = true });
-        col.text("Use chasen.run(...) instead of runWith(... stats_fn ...) to disable it.", .{ .dim = true });
+        col.borrowText("", .{});
+        col.borrowText("The stats callback updates this summary after each event loop iteration.", .{ .dim = true });
+        col.borrowText("Use chasen.run(...) instead of runWith(... stats_fn ...) to disable it.", .{ .dim = true });
     }
 
     pub fn handleEvent(self: *const RuntimeStatsDemo, event: chasen.Event) ?Msg {

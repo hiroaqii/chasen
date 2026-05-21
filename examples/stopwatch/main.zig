@@ -63,12 +63,12 @@ const Stopwatch = struct {
         const millis = total_ms % 1_000;
 
         var col = sfc.column(.{ .gap = 1 });
-        col.text("Stopwatch", .{ .bold = true });
-        try col.textf("{d:0>2}:{d:0>2}.{d:0>3}", .{ minutes, seconds, millis });
+        col.borrowText("Stopwatch", .{ .bold = true });
+        try col.print("{d:0>2}:{d:0>2}.{d:0>3}", .{ minutes, seconds, millis });
 
         const status: []const u8 = if (self.running) "Running" else "Stopped";
-        col.text(status, .{ .fg = .gray });
-        col.text("space: start/stop  r: reset  q: quit", .{ .dim = true });
+        col.borrowText(status, .{ .fg = .gray });
+        col.borrowText("space: start/stop  r: reset  q: quit", .{ .dim = true });
     }
 
     pub fn handleEvent(self: *const Stopwatch, event: chasen.Event) ?Msg {

@@ -20,9 +20,9 @@ const Counter = struct {
 
     pub fn view(self: *const Counter, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
-        col.text("Counter Example", .{ .bold = true });
-        try col.textf("Count: {d}", .{self.count});
-        col.text("Press +/- to change, q to quit", .{ .fg = .gray });
+        col.borrowText("Counter Example", .{ .bold = true });
+        try col.print("Count: {d}", .{self.count});
+        col.borrowText("Press +/- to change, q to quit", .{ .fg = .gray });
     }
 
     pub fn handleEvent(self: *const Counter, event: chasen.Event) ?Msg {

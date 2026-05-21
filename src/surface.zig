@@ -85,11 +85,16 @@ pub const Surface = struct {
 
     /// Print borrowed styled text at `col`, `row` without wrapping.
     ///
-    /// The string is not copied. It must remain valid until the current frame's
-    /// render finishes. Static strings, app-owned state, and component-owned
-    /// buffers are appropriate inputs. Use `copyTextAt` or `printAt` for
-    /// temporary strings created during `view`.
-    pub fn textAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) PrintResult {
+    /// This is the explicit borrowed-text escape hatch. The string is not
+    /// copied, so the caller must guarantee that `str` stays valid until the
+    /// current frame finishes rendering.
+    ///
+    /// Good inputs are string literals, model/state-owned text, and
+    /// component-owned buffers that outlive the frame. Do not pass stack
+    /// buffers, `std.fmt.bufPrint` results, or allocations that may be freed
+    /// before render completion. For text created during `view`, prefer
+    /// `copyTextAt` or `printAt`.
+    pub fn borrowTextAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) PrintResult {
         return .fromVaxis(self.window.printSegment(.{
             .text = str,
             .style = ts.toVaxis(),
@@ -103,23 +108,27 @@ pub const Surface = struct {
     /// Copy `str` into the frame allocator and return the copied text.
     ///
     /// The returned slice remains valid until the current frame finishes
-    /// rendering. It is intended for dynamic text that must be passed through a
-    /// borrowed API such as a component view option.
+    /// rendering. This is useful when dynamic text must be passed through a
+    /// borrowed API, such as a component view option.
     pub fn copyText(self: *Surface, str: []const u8) ![]const u8 {
         return self.arena.dupe(u8, str);
     }
 
-    /// Copy `str` into the frame allocator, then print it with `textAt`.
+    /// Copy `str` into the frame allocator, then print it with `borrowTextAt`.
     ///
-    /// Use this when the source text may not live until render completion.
+    /// Use this for dynamic text that already exists as a slice but may not
+    /// live until render completion. It is the safe default when a caller is
+    /// unsure whether `borrowTextAt` is valid.
     pub fn copyTextAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) !PrintResult {
         const copied = try self.copyText(str);
-        return self.textAt(col, row, copied, ts);
+        return self.borrowTextAt(col, row, copied, ts);
     }
 
-    /// Format text into the frame allocator, then print it with `textAt`.
+    /// Format text into the frame allocator, then print it with `borrowTextAt`.
     ///
-    /// This is the safe default for formatted text created during `view`.
+    /// This is the safe default for formatted text created during `view`. It
+    /// avoids borrowing a temporary stack buffer or short-lived formatting
+    /// result.
     pub fn printAt(
         self: *Surface,
         col: u16,
@@ -129,7 +138,7 @@ pub const Surface = struct {
         args: anytype,
     ) !PrintResult {
         const str = try std.fmt.allocPrint(self.arena, fmt, args);
-        return self.textAt(col, row, str, ts);
+        return self.borrowTextAt(col, row, str, ts);
     }
 
     /// Return the terminal display width of `str`.
@@ -252,8 +261,12 @@ pub const Column = struct {
     /// Print a borrowed styled text segment at the current row, then advance
     /// the cursor by `gap` rows.
     ///
-    /// The string has the same lifetime requirement as `Surface.textAt`.
-    pub fn text(self: *Column, str: []const u8, ts: TextStyle) void {
+    /// This has the same lifetime requirement as `Surface.borrowTextAt`: the
+    /// text is not copied, and the caller must keep it alive until the current
+    /// frame finishes rendering. Use this for string literals and app-owned or
+    /// component-owned text. Use `copyText` or `print` for text created during
+    /// `view`.
+    pub fn borrowText(self: *Column, str: []const u8, ts: TextStyle) void {
         const result = self.window.printSegment(.{
             .text = str,
             .style = ts.toVaxis(),
@@ -261,11 +274,23 @@ pub const Column = struct {
         self.row = result.row + self.gap;
     }
 
-    /// Format and print text using the default style.
+    /// Copy text into the frame allocator, print it, then advance by `gap`.
+    ///
+    /// This is the safe column API for dynamic slices whose original storage
+    /// may not live until render completion.
+    pub fn copyText(self: *Column, str: []const u8, ts: TextStyle) !void {
+        const copied = try self.arena.dupe(u8, str);
+        self.borrowText(copied, ts);
+    }
+
+    /// Format text into the frame allocator, print it with the default style,
+    /// then advance by `gap`.
+    ///
+    /// This is the safe column API for formatted text created during `view`.
     /// Returns an error if formatting allocation fails.
-    pub fn textf(self: *Column, comptime fmt: []const u8, args: anytype) !void {
+    pub fn print(self: *Column, comptime fmt: []const u8, args: anytype) !void {
         const str = try std.fmt.allocPrint(self.arena, fmt, args);
-        self.text(str, .{});
+        self.borrowText(str, .{});
     }
 };
 
@@ -390,12 +415,12 @@ test "Surface.displayWidth matches chasen text unicode width" {
     try std.testing.expectEqual(text.displayWidth("🇯🇵"), ts.surface.displayWidth("🇯🇵"));
 }
 
-test "Surface.textAt prints unwrapped styled text at coordinates" {
+test "Surface.borrowTextAt prints unwrapped styled text at coordinates" {
     var ts = try testSurface(4, 2);
     ts.bind();
     defer ts.deinit();
 
-    const result = ts.surface.textAt(1, 0, "abc", .{ .fg = .{ .index = 2 } });
+    const result = ts.surface.borrowTextAt(1, 0, "abc", .{ .fg = .{ .index = 2 } });
 
     try std.testing.expectEqual(@as(u16, 4), result.col);
     try std.testing.expectEqual(@as(u16, 0), result.row);

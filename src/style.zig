@@ -42,7 +42,7 @@ pub const Underline = enum {
     }
 };
 
-/// Text styling attributes for use with `Column.text()`.
+/// Text styling attributes for use with `Column.borrowText()`.
 /// All fields default to off/default, so `.{ .bold = true }` is sufficient
 /// to create a bold style with default colors.
 pub const TextStyle = struct {

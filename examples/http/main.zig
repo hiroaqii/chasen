@@ -241,26 +241,26 @@ const HttpDemo = struct {
 
     pub fn view(self: *const HttpDemo, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
-        col.text("HTTP Demo", .{ .bold = true });
+        col.borrowText("HTTP Demo", .{ .bold = true });
 
         switch (self.state) {
             .idle => {
-                col.text("Press space to fetch http://example.com", .{ .fg = .gray });
+                col.borrowText("Press space to fetch http://example.com", .{ .fg = .gray });
             },
             .loading => {
-                col.text("Loading...", .{ .fg = .{ .index = 3 } });
+                col.borrowText("Loading...", .{ .fg = .{ .index = 3 } });
             },
             .loaded => |body| {
-                col.text("Response:", .{ .fg = .{ .index = 2 } });
-                col.text(body.slice(), .{});
+                col.borrowText("Response:", .{ .fg = .{ .index = 2 } });
+                col.borrowText(body.slice(), .{});
             },
             .failed => |err_msg| {
-                col.text("Error:", .{ .fg = .{ .index = 1 } });
-                col.text(err_msg.slice(), .{});
+                col.borrowText("Error:", .{ .fg = .{ .index = 1 } });
+                col.borrowText(err_msg.slice(), .{});
             },
         }
 
-        col.text("space: fetch  q: quit", .{ .dim = true });
+        col.borrowText("space: fetch  q: quit", .{ .dim = true });
     }
 
     pub fn handleEvent(self: *const HttpDemo, event: chasen.Event) ?Msg {

@@ -14,7 +14,7 @@ const surface_mod = @import("surface.zig");
 /// try ts.init(20, 4);
 /// defer ts.deinit();
 ///
-/// _ = ts.surface.textAt(0, 0, "ok", .{});
+/// _ = ts.surface.borrowTextAt(0, 0, "ok", .{});
 /// try ts.expectSnapshot("ok                  \n                    \n                    \n                    ");
 /// ```
 pub const TestSurface = struct {
@@ -244,7 +244,7 @@ test "TestSurface exposes a drawable headless surface" {
     try ts.init(6, 2);
     defer ts.deinit();
 
-    _ = ts.surface.textAt(1, 0, "ok", .{});
+    _ = ts.surface.borrowTextAt(1, 0, "ok", .{});
 
     try ts.expectCellText(1, 0, "o");
     try ts.expectCellText(2, 0, "k");
@@ -257,7 +257,7 @@ test "TestSurface snapshot captures child clipping" {
     defer ts.deinit();
 
     var child = ts.surface.child(.{ .col = 1, .row = 0, .width = 3, .height = 1 });
-    _ = child.textAt(0, 0, "abcd", .{});
+    _ = child.borrowTextAt(0, 0, "abcd", .{});
 
     try ts.expectSnapshot(" abc \n     ");
 }

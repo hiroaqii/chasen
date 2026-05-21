@@ -50,21 +50,21 @@ const TickDemo = struct {
 
     pub fn view(self: *const TickDemo, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
-        col.text("Tick Example", .{ .bold = true });
-        col.text("s: schedule/replace  c: cancel  q: quit", .{ .fg = .gray });
+        col.borrowText("Tick Example", .{ .bold = true });
+        col.borrowText("s: schedule/replace  c: cancel  q: quit", .{ .fg = .gray });
 
         const status = if (self.scheduled)
             "scheduled: one message will arrive in about 2 seconds"
         else
             "scheduled: none";
-        col.text(status, .{});
+        col.borrowText(status, .{});
 
-        try col.textf("scheduled: {d}  fired: {d}  cancelled: {d}", .{
+        try col.print("scheduled: {d}  fired: {d}  cancelled: {d}", .{
             self.scheduled_count,
             self.fired_count,
             self.cancelled_count,
         });
-        col.text(self.last_event, .{ .dim = true });
+        col.borrowText(self.last_event, .{ .dim = true });
     }
 
     pub fn handleEvent(self: *const TickDemo, event: chasen.Event) ?Msg {

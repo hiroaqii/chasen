@@ -48,7 +48,7 @@ const Animation = struct {
         sfc.hideCursor();
 
         const size = sfc.size();
-        _ = sfc.textAt(0, 0, "requestFrame animation", .{ .bold = true });
+        _ = sfc.borrowTextAt(0, 0, "requestFrame animation", .{ .bold = true });
 
         const status = if (self.running) "running" else "paused";
         // `frameAllocator()` is reset after this frame, which makes it useful
@@ -58,8 +58,8 @@ const Animation = struct {
             "frame: {d}  delta: {d}ms  {s}",
             .{ self.frame_index, self.last_delta_ms, status },
         );
-        _ = sfc.textAt(0, 1, info, .{ .fg = .gray });
-        _ = sfc.textAt(0, 2, "space: pause/resume  q: quit", .{ .dim = true });
+        _ = sfc.borrowTextAt(0, 1, info, .{ .fg = .gray });
+        _ = sfc.borrowTextAt(0, 2, "space: pause/resume  q: quit", .{ .dim = true });
 
         if (size.width == 0 or size.height < 4) return;
 
