@@ -116,10 +116,10 @@ pub fn run(init: std.process.Init, app: anytype) !void {
 ///
 /// Use this when you need a custom allocator, Io, or Environ.Map
 /// (e.g. tests, custom `Io.Threaded` setup).
-pub fn runWith(opts: RunOptions, app: anytype) !void {
-    const App = @TypeOf(app);
+pub fn runWith(opts: RunOptions, initial_app: anytype) !void {
+    const App = @TypeOf(initial_app);
     comptime validateApp(App);
-    try program.run(App, opts, app);
+    try program.run(App, opts, initial_app);
 }
 
 fn validateApp(comptime App: type) void {
