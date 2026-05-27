@@ -520,21 +520,24 @@ fn processPendingTerminalImages(
     for (app_ctx.pendingTerminalImageLoadSlice()) |entry| {
         defer allocator.free(entry.path);
 
-        const handle = loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts) catch |err| {
-            const reason: terminal_image.LoadError = switch (err) {
-                error.Unsupported => .unsupported,
-                error.LoadFailed => .load_failed,
-                error.RegistryFull => .registry_full,
-            };
-            loop.postEvent(.{ .user_msg = entry.failed(entry.ctx, reason) }) catch {};
-            continue;
-        };
-        loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {
-            _ = registry.unload(vx.*, tty, handle);
-        };
+        switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
+            .loaded => |handle| {
+                loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {
+                    _ = registry.unload(vx.*, tty, handle);
+                };
+            },
+            .failed => |reason| {
+                loop.postEvent(.{ .user_msg = entry.failed(entry.ctx, reason) }) catch {};
+            },
+        }
     }
     app_ctx.pending_terminal_image_loads_len = 0;
 }
+
+const TerminalImageLoadResult = union(enum) {
+    loaded: terminal_image.TerminalImageHandle,
+    failed: terminal_image.LoadError,
+};
 
 fn loadTerminalImagePath(
     registry: *terminal_image.Registry,
@@ -543,16 +546,17 @@ fn loadTerminalImagePath(
     allocator: std.mem.Allocator,
     path: []const u8,
     opts: root.RunOptions,
-) error{ Unsupported, LoadFailed, RegistryFull }!terminal_image.TerminalImageHandle {
+) TerminalImageLoadResult {
     const loader = opts.terminal_image_path_loader orelse terminal_image.unsupportedPathLoader;
-    const image = loader(opts.terminal_image_loader_context, vx, tty, allocator, path) catch |err| switch (err) {
-        error.Unsupported => return error.Unsupported,
-        error.LoadFailed => return error.LoadFailed,
+    const image = loader(opts.terminal_image_loader_context, vx, tty, allocator, path) catch |err| {
+        if (err == error.Unsupported) return .{ .failed = .unsupported };
+        return .{ .failed = .load_failed };
     };
-    return registry.add(allocator, image) catch {
+    const handle = registry.add(allocator, image) catch {
         vx.freeImage(tty, image.id);
-        return error.RegistryFull;
+        return .{ .failed = .registry_full };
     };
+    return .{ .loaded = handle };
 }
 
 fn timestampNs(io: std.Io) u64 {
