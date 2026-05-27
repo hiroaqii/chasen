@@ -45,6 +45,10 @@ pub const RuntimeEventKind = stats.RuntimeEventKind;
 pub const RuntimeStats = stats.RuntimeStats;
 pub const StatsFn = stats.StatsFn;
 
+pub const trace = @import("trace.zig");
+pub const TraceEvent = trace.TraceEvent;
+pub const TraceFn = trace.TraceFn;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).
@@ -86,6 +90,13 @@ pub const RunOptions = struct {
     stats_fn: ?StatsFn = null,
     /// Optional caller-owned context passed to `stats_fn`.
     stats_context: ?*anyopaque = null,
+    /// Optional callback called at runtime lifecycle boundaries.
+    ///
+    /// The callback receives event notifications, not timings. Chasen does not
+    /// store, aggregate, format, or export trace events.
+    trace_fn: ?TraceFn = null,
+    /// Optional caller-owned context passed to `trace_fn`.
+    trace_context: ?*anyopaque = null,
     /// Optional terminal image path loader.
     ///
     /// Leave null when the app does not load terminal images. Terminal-only

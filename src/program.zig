@@ -203,15 +203,19 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         running_timers.deinit(allocator);
     }
 
+    trace(opts, .startup);
+
     if (@hasDecl(App, "init")) {
         try app.init(&app_ctx);
         // Process tasks, ticks, and everys spawned during init
+        trace(opts, .effect_drain_start);
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        trace(opts, .effect_drain_end);
     }
 
     // Deliver the initial terminal size before the first render. Resize events
@@ -219,21 +223,25 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // size for first-frame layout and scroll bounds.
     if (tty.getWinsize()) |ws| {
         var initial_stats: ?root.RuntimeStats = null;
-        _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats);
+        trace(opts, .event_received);
+        _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
+        trace(opts, .effect_drain_start);
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        trace(opts, .effect_drain_end);
     } else |_| {}
 
     // Initial render
-    _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false);
+    _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false, opts);
 
     // --- Main loop ---
     while (!app_ctx.should_quit) {
         const event = try loop.nextEvent();
+        trace(opts, .event_received);
         event_count += 1;
         var needs_render = false;
         var stats: ?root.RuntimeStats = if (stats_enabled) .{
@@ -244,31 +252,31 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
         switch (event) {
             .key_press => |key| {
-                needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats, opts);
             },
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
                 // terminal size; suppressRedraw only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
                 useUnicodeWidth(&vx);
-                _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &stats);
+                _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &stats, opts);
                 needs_render = true;
             },
             .user_msg => |msg| {
-                needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats);
+                needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats, opts);
             },
             .mouse => |m| {
-                needs_render = try dispatchAppEvent(App, &app, .{ .mouse = m }, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .{ .mouse = m }, &app_ctx, io, &stats, opts);
             },
             .focus_in => {
-                needs_render = try dispatchAppEvent(App, &app, .focus_in, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .focus_in, &app_ctx, io, &stats, opts);
             },
             .focus_out => {
-                needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats, opts);
             },
             .paste => |text| {
                 defer allocator.free(text);
-                needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats, opts);
             },
             .frame => |frame| {
                 frame_count += 1;
@@ -280,11 +288,12 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 frame_in_flight = false;
                 last_frame_ns = frame.now_ns;
                 next_frame_index = frame.index + 1;
-                needs_render = try dispatchAppEvent(App, &app, .{ .frame = frame }, &app_ctx, io, &stats);
+                needs_render = try dispatchAppEvent(App, &app, .{ .frame = frame }, &app_ctx, io, &stats, opts);
             },
         }
 
         // Process tasks, ticks, and everys spawned during update
+        trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
         try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
@@ -293,9 +302,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         processPendingCancels(Msg, &app_ctx, &running_timers, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
+        trace(opts, .effect_drain_end);
 
         if (needs_render) {
-            const timings = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, stats_enabled);
+            const timings = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, stats_enabled, opts);
             if (stats) |*s| {
                 s.view_ns = timings.view_ns;
                 s.render_ns = timings.render_ns;
@@ -307,6 +317,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             stats_fn(opts.stats_context, stats.?);
         }
     }
+
+    trace(opts, .shutdown);
 }
 
 /// Route an app-facing event through `handleEvent`, then apply the returned
@@ -322,17 +334,20 @@ fn dispatchAppEvent(
     app_ctx: *ctx_mod.Ctx(App.Msg),
     io: std.Io,
     stats: *?root.RuntimeStats,
+    opts: root.RunOptions,
 ) !bool {
     const measure = stats.* != null;
+    trace(opts, .handle_event_start);
     const handle_start = timingStart(measure, io);
     const maybe_msg = app.handleEvent(event);
 
     if (stats.*) |*s| {
         s.handle_event_ns = timingElapsed(handle_start, io);
     }
+    trace(opts, .handle_event_end);
 
     if (maybe_msg) |msg| {
-        return try applyMsg(App, app, msg, app_ctx, io, stats);
+        return try applyMsg(App, app, msg, app_ctx, io, stats, opts);
     }
 
     return false;
@@ -351,10 +366,12 @@ fn applyMsg(
     app_ctx: *ctx_mod.Ctx(App.Msg),
     io: std.Io,
     stats: *?root.RuntimeStats,
+    opts: root.RunOptions,
 ) !bool {
     const measure = stats.* != null;
     app_ctx.redraw_suppressed = false;
 
+    trace(opts, .update_start);
     const update_start = timingStart(measure, io);
     try app.update(msg, app_ctx);
 
@@ -362,6 +379,7 @@ fn applyMsg(
         s.update_ns = timingElapsed(update_start, io);
         s.did_update = true;
     }
+    trace(opts, .update_end);
 
     return !app_ctx.redraw_suppressed;
 }
@@ -595,6 +613,12 @@ fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
     return deltaNs(start_ns, end_ns);
 }
 
+fn trace(opts: root.RunOptions, event: root.TraceEvent) void {
+    if (opts.trace_fn) |trace_fn| {
+        trace_fn(opts.trace_context, event);
+    }
+}
+
 fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
     vx.caps.unicode = .unicode;
     vx.screen.width_method = .unicode;
@@ -609,6 +633,7 @@ fn render(
     writer: *std.Io.Writer,
     io: std.Io,
     measure: bool,
+    opts: root.RunOptions,
 ) !RenderTimings {
     _ = frame_arena.reset(.retain_capacity);
     const win = vx.window();
@@ -618,12 +643,16 @@ fn render(
         .arena = frame_arena.allocator(),
         .image_registry = terminal_images,
     };
+    trace(opts, .view_start);
     const view_start = timingStart(measure, io);
     try app.view(&sfc);
     const view_ns = if (measure) timingElapsed(view_start, io) else 0;
+    trace(opts, .view_end);
+    trace(opts, .render_start);
     const render_start = timingStart(measure, io);
     try vx.render(writer);
     const render_ns = if (measure) timingElapsed(render_start, io) else 0;
+    trace(opts, .render_end);
 
     return .{
         .view_ns = view_ns,

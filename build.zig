@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
         "http",
         "animation",
         "runtime_stats",
+        "runtime_trace",
         "surface_basics",
     };
 
