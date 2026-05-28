@@ -82,6 +82,34 @@ pub fn build(b: *std.Build) void {
         run_example_step.dependOn(&run_example.step);
     }
 
+    const chasen_anim_dep = b.lazyDependency("chasen_anim", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const check_anim_transition_step = b.step("check-anim_transition", "Build the chasen-anim transition example");
+    if (chasen_anim_dep) |dep| {
+        const anim_transition_exe = b.addExecutable(.{
+            .name = "anim_transition",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/anim_transition/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "chasen", .module = mod },
+                    .{ .name = "chasen_anim", .module = dep.module("chasen_anim") },
+                },
+            }),
+        });
+
+        check_anim_transition_step.dependOn(&anim_transition_exe.step);
+        check_examples_step.dependOn(&anim_transition_exe.step);
+
+        const run_anim_transition = b.addRunArtifact(anim_transition_exe);
+        const run_anim_transition_step = b.step("run-anim_transition", "Run the chasen-anim transition example");
+        run_anim_transition_step.dependOn(&run_anim_transition.step);
+    }
+
     const io_threaded_check = b.addExecutable(.{
         .name = "io-threaded-check",
         .root_module = b.createModule(.{
