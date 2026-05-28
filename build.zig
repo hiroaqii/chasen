@@ -82,13 +82,15 @@ pub fn build(b: *std.Build) void {
         run_example_step.dependOn(&run_example.step);
     }
 
-    const chasen_anim_dep = b.lazyDependency("chasen_anim", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
+    const chasen_anim_path = b.option([]const u8, "chasen-anim-path", "Path to a local chasen-anim checkout for the anim_transition example");
     const check_anim_transition_step = b.step("check-anim_transition", "Build the chasen-anim transition example");
-    if (chasen_anim_dep) |dep| {
+    if (chasen_anim_path) |path| {
+        const chasen_anim_mod = b.addModule("chasen_anim", .{
+            .root_source_file = std.Build.LazyPath{ .cwd_relative = b.pathJoin(&.{ path, "src/root.zig" }) },
+            .target = target,
+            .optimize = optimize,
+        });
+
         const anim_transition_exe = b.addExecutable(.{
             .name = "anim_transition",
             .root_module = b.createModule(.{
@@ -97,7 +99,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "chasen", .module = mod },
-                    .{ .name = "chasen_anim", .module = dep.module("chasen_anim") },
+                    .{ .name = "chasen_anim", .module = chasen_anim_mod },
                 },
             }),
         });
@@ -108,6 +110,9 @@ pub fn build(b: *std.Build) void {
         const run_anim_transition = b.addRunArtifact(anim_transition_exe);
         const run_anim_transition_step = b.step("run-anim_transition", "Run the chasen-anim transition example");
         run_anim_transition_step.dependOn(&run_anim_transition.step);
+    } else {
+        const missing_chasen_anim = b.addFail("check-anim_transition requires -Dchasen-anim-path=/path/to/chasen-anim");
+        check_anim_transition_step.dependOn(&missing_chasen_anim.step);
     }
 
     const io_threaded_check = b.addExecutable(.{

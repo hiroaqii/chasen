@@ -36,9 +36,6 @@
             .url = "git+https://github.com/rockorager/libvaxis.git#0f46f499e1d6501922e2ef5705a80432f5831fe3",
             .hash = "vaxis-0.6.0-BWNV_M3UCQD-CLOAF_EZlKwXfWd8LuGrijzyObHu-l4X",
         },
-        .chasen_anim = .{
-            .path = "../chasen-anim",
-        },
     },
     .paths = .{
         "build.zig",
