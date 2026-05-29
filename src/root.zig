@@ -77,6 +77,15 @@ pub const Event = union(enum) {
     frame: Frame,
 };
 
+/// Cleanup context passed to optional app `deinit`.
+///
+/// This context is intentionally smaller than `Ctx`: shutdown cleanup cannot
+/// queue effects, spawn work, or request frames.
+pub const AppDeinitContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+};
+
 /// Options for the low-level `runWith` entry point.
 pub const RunOptions = struct {
     allocator: std.mem.Allocator,
