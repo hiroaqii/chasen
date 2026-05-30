@@ -165,6 +165,14 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
     // --- App state ---
     var app = initial_app;
+    defer {
+        if (@hasDecl(App, "deinit")) {
+            app.deinit(.{
+                .allocator = allocator,
+                .io = io,
+            });
+        }
+    }
     // Ctx keeps Io privately so user code can call ctx.now() without receiving
     // direct access to the runtime Io handle.
     var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
