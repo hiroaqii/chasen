@@ -285,13 +285,17 @@ pub fn Ctx(comptime Msg: type) type {
         /// Dispatch a command descriptor.
         ///
         /// Maps each `Cmd` variant to the corresponding `Ctx` method.
-        /// `batch` and `sequence` are dispatched recursively.
-        /// Note: `sequence` currently dispatches all commands immediately
-        /// (true async sequencing is not yet supported).
+        /// `batch` and `sequence` are dispatched recursively. Their command
+        /// slices must remain valid until this method returns.
+        ///
+        /// Note: `sequence` currently guarantees dispatch order only. It does
+        /// not wait for timer or task completion.
         pub fn dispatch(self: *@This(), command: cmd_mod.Cmd(Msg)) (error{TaskLimitExceeded} || error{TimerLimitExceeded})!void {
             switch (command) {
                 .none => {},
                 .quit => self.quit(),
+                .suppress_redraw => self.suppressRedraw(),
+                .request_frame => self.requestFrame(),
                 .cancel_timer => |id| self.cancelTimer(id),
                 .task => |task_fn| try self.spawn(task_fn),
                 .task_with => |tw| try self.spawnWith(tw.ctx, tw.run),
@@ -560,6 +564,24 @@ test "dispatch .quit sets should_quit" {
     try std.testing.expectEqual(true, ctx_val.should_quit);
 }
 
+test "dispatch .suppress_redraw sets redraw_suppressed" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.suppress_redraw);
+
+    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
+}
+
+test "dispatch .request_frame marks a pending frame request" {
+    const TestMsg = union(enum) { hello };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try ctx_val.dispatch(.request_frame);
+
+    try std.testing.expectEqual(true, ctx_val.frame_requested);
+}
+
 test "dispatch .task queues a task" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
@@ -625,6 +647,8 @@ test "dispatch .batch processes multiple commands" {
 
     const cmds = [_]C{
         .quit,
+        .request_frame,
+        .suppress_redraw,
         .{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .timeout } },
         .{ .task = &struct {
             fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
@@ -635,6 +659,8 @@ test "dispatch .batch processes multiple commands" {
     try ctx_val.dispatch(.{ .batch = &cmds });
 
     try std.testing.expectEqual(true, ctx_val.should_quit);
+    try std.testing.expectEqual(true, ctx_val.frame_requested);
+    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
 }

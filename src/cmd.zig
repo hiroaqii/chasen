@@ -1,11 +1,10 @@
 const std = @import("std");
 
-/// Side-effect descriptor used by Ctx methods and composable by components.
+/// Side-effect descriptor composable by components and dispatched through Ctx.
 /// Cmd values describe effects only; they do not execute work by themselves.
 ///
-/// Users typically call Ctx methods (spawn, tick, every) rather than
-/// constructing Cmd values directly. Components may return Cmd for
-/// composition via batch/sequence.
+/// App-level code typically calls Ctx methods directly. Components and helper
+/// functions may return Cmd values so the app can dispatch them from update.
 pub fn Cmd(comptime Msg: type) type {
     return union(enum) {
         /// No operation.
@@ -14,6 +13,12 @@ pub fn Cmd(comptime Msg: type) type {
         /// Request the application to exit.
         quit,
 
+        /// Suppress the default redraw for the current update cycle.
+        suppress_redraw,
+
+        /// Request one future frame event.
+        request_frame,
+
         /// Cancel a running or pending timer by id.
         /// If the pending cancel queue is full, the cancel request is silently dropped.
         ///
@@ -21,10 +26,17 @@ pub fn Cmd(comptime Msg: type) type {
         /// (e.g. a string literal or application-owned slice).
         cancel_timer: []const u8,
 
-        /// Run multiple commands concurrently.
+        /// Dispatch multiple commands through immediate recursive dispatch.
+        ///
+        /// The command slice is not owned by Cmd and must remain valid until
+        /// Ctx.dispatch returns.
         batch: []const Cmd(Msg),
 
-        /// Run commands in order, each waiting for the previous to complete.
+        /// Dispatch commands in order through immediate recursive dispatch.
+        ///
+        /// This currently guarantees dispatch order only. It does not wait for
+        /// async task or timer completion. The command slice is not owned by Cmd
+        /// and must remain valid until Ctx.dispatch returns.
         sequence: []const Cmd(Msg),
 
         /// Send `msg` once after `after_ns` nanoseconds.
@@ -86,6 +98,14 @@ test "Cmd instantiation" {
     // Verify quit
     const quit_cmd: C = .quit;
     try std.testing.expect(quit_cmd == .quit);
+
+    // Verify suppress_redraw
+    const suppress_redraw_cmd: C = .suppress_redraw;
+    try std.testing.expect(suppress_redraw_cmd == .suppress_redraw);
+
+    // Verify request_frame
+    const request_frame_cmd: C = .request_frame;
+    try std.testing.expect(request_frame_cmd == .request_frame);
 
     // Verify tick
     const tick_cmd: C = .{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .hello } };

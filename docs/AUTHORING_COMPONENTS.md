@@ -522,6 +522,33 @@ const command = widget.update(action);
 try ctx.dispatch(command);
 ```
 
+Single-value commands such as `.request_frame`, `.suppress_redraw`, `.tick`,
+and `.every` are the preferred shape for component-returned commands.
+
+`Cmd.batch` and `Cmd.sequence` store slices; they do not own command arrays.
+The backing memory must remain valid until `ctx.dispatch()` returns. If you
+need to combine multiple commands from app code, build the array beside the
+dispatch call:
+
+```zig
+const widget_cmd = widget.open();
+const commands = [_]chasen.Cmd(Msg){
+    widget_cmd,
+    .{ .tick = .{
+        .id = "hide-help",
+        .after_ns = 700_000_000,
+        .msg = .hide_help,
+    }},
+};
+try ctx.dispatch(.{ .batch = &commands });
+```
+
+Do not return `.batch` or `.sequence` that points at a local stack array from a
+component helper.
+
+`Cmd.sequence` currently guarantees dispatch order only. It does not wait for
+timer or async task completion.
+
 Do not execute I/O from `view`.
 
 ## Checklist
