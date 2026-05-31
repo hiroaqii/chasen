@@ -152,9 +152,18 @@ fn validateApp(comptime App: type) void {
     if (!@hasDecl(App, "view")) {
         @compileError("App must declare `pub fn view`");
     }
-    if (!@hasDecl(App, "handleEvent")) {
-        @compileError("App must declare `pub fn handleEvent`");
-    }
+}
+
+test "validateApp accepts apps without handleEvent" {
+    const App = struct {
+        pub const Msg = enum { noop };
+
+        pub fn update(_: *@This(), _: Msg, _: *Ctx(Msg)) !void {}
+
+        pub fn view(_: *const @This(), _: *Surface) !void {}
+    };
+
+    comptime validateApp(App);
 }
 
 test {

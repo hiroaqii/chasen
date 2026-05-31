@@ -329,8 +329,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     trace(opts, .shutdown);
 }
 
-/// Route an app-facing event through `handleEvent`, then apply the returned
-/// message if the app handled it.
+/// Route an app-facing event through optional `handleEvent`, then apply the
+/// returned message if the app handled it.
 ///
 /// This keeps the common handleEvent/update/stat timing path in one place.
 /// Event-specific runtime work, such as terminal resize or frame-future
@@ -347,7 +347,10 @@ fn dispatchAppEvent(
     const measure = stats.* != null;
     trace(opts, .handle_event_start);
     const handle_start = timingStart(measure, io);
-    const maybe_msg = app.handleEvent(event);
+    const maybe_msg: ?App.Msg = if (@hasDecl(App, "handleEvent"))
+        app.handleEvent(event)
+    else
+        null;
 
     if (stats.*) |*s| {
         s.handle_event_ns = timingElapsed(handle_start, io);
