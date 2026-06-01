@@ -29,7 +29,7 @@ pub const RuntimeEventKind = enum {
 /// to find whether work is in handleEvent, update, effect draining, view, or
 /// render, then use a profiler to investigate inside that phase.
 ///
-/// When `RunOptions.stats_fn` is `null`, the runtime does not construct
+/// When `RunOptions.runtime.stats_fn` is `null`, the runtime does not construct
 /// `RuntimeStats` or perform these timing measurements.
 pub const RuntimeStats = struct {
     /// Category of runtime event handled in this iteration.
@@ -58,8 +58,8 @@ pub const RuntimeStats = struct {
 
 /// Optional callback invoked by the runtime after one event loop iteration.
 ///
-/// `context` is the value from `RunOptions.stats_context`. The callback should
-/// avoid expensive work because it runs on the runtime path.
+/// `context` is the value from `RunOptions.runtime.stats_context`. The callback
+/// should avoid expensive work because it runs on the runtime path.
 pub const StatsFn = *const fn (context: ?*anyopaque, stats: RuntimeStats) void;
 
 test "RuntimeStats initializes with phase duration defaults" {

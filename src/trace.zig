@@ -23,9 +23,9 @@ pub const TraceEvent = enum {
 
 /// Optional callback invoked when a runtime lifecycle boundary is reached.
 ///
-/// `context` is the value from `RunOptions.trace_context`. Chasen does not
-/// store, format, aggregate, or export trace events. The callback should avoid
-/// expensive work because it runs on the runtime path.
+/// `context` is the value from `RunOptions.runtime.trace_context`. Chasen does
+/// not store, format, aggregate, or export trace events. The callback should
+/// avoid expensive work because it runs on the runtime path.
 pub const TraceFn = *const fn (context: ?*anyopaque, event: TraceEvent) void;
 
 test "TraceEvent exposes lifecycle boundaries" {

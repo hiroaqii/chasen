@@ -1,7 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 
-// This example demonstrates RunOptions.stats_fn.
+// This example demonstrates RunOptions.runtime.stats_fn.
 //
 // The stats callback runs on the runtime path, so it should do only cheap work.
 // This example stores the latest timings and maximum observed timings in a
@@ -150,14 +150,18 @@ fn nsToUs(ns: u64) u64 {
 pub fn main(init: std.process.Init) !void {
     var collector = StatsCollector{};
 
-    // runWith exposes the low-level RunOptions. stats_fn enables measurement;
-    // leaving it null, or using chasen.run(...), keeps the default path free of
-    // RuntimeStats construction and timing clock reads.
+    // runWith exposes the low-level RunOptions. runtime.stats_fn enables
+    // measurement; leaving it null, or using chasen.run(...), keeps the default
+    // path free of RuntimeStats construction and timing clock reads.
     try chasen.runWith(.{
-        .allocator = init.gpa,
-        .io = init.io,
-        .env_map = init.environ_map,
-        .stats_fn = onStats,
-        .stats_context = &collector,
+        .runtime = .{
+            .allocator = init.gpa,
+            .io = init.io,
+            .stats_fn = onStats,
+            .stats_context = &collector,
+        },
+        .terminal = .{
+            .env_map = init.environ_map,
+        },
     }, RuntimeStatsDemo{ .stats = &collector });
 }

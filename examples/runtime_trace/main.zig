@@ -1,7 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 
-// This example demonstrates RunOptions.trace_fn.
+// This example demonstrates RunOptions.runtime.trace_fn.
 //
 // The trace callback runs on the runtime path, so it should do only cheap work.
 // This example counts lifecycle boundary events in caller-owned storage. The
@@ -120,10 +120,14 @@ pub fn main(init: std.process.Init) !void {
     var collector = TraceCollector{};
 
     try chasen.runWith(.{
-        .allocator = init.gpa,
-        .io = init.io,
-        .env_map = init.environ_map,
-        .trace_fn = onTrace,
-        .trace_context = &collector,
+        .runtime = .{
+            .allocator = init.gpa,
+            .io = init.io,
+            .trace_fn = onTrace,
+            .trace_context = &collector,
+        },
+        .terminal = .{
+            .env_map = init.environ_map,
+        },
     }, RuntimeTraceDemo{ .trace = &collector });
 }

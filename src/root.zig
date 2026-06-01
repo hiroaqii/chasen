@@ -86,11 +86,10 @@ pub const AppDeinitContext = struct {
     io: std.Io,
 };
 
-/// Options for the low-level `runWith` entry point.
-pub const RunOptions = struct {
+/// Backend-independent runtime options for `runWith`.
+pub const RuntimeOptions = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    env_map: *std.process.Environ.Map,
     /// Optional callback called after each runtime event loop iteration.
     ///
     /// The callback receives lightweight timing information. Chasen does not
@@ -106,14 +105,25 @@ pub const RunOptions = struct {
     trace_fn: ?TraceFn = null,
     /// Optional caller-owned context passed to `trace_fn`.
     trace_context: ?*anyopaque = null,
+};
+
+/// Terminal-backend options for `runWith`.
+pub const TerminalOptions = struct {
+    env_map: *std.process.Environ.Map,
     /// Optional terminal image path loader.
     ///
     /// Leave null when the app does not load terminal images. Terminal-only
     /// runners can provide an adapter outside core when image decode/transmit
     /// support is needed.
-    terminal_image_path_loader: ?TerminalImagePathLoaderFn = null,
-    /// Optional caller-owned context passed to `terminal_image_path_loader`.
-    terminal_image_loader_context: ?*anyopaque = null,
+    image_path_loader: ?TerminalImagePathLoaderFn = null,
+    /// Optional caller-owned context passed to `image_path_loader`.
+    image_loader_context: ?*anyopaque = null,
+};
+
+/// Options for the low-level `runWith` entry point.
+pub const RunOptions = struct {
+    runtime: RuntimeOptions,
+    terminal: TerminalOptions,
 };
 
 /// Run the application (Juicy Main API).
@@ -126,16 +136,19 @@ pub const RunOptions = struct {
 /// ```
 pub fn run(init: std.process.Init, app: anytype) !void {
     return runWith(.{
-        .allocator = init.gpa,
-        .io = init.io,
-        .env_map = init.environ_map,
+        .runtime = .{
+            .allocator = init.gpa,
+            .io = init.io,
+        },
+        .terminal = .{
+            .env_map = init.environ_map,
+        },
     }, app);
 }
 
 /// Run the application with explicit options.
 ///
-/// Use this when you need a custom allocator, Io, or Environ.Map
-/// (e.g. tests, custom `Io.Threaded` setup).
+/// Use this when you need custom runtime hooks or terminal-backend options.
 pub fn runWith(opts: RunOptions, initial_app: anytype) !void {
     const App = @TypeOf(initial_app);
     comptime validateApp(App);

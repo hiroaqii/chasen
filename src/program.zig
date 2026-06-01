@@ -127,15 +127,15 @@ const RenderTimings = struct {
 pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
-    const allocator = opts.allocator;
-    const io = opts.io;
+    const allocator = opts.runtime.allocator;
+    const io = opts.runtime.io;
 
     // --- Terminal setup ---
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();
 
-    var vx = try vaxis.Vaxis.init(io, allocator, opts.env_map, .{
+    var vx = try vaxis.Vaxis.init(io, allocator, opts.terminal.env_map, .{
         .system_clipboard_allocator = allocator,
     });
     useUnicodeWidth(&vx);
@@ -187,7 +187,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var next_frame_index: u64 = 0;
     var event_count: u64 = 0;
     var frame_count: u64 = 0;
-    const stats_enabled = opts.stats_fn != null;
+    const stats_enabled = opts.runtime.stats_fn != null;
 
     // --- Pending futures (for spawned async tasks) ---
     // Completed one-shot futures (spawn/tick) remain in this list until
@@ -321,8 +321,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             }
         }
 
-        if (opts.stats_fn) |stats_fn| {
-            stats_fn(opts.stats_context, stats.?);
+        if (opts.runtime.stats_fn) |stats_fn| {
+            stats_fn(opts.runtime.stats_context, stats.?);
         }
     }
 
@@ -576,8 +576,8 @@ fn loadTerminalImagePath(
     path: []const u8,
     opts: root.RunOptions,
 ) TerminalImageLoadResult {
-    const loader = opts.terminal_image_path_loader orelse terminal_image.unsupportedPathLoader;
-    const image = loader(opts.terminal_image_loader_context, vx, tty, allocator, path) catch |err| {
+    const loader = opts.terminal.image_path_loader orelse terminal_image.unsupportedPathLoader;
+    const image = loader(opts.terminal.image_loader_context, vx, tty, allocator, path) catch |err| {
         if (err == error.Unsupported) return .{ .failed = .unsupported };
         return .{ .failed = .load_failed };
     };
@@ -625,8 +625,8 @@ fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
 }
 
 fn trace(opts: root.RunOptions, event: root.TraceEvent) void {
-    if (opts.trace_fn) |trace_fn| {
-        trace_fn(opts.trace_context, event);
+    if (opts.runtime.trace_fn) |trace_fn| {
+        trace_fn(opts.runtime.trace_context, event);
     }
 }
 
