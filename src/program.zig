@@ -649,11 +649,7 @@ fn render(
     _ = frame_arena.reset(.retain_capacity);
     const win = vx.window();
     win.clear();
-    var sfc: Surface = .{
-        .window = win,
-        .arena = frame_arena.allocator(),
-        .image_registry = terminal_images,
-    };
+    var sfc: Surface = .initVaxis(win, frame_arena.allocator(), terminal_images);
     trace(opts, .view_start);
     const view_start = timingStart(measure, io);
     try app.view(&sfc);

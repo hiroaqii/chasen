@@ -37,8 +37,8 @@ pub const TestSurface = struct {
         self.* = .{
             .screen = screen,
             .arena = .init(std.testing.allocator),
-            .surface = .{
-                .window = .{
+            .surface = surface_mod.Surface.initVaxis(
+                .{
                     .x_off = 0,
                     .y_off = 0,
                     .parent_x_off = 0,
@@ -47,8 +47,9 @@ pub const TestSurface = struct {
                     .height = height,
                     .screen = undefined,
                 },
-                .arena = undefined,
-            },
+                undefined,
+                null,
+            ),
         };
         self.screen.width_method = .unicode;
         self.bind();
@@ -62,7 +63,7 @@ pub const TestSurface = struct {
     }
 
     fn bind(self: *TestSurface) void {
-        self.surface.window.screen = &self.screen;
+        self.surface.bindVaxisScreenForTesting(&self.screen);
         self.surface.arena = self.arena.allocator();
     }
 
