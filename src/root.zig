@@ -34,9 +34,9 @@ pub const Cmd = cmd.Cmd;
 pub const testing = @import("testing.zig");
 
 pub const state_store = @import("state_store.zig");
-pub const StateStore = state_store.StateStore;
-pub const StateInitContext = state_store.StateInitContext;
-pub const StateDeinitContext = state_store.StateDeinitContext;
+pub const ComponentStateStore = state_store.ComponentStateStore;
+pub const ComponentStateInitContext = state_store.ComponentStateInitContext;
+pub const ComponentStateDeinitContext = state_store.ComponentStateDeinitContext;
 
 pub const text = @import("text.zig");
 

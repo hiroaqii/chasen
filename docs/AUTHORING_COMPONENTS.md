@@ -63,7 +63,7 @@ should not return a `Msg`. If user input changes state, map it to `Msg` from
 Reusable component packages should expose small, explicit APIs. A typical
 component package can define:
 
-- `State`: visual retained state owned by `StateStore`
+- `State`: visual retained state owned by `ComponentStateStore`
 - `Options`: app-owned semantic inputs and callbacks expressed as values
 - `Action`: component-level event result, if useful
 - `handleEvent`: pure event-to-action helper
@@ -121,28 +121,33 @@ pub const TextInput = struct {
 The application decides how `Action` maps to its own `Msg`. This keeps app
 message types fully under application control.
 
-## StateStore
+## ComponentStateStore
 
-Use `chasen.StateStore` for visual state that belongs to a reusable component
-but is not part of the application's semantic model. Examples include scroll
-offset, viewport cache, animation phase, selection anchor, or cursor viewport
-position.
+Use `chasen.ComponentStateStore` for visual state that belongs to a reusable
+component but is not part of the application's semantic model. Examples include
+scroll offset, viewport cache, animation phase, selection anchor, or cursor
+viewport position.
 
-Do not use `StateStore` for data that should be saved, restored, deep-linked,
-or sent to business logic. Text input values, selected board game ids, filters,
-and loaded records should live in the app model.
+Do not use `ComponentStateStore` for data that should be saved, restored,
+deep-linked, or sent to business logic. Text input values, selected board game
+ids, filters, and loaded records should live in the app model.
+
+`ComponentStateStore` is arena-backed. `remove(id)` and
+`clearNamespace(prefix)` call stored `deinit` hooks and remove map entries, but
+they do not reclaim arena memory. Memory is reclaimed when the whole store is
+deinitialized. Avoid using it as a high-churn cache.
 
 ```zig
 const ListVisualState = struct {
     scroll_row: u16 = 0,
 
-    fn init(_: chasen.StateInitContext) !@This() {
+    fn init(_: chasen.ComponentStateInitContext) !@This() {
         return .{};
     }
 };
 
 fn listState(
-    store: *chasen.StateStore,
+    store: *chasen.ComponentStateStore,
     id: []const u8,
 ) !*ListVisualState {
     return store.getOrCreate(id, ListVisualState, ListVisualState.init);
@@ -171,12 +176,12 @@ If a stored state owns long-lived resources, define `deinit`:
 const TerminalState = struct {
     child_pid: u32,
 
-    fn init(ctx: chasen.StateInitContext) !@This() {
+    fn init(ctx: chasen.ComponentStateInitContext) !@This() {
         _ = ctx.io orelse @panic("TerminalState requires runtime io");
         return .{ .child_pid = 0 };
     }
 
-    fn deinit(self: *@This(), ctx: chasen.StateDeinitContext) void {
+    fn deinit(self: *@This(), ctx: chasen.ComponentStateDeinitContext) void {
         _ = self;
         _ = ctx;
         // Stop child process, close PTY, cancel runtime resources, etc.
@@ -184,10 +189,11 @@ const TerminalState = struct {
 };
 ```
 
-`StateInitContext.allocator` is the store allocator and is valid until the state
-is removed or the store is deinitialized. `StateInitContext.io` and
-`StateDeinitContext.io` are optional so the store can be used in tests without a
-runtime `std.Io`.
+`ComponentStateInitContext.allocator` is the store allocator and is valid until
+the store is deinitialized. `remove` calls the stored value's `deinit`, but the
+underlying arena allocation remains owned by the store. `ComponentStateInitContext.io`
+and `ComponentStateDeinitContext.io` are optional so the store can be used in
+tests without a runtime `std.Io`.
 
 ## Surface
 
@@ -258,7 +264,7 @@ panel.view(surface, .{ .title = title });
 
 `frameAllocator()` is reset after the current frame. Use it only for temporary
 formatting or layout buffers during `view`. Never store memory from the frame
-allocator in `Model`, `Msg`, or `StateStore`.
+allocator in `Model`, `Msg`, or `ComponentStateStore`.
 
 The `surface_basics` example shows these rules in a runnable app:
 
@@ -556,7 +562,7 @@ Do not execute I/O from `view`.
 Before publishing a component package, verify:
 
 - Semantic state remains in the app model.
-- Visual retained state uses `StateStore` with stable ids.
+- Visual retained state uses `ComponentStateStore` with stable ids.
 - `view` is draw-only and only uses `Surface`.
 - Frame allocator memory is not stored.
 - Heap payload ownership is documented.

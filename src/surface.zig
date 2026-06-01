@@ -103,7 +103,7 @@ pub const Surface = struct {
     /// Return the frame-scoped allocator.
     ///
     /// Memory allocated from this allocator is reset after the current frame.
-    /// Do not store references to it in Model, Msg, or StateStore state.
+    /// Do not store references to it in Model, Msg, or ComponentStateStore state.
     pub fn frameAllocator(self: *const Surface) std.mem.Allocator {
         return self.arena;
     }

@@ -1,11 +1,11 @@
 const std = @import("std");
 
-pub const StateInitContext = struct {
+pub const ComponentStateInitContext = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
 };
 
-pub const StateDeinitContext = struct {
+pub const ComponentStateDeinitContext = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
 };
@@ -13,20 +13,29 @@ pub const StateDeinitContext = struct {
 const StoredState = struct {
     ptr: *anyopaque,
     type_name: []const u8,
-    deinit_fn: ?*const fn (*anyopaque, StateDeinitContext) void,
+    deinit_fn: ?*const fn (*anyopaque, ComponentStateDeinitContext) void,
 };
 
-pub const StateStore = struct {
+/// Arena-backed retained visual state for reusable components.
+///
+/// This is for component-local UI state such as scroll offsets, animation
+/// phase, cursor viewport, or selection anchors. It is not intended for app
+/// domain state, persisted data, or high-churn caches.
+///
+/// `remove` and `clearNamespace` call stored `deinit` hooks and remove map
+/// entries, but they do not reclaim arena memory. Memory is reclaimed when the
+/// whole store is deinitialized.
+pub const ComponentStateStore = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     map: std.StringHashMap(StoredState),
     io: ?std.Io = null,
 
-    pub fn init(allocator: std.mem.Allocator) StateStore {
+    pub fn init(allocator: std.mem.Allocator) ComponentStateStore {
         return initWithIo(allocator, null);
     }
 
-    pub fn initWithIo(allocator: std.mem.Allocator, io: ?std.Io) StateStore {
+    pub fn initWithIo(allocator: std.mem.Allocator, io: ?std.Io) ComponentStateStore {
         return .{
             .backing_allocator = allocator,
             .arena = .init(allocator),
@@ -35,7 +44,7 @@ pub const StateStore = struct {
         };
     }
 
-    pub fn deinit(self: *StateStore) void {
+    pub fn deinit(self: *ComponentStateStore) void {
         var iter = self.map.iterator();
         while (iter.next()) |entry| {
             self.deinitStored(entry.value_ptr.*);
@@ -46,10 +55,10 @@ pub const StateStore = struct {
     }
 
     pub fn getOrCreate(
-        self: *StateStore,
+        self: *ComponentStateStore,
         id: []const u8,
         comptime T: type,
-        init_fn: *const fn (StateInitContext) anyerror!T,
+        init_fn: *const fn (ComponentStateInitContext) anyerror!T,
     ) !*T {
         if (self.map.getPtr(id)) |stored| {
             self.assertType(T, stored.*);
@@ -81,19 +90,19 @@ pub const StateStore = struct {
         return ptr;
     }
 
-    pub fn get(self: *StateStore, id: []const u8, comptime T: type) ?*T {
+    pub fn get(self: *ComponentStateStore, id: []const u8, comptime T: type) ?*T {
         const stored = self.map.get(id) orelse return null;
         self.assertType(T, stored);
         return typedPtr(T, stored.ptr);
     }
 
-    pub fn remove(self: *StateStore, id: []const u8) void {
+    pub fn remove(self: *ComponentStateStore, id: []const u8) void {
         if (self.map.fetchRemove(id)) |kv| {
             self.deinitStored(kv.value);
         }
     }
 
-    pub fn clearNamespace(self: *StateStore, prefix: []const u8) void {
+    pub fn clearNamespace(self: *ComponentStateStore, prefix: []const u8) void {
         while (true) {
             var found: ?[]const u8 = null;
             var iter = self.map.iterator();
@@ -112,11 +121,11 @@ pub const StateStore = struct {
         }
     }
 
-    pub fn count(self: *const StateStore) usize {
+    pub fn count(self: *const ComponentStateStore) usize {
         return self.map.count();
     }
 
-    fn deinitStored(self: *StateStore, stored: StoredState) void {
+    fn deinitStored(self: *ComponentStateStore, stored: StoredState) void {
         if (stored.deinit_fn) |deinit_fn| {
             deinit_fn(stored.ptr, .{
                 .allocator = self.arena.allocator(),
@@ -125,12 +134,12 @@ pub const StateStore = struct {
         }
     }
 
-    fn assertType(self: *StateStore, comptime T: type, stored: StoredState) void {
+    fn assertType(self: *ComponentStateStore, comptime T: type, stored: StoredState) void {
         _ = self;
         const expected = typeName(T);
         if (!std.mem.eql(u8, stored.type_name, expected)) {
             std.debug.panic(
-                "StateStore type mismatch: requested {s}, stored {s}",
+                "ComponentStateStore type mismatch: requested {s}, stored {s}",
                 .{ expected, stored.type_name },
             );
         }
@@ -145,27 +154,27 @@ fn typedPtr(comptime T: type, ptr: *anyopaque) *T {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn deinitFn(comptime T: type) ?*const fn (*anyopaque, StateDeinitContext) void {
+fn deinitFn(comptime T: type) ?*const fn (*anyopaque, ComponentStateDeinitContext) void {
     if (!@hasDecl(T, "deinit")) return null;
 
     return struct {
-        fn call(ptr: *anyopaque, ctx: StateDeinitContext) void {
+        fn call(ptr: *anyopaque, ctx: ComponentStateDeinitContext) void {
             const typed = typedPtr(T, ptr);
             typed.deinit(ctx);
         }
     }.call;
 }
 
-test "StateStore getOrCreate creates and reuses state" {
+test "ComponentStateStore getOrCreate creates and reuses state" {
     const State = struct {
         value: u32,
 
-        fn init(_: StateInitContext) !@This() {
+        fn init(_: ComponentStateInitContext) !@This() {
             return .{ .value = 1 };
         }
     };
 
-    var store = StateStore.init(std.testing.allocator);
+    var store = ComponentStateStore.init(std.testing.allocator);
     defer store.deinit();
 
     const first = try store.getOrCreate("counter", State, State.init);
@@ -178,31 +187,31 @@ test "StateStore getOrCreate creates and reuses state" {
     try std.testing.expectEqual(@as(usize, 1), store.count());
 }
 
-test "StateStore get returns null for missing id" {
+test "ComponentStateStore get returns null for missing id" {
     const State = struct { value: u32 };
 
-    var store = StateStore.init(std.testing.allocator);
+    var store = ComponentStateStore.init(std.testing.allocator);
     defer store.deinit();
 
     try std.testing.expect(store.get("missing", State) == null);
 }
 
-test "StateStore remove calls deinit and removes entry" {
+test "ComponentStateStore remove calls deinit and removes entry" {
     const State = struct {
         counter: *u32,
 
-        fn init(ctx: StateInitContext) !@This() {
+        fn init(ctx: ComponentStateInitContext) !@This() {
             const counter = try ctx.allocator.create(u32);
             counter.* = 0;
             return .{ .counter = counter };
         }
 
-        fn deinit(self: *@This(), _: StateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
 
-    var store = StateStore.init(std.testing.allocator);
+    var store = ComponentStateStore.init(std.testing.allocator);
     defer store.deinit();
 
     const state = try store.getOrCreate("state", State, State.init);
@@ -215,22 +224,22 @@ test "StateStore remove calls deinit and removes entry" {
     try std.testing.expectEqual(@as(usize, 0), store.count());
 }
 
-test "StateStore clearNamespace removes matching entries" {
+test "ComponentStateStore clearNamespace removes matching entries" {
     const State = struct {
         counter: *u32,
 
-        fn init(ctx: StateInitContext) !@This() {
+        fn init(ctx: ComponentStateInitContext) !@This() {
             const counter = try ctx.allocator.create(u32);
             counter.* = 0;
             return .{ .counter = counter };
         }
 
-        fn deinit(self: *@This(), _: StateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
 
-    var store = StateStore.init(std.testing.allocator);
+    var store = ComponentStateStore.init(std.testing.allocator);
     defer store.deinit();
 
     const a = try store.getOrCreate("screen/a", State, State.init);
@@ -250,20 +259,20 @@ test "StateStore clearNamespace removes matching entries" {
     try std.testing.expectEqual(@as(usize, 1), store.count());
 }
 
-test "StateStore deinit calls remaining deinit hooks" {
+test "ComponentStateStore deinit calls remaining deinit hooks" {
     deinit_test_counter = 0;
 
     const State = struct {
-        fn init(_: StateInitContext) !@This() {
+        fn init(_: ComponentStateInitContext) !@This() {
             return .{};
         }
 
-        fn deinit(_: *@This(), _: StateDeinitContext) void {
+        fn deinit(_: *@This(), _: ComponentStateDeinitContext) void {
             deinit_test_counter += 1;
         }
     };
 
-    var store = StateStore.init(std.testing.allocator);
+    var store = ComponentStateStore.init(std.testing.allocator);
     _ = try store.getOrCreate("state", State, State.init);
 
     store.deinit();
