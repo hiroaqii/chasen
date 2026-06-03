@@ -14,4 +14,7 @@ pub export fn chasen_runtime_compile_check() void {
         .did_update = true,
     };
     _ = stats;
+
+    if (!runtime.BrowserInitialEffects.isSupported(.dispatch)) unreachable;
+    if (runtime.BrowserInitialEffects.isSupported(.spawn)) unreachable;
 }

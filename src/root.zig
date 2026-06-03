@@ -51,6 +51,11 @@ pub const trace = runtime.trace;
 pub const TraceEvent = runtime.TraceEvent;
 pub const TraceFn = runtime.TraceFn;
 
+pub const runtime_effect = runtime.runtime_effect;
+pub const RuntimeEffectKind = runtime.RuntimeEffectKind;
+pub const EffectSupport = runtime.EffectSupport;
+pub const BrowserInitialEffects = runtime.BrowserInitialEffects;
+
 const program = @import("program.zig");
 
 /// Keyboard input type (re-exported from libvaxis).

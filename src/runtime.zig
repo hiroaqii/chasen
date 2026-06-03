@@ -15,6 +15,11 @@ pub const trace = @import("trace.zig");
 pub const TraceEvent = trace.TraceEvent;
 pub const TraceFn = trace.TraceFn;
 
+pub const runtime_effect = @import("runtime_effect.zig");
+pub const RuntimeEffectKind = runtime_effect.RuntimeEffectKind;
+pub const EffectSupport = runtime_effect.EffectSupport;
+pub const BrowserInitialEffects = runtime_effect.BrowserInitialEffects;
+
 /// Cleanup context passed to optional app `deinit`.
 ///
 /// This context is intentionally smaller than `Ctx`: shutdown cleanup cannot
