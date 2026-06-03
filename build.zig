@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const runtime_mod = b.addModule("chasen_runtime", .{
+        .root_source_file = b.path("src/runtime.zig"),
+        .target = target,
+    });
+
     const example_names = [_][]const u8{
         "counter",
         "stopwatch",
@@ -147,15 +152,38 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    const runtime_mod_tests = b.addTest(.{
+        .root_module = runtime_mod,
+    });
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const run_runtime_mod_tests = b.addRunArtifact(runtime_mod_tests);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_runtime_mod_tests.step);
+
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const runtime_wasm = b.addObject(.{
+        .name = "chasen-runtime-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_check.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen_runtime", .module = runtime_mod },
+            },
+        }),
+    });
+    const check_runtime_wasm_step = b.step("check-runtime-wasm", "Compile runtime-only Chasen API for wasm32-freestanding");
+    check_runtime_wasm_step.dependOn(&runtime_wasm.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

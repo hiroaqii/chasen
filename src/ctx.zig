@@ -1,6 +1,6 @@
 const std = @import("std");
 const cmd_mod = @import("cmd.zig");
-const terminal_image = @import("terminal_image.zig");
+const terminal_image = @import("terminal_image_types.zig");
 
 /// Context object passed to `update`, providing side-effect methods.
 ///

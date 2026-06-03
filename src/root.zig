@@ -1,6 +1,8 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+pub const runtime = @import("runtime.zig");
+
 pub const style = @import("style.zig");
 pub const TextStyle = style.TextStyle;
 pub const Color = style.Color;
@@ -25,11 +27,11 @@ pub const TerminalImagePathLoaderFn = terminal_image.PathLoaderFn;
 pub const TerminalImageLoaderVaxis = terminal_image.LoaderVaxis;
 pub const TerminalImageLoaderImage = terminal_image.LoaderImage;
 
-pub const ctx = @import("ctx.zig");
-pub const Ctx = ctx.Ctx;
+pub const ctx = runtime.ctx;
+pub const Ctx = runtime.Ctx;
 
-pub const cmd = @import("cmd.zig");
-pub const Cmd = cmd.Cmd;
+pub const cmd = runtime.cmd;
+pub const Cmd = runtime.Cmd;
 
 pub const testing = @import("testing.zig");
 
@@ -40,14 +42,14 @@ pub const ComponentStateDeinitContext = state_store.ComponentStateDeinitContext;
 
 pub const text = @import("text.zig");
 
-pub const stats = @import("stats.zig");
-pub const RuntimeEventKind = stats.RuntimeEventKind;
-pub const RuntimeStats = stats.RuntimeStats;
-pub const StatsFn = stats.StatsFn;
+pub const stats = runtime.stats;
+pub const RuntimeEventKind = runtime.RuntimeEventKind;
+pub const RuntimeStats = runtime.RuntimeStats;
+pub const StatsFn = runtime.StatsFn;
 
-pub const trace = @import("trace.zig");
-pub const TraceEvent = trace.TraceEvent;
-pub const TraceFn = trace.TraceFn;
+pub const trace = runtime.trace;
+pub const TraceEvent = runtime.TraceEvent;
+pub const TraceFn = runtime.TraceFn;
 
 const program = @import("program.zig");
 
@@ -77,35 +79,9 @@ pub const Event = union(enum) {
     frame: Frame,
 };
 
-/// Cleanup context passed to optional app `deinit`.
-///
-/// This context is intentionally smaller than `Ctx`: shutdown cleanup cannot
-/// queue effects, spawn work, or request frames.
-pub const AppDeinitContext = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-};
+pub const AppDeinitContext = runtime.AppDeinitContext;
 
-/// Backend-independent runtime options for `runWith`.
-pub const RuntimeOptions = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    /// Optional callback called after each runtime event loop iteration.
-    ///
-    /// The callback receives lightweight timing information. Chasen does not
-    /// store, aggregate, format, or export these stats. When this is `null`,
-    /// Chasen skips runtime timing measurements.
-    stats_fn: ?StatsFn = null,
-    /// Optional caller-owned context passed to `stats_fn`.
-    stats_context: ?*anyopaque = null,
-    /// Optional callback called at runtime lifecycle boundaries.
-    ///
-    /// The callback receives event notifications, not timings. Chasen does not
-    /// store, aggregate, format, or export trace events.
-    trace_fn: ?TraceFn = null,
-    /// Optional caller-owned context passed to `trace_fn`.
-    trace_context: ?*anyopaque = null,
-};
+pub const RuntimeOptions = runtime.RuntimeOptions;
 
 /// Terminal-backend options for `runWith`.
 pub const TerminalOptions = struct {
