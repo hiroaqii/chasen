@@ -647,15 +647,20 @@ fn render(
     measure: bool,
     opts: root.RunOptions,
 ) !RenderTimings {
+    // Reuse frame scratch capacity across renders to avoid per-frame allocator churn.
     _ = frame_arena.reset(.retain_capacity);
+
     const win = vx.window();
     win.clear();
+
     var sfc: Surface = .initVaxis(win, frame_arena.allocator(), terminal_images);
+
     trace(opts, .view_start);
     const view_start = timingStart(measure, io);
     try app.view(&sfc);
     const view_ns = if (measure) timingElapsed(view_start, io) else 0;
     trace(opts, .view_end);
+
     trace(opts, .render_start);
     const render_start = timingStart(measure, io);
     try vx.render(writer);
