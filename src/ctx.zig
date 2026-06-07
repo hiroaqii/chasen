@@ -17,8 +17,8 @@ pub fn Ctx(comptime Msg: type) type {
     const max_cancels = 8;
 
     return struct {
-        pub const TerminalImageLoadedFn = *const fn (*anyopaque, terminal_image.TerminalImageHandle) Msg;
-        pub const TerminalImageFailedFn = *const fn (*anyopaque, terminal_image.LoadError) Msg;
+        pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
+        pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
 
         pub const TickEntry = struct {
             id: []const u8,
@@ -38,8 +38,8 @@ pub fn Ctx(comptime Msg: type) type {
         };
 
         pub const TerminalImageLoadEntry = struct {
+            request_id: terminal_image.TerminalImageRequestId,
             path: []const u8,
-            ctx: *anyopaque,
             loaded: TerminalImageLoadedFn,
             failed: TerminalImageFailedFn,
         };
@@ -60,6 +60,7 @@ pub fn Ctx(comptime Msg: type) type {
         pending_cancels_len: u8 = 0,
         pending_terminal_image_loads: [max_terminal_image_loads]TerminalImageLoadEntry = undefined,
         pending_terminal_image_loads_len: u8 = 0,
+        next_terminal_image_request_id: u64 = 1,
         pending_terminal_image_unloads: [max_terminal_image_unloads]terminal_image.TerminalImageHandle = undefined,
         pending_terminal_image_unloads_len: u8 = 0,
         redraw_suppressed: bool = false,
@@ -115,24 +116,32 @@ pub fn Ctx(comptime Msg: type) type {
         /// The path is copied while queueing because effects are drained after
         /// `init`/`update` returns. The runtime frees the copied path after it
         /// posts either `loaded` or `failed`.
+        ///
+        /// The returned request id is passed back to the callbacks so apps can
+        /// ignore stale image loads without owning callback context pointers.
+        /// Once a loaded callback receives a handle, the app owns that handle:
+        /// if the result is stale or otherwise unused, queue
+        /// `unloadTerminalImage` for the handle instead of silently dropping it.
         pub fn loadTerminalImagePath(
             self: *@This(),
             path: []const u8,
-            ctx_ptr: *anyopaque,
             loaded_fn: TerminalImageLoadedFn,
             failed_fn: TerminalImageFailedFn,
-        ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!void {
+        ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!terminal_image.TerminalImageRequestId {
             if (self.pending_terminal_image_loads_len >= max_terminal_image_loads)
                 return error.TerminalImageLoadLimitExceeded;
 
             const copied_path = try self._allocator.dupe(u8, path);
+            const request_id = terminal_image.TerminalImageRequestId{ .id = self.next_terminal_image_request_id };
+            self.next_terminal_image_request_id +%= 1;
             self.pending_terminal_image_loads[self.pending_terminal_image_loads_len] = .{
+                .request_id = request_id,
                 .path = copied_path,
-                .ctx = ctx_ptr,
                 .loaded = loaded_fn,
                 .failed = failed_fn,
             };
             self.pending_terminal_image_loads_len += 1;
+            return request_id;
         }
 
         pub fn pendingTerminalImageLoadSlice(self: *@This()) []const TerminalImageLoadEntry {
@@ -500,12 +509,12 @@ test "Ctx loadTerminalImagePath copies queued path" {
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
 
     var path_buf = [_]u8{ 'a', '.', 'p', 'n', 'g' };
-    try ctx_val.loadTerminalImagePath(&path_buf, undefined, &struct {
-        fn loaded(_: *anyopaque, _: terminal_image.TerminalImageHandle) TestMsg {
+    const request_id = try ctx_val.loadTerminalImagePath(&path_buf, &struct {
+        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) TestMsg {
             return .loaded;
         }
     }.loaded, &struct {
-        fn failed(_: *anyopaque, _: terminal_image.LoadError) TestMsg {
+        fn failed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) TestMsg {
             return .failed;
         }
     }.failed);
@@ -519,7 +528,9 @@ test "Ctx loadTerminalImagePath copies queued path" {
     path_buf[0] = 'b';
 
     const pending = ctx_val.pendingTerminalImageLoadSlice();
+    try std.testing.expectEqual(@as(u64, 1), request_id.id);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(request_id, pending[0].request_id);
     try std.testing.expectEqualStrings("a.png", pending[0].path);
 }
 

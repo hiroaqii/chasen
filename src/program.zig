@@ -190,14 +190,15 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const stats_enabled = opts.runtime.stats_fn != null;
 
     // --- Pending futures (for spawned async tasks) ---
-    // Completed one-shot futures (spawn/tick) remain in this list until
-    // shutdown because std.Io.Future has no non-blocking completion check.
-    // Memory impact is expected to be small for typical TUI usage.
-    // All futures are cancelled in the defer block below.
+    // Completed one-shot futures remain in this list until shutdown because
+    // std.Io.Future has no non-blocking completion check. They are awaited
+    // instead of cancelled: app task callbacks return `Msg`, not a cancelable
+    // result, so forcing cancelation can make a task turn `error.Canceled` into
+    // an ordinary failure message and continue into the next I/O operation.
     var pending_futures: std.ArrayList(std.Io.Future(void)) = .empty;
     defer {
         for (pending_futures.items) |*f| {
-            _ = f.cancel(io);
+            _ = f.await(io);
         }
         pending_futures.deinit(allocator);
     }
@@ -551,12 +552,12 @@ fn processPendingTerminalImages(
 
         switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
             .loaded => |handle| {
-                loop.postEvent(.{ .user_msg = entry.loaded(entry.ctx, handle) }) catch {
+                loop.postEvent(.{ .user_msg = entry.loaded(entry.request_id, handle) }) catch {
                     _ = registry.unload(vx.*, tty, handle);
                 };
             },
             .failed => |reason| {
-                loop.postEvent(.{ .user_msg = entry.failed(entry.ctx, reason) }) catch {};
+                loop.postEvent(.{ .user_msg = entry.failed(entry.request_id, reason) }) catch {};
             },
         }
     }

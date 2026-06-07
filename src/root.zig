@@ -19,6 +19,7 @@ pub const PrintResult = surface.PrintResult;
 
 pub const terminal_image = @import("terminal_image.zig");
 pub const TerminalImageHandle = terminal_image.TerminalImageHandle;
+pub const TerminalImageRequestId = terminal_image.TerminalImageRequestId;
 pub const TerminalImageFit = terminal_image.TerminalImageFit;
 pub const TerminalImageOptions = terminal_image.TerminalImageOptions;
 pub const TerminalImageLoadError = terminal_image.LoadError;

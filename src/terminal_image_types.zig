@@ -8,6 +8,15 @@ pub const TerminalImageHandle = struct {
     generation: u32,
 };
 
+/// Runtime-issued id for a queued terminal image load request.
+///
+/// Apps can store this value and compare it with later load-result messages to
+/// ignore stale results. It is intentionally distinct from frame counters,
+/// image handles, and app-local request ids.
+pub const TerminalImageRequestId = struct {
+    id: u64,
+};
+
 /// Image scaling policy for terminal image placement.
 pub const TerminalImageFit = enum {
     none,

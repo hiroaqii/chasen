@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 pub const types = @import("terminal_image_types.zig");
 
 pub const TerminalImageHandle = types.TerminalImageHandle;
+pub const TerminalImageRequestId = types.TerminalImageRequestId;
 pub const TerminalImageFit = types.TerminalImageFit;
 pub const TerminalImageHorizontalAlign = types.TerminalImageHorizontalAlign;
 pub const TerminalImageVerticalAlign = types.TerminalImageVerticalAlign;
