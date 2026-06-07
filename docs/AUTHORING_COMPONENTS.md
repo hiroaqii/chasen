@@ -30,7 +30,7 @@ pub fn update(self: *Self, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         .toggle => self.enabled = !self.enabled,
         .frame => |frame| {
             self.animation_time_ns = frame.now_ns;
-            ctx.requestFrame();
+            ctx.frame().request();
         },
     }
 }
@@ -323,7 +323,7 @@ inspect style, cursor behavior, wide-character layout, or individual cells.
 
 ## Animation
 
-Animation and media packages should drive rendering with `ctx.requestFrame()`.
+Animation and media packages should drive rendering with `ctx.frame().request()`.
 This requests one future `Event.frame`. Re-request from `update` while the
 animation is still active.
 
@@ -337,12 +337,12 @@ pub fn update(self: *Self, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
     switch (msg) {
         .start => {
             self.running = true;
-            ctx.requestFrame();
+            ctx.frame().request();
         },
         .frame => |frame| {
             if (!self.running) return;
             self.t_ns = frame.now_ns;
-            ctx.requestFrame();
+            ctx.frame().request();
         },
     }
 }
@@ -408,37 +408,38 @@ the screen buffer matched to the new terminal size.
 
 Effect drain currently processes pending work in this order:
 
-1. `spawn` / `spawnWith`
-2. `tick`
-3. `every`
-4. `cancelTimer`
-5. `requestFrame`
+1. `ctx.task().spawn` / `ctx.task().spawnWith`
+2. `ctx.timer().tick`
+3. `ctx.timer().every`
+4. `ctx.image().unload` / `ctx.image().loadPath`
+5. `ctx.timer().cancel`
+6. `ctx.frame().request`
 
-`tick(id, after_ns, msg)` schedules one future message. `every(id,
-interval_ns, msg)` schedules repeated messages until cancelled. Scheduling a
-new `tick` or `every` with the same id replaces the existing running timer with
-that id.
+`ctx.timer().tick(id, after_ns, msg)` schedules one future message.
+`ctx.timer().every(id, interval_ns, msg)` schedules repeated messages until
+cancelled. Scheduling a new `tick` or `every` with the same id replaces the
+existing running timer with that id.
 
 The `tick` example shows a one-shot timer, same-id replacement, and
-`cancelTimer` in a runnable app:
+`ctx.timer().cancel` in a runnable app:
 
 ```sh
 zig build run-tick
 ```
 
-`cancelTimer(id)` removes matching timers queued in the current `Ctx` and also
-queues cancellation for matching timers already running in the runtime. Timer
-ids are borrowed text and must remain valid until the runtime drains the cancel
-request.
+`ctx.timer().cancel(id)` removes matching timers queued in the current `Ctx`
+and also queues cancellation for matching timers already running in the runtime.
+Timer ids are borrowed text and must remain valid until the runtime drains the
+cancel request.
 
-`requestFrame()` requests one future `Event.frame`. It is coalesced while a
-frame request is already in flight; it does not create an idle render loop by
-itself. Re-request from `update` while animation should continue, and stop
-requesting when the animation is done.
+`ctx.frame().request()` requests one future `Event.frame`. It is coalesced
+while a frame request is already in flight; it does not create an idle render
+loop by itself. Re-request from `update` while animation should continue, and
+stop requesting when the animation is done.
 
-`suppressRedraw()` is message-scoped. The runtime resets that flag immediately
-before each `update`; if the update suppresses redraw, pending effects are still
-drained, but the redraw for that message is skipped.
+`ctx.frame().suppressRedraw()` is message-scoped. The runtime resets that flag
+immediately before each `update`; if the update suppresses redraw, pending
+effects are still drained, but the redraw for that message is skipped.
 
 ## Msg Ownership
 
@@ -514,46 +515,26 @@ pub fn update(self: *Self, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
 This pattern is important for HTTP, media metadata, BGG XML payloads, terminal
 buffers, and other large data.
 
-## Cmd
+## Component Effects
 
-Applications normally call `Ctx` methods directly from `update`.
+Applications call `Ctx` namespace methods directly from `update`.
 
-`chasen.Cmd(Msg)` exists as an effect descriptor for helpers that need to
-compose effects before handing them back to app code. A component package may
-return a `Cmd(Msg)` from an update helper, but the application should still
-dispatch it from `update`:
+Component helpers that need to request runtime effects should either:
 
-```zig
-const command = widget.update(action);
-try ctx.dispatch(command);
-```
+- return an app-level message that the parent handles in `update`, or
+- accept `*chasen.Ctx(Msg)` and queue the effect directly.
 
-Single-value commands such as `.request_frame`, `.suppress_redraw`, `.tick`,
-and `.every` are the preferred shape for component-returned commands.
-
-`Cmd.batch` and `Cmd.sequence` store slices; they do not own command arrays.
-The backing memory must remain valid until `ctx.dispatch()` returns. If you
-need to combine multiple commands from app code, build the array beside the
-dispatch call:
+Example:
 
 ```zig
-const widget_cmd = widget.open();
-const commands = [_]chasen.Cmd(Msg){
-    widget_cmd,
-    .{ .tick = .{
-        .id = "hide-help",
-        .after_ns = 700_000_000,
-        .msg = .hide_help,
-    }},
-};
-try ctx.dispatch(.{ .batch = &commands });
+pub fn updateTransition(self: *TransitionState, ctx: *chasen.Ctx(Msg)) void {
+    if (self.running) ctx.frame().request();
+}
 ```
 
-Do not return `.batch` or `.sequence` that points at a local stack array from a
-component helper.
-
-`Cmd.sequence` currently guarantees dispatch order only. It does not wait for
-timer or async task completion.
+Chasen intentionally does not expose a public `Cmd` effect descriptor as the
+primary component boundary. This keeps the framework `Ctx`-first and avoids a
+second effect API beside the namespace methods.
 
 Do not execute I/O from `view`.
 

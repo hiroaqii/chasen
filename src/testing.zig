@@ -171,12 +171,12 @@ test "resetTransient clears pending queues and redraw_suppressed" {
             return .inc;
         }
     }.run;
-    try tc.ctx.spawn(task);
-    try tc.ctx.tick("t1", 1_000, .inc);
-    try tc.ctx.every("e1", 2_000, .dec);
-    tc.ctx.cancelTimer("x");
-    tc.ctx.suppressRedraw();
-    tc.ctx.requestFrame();
+    try tc.ctx.task().spawn(task);
+    try tc.ctx.timer().tick("t1", 1_000, .inc);
+    try tc.ctx.timer().every("e1", 2_000, .dec);
+    tc.ctx.timer().cancel("x");
+    tc.ctx.frame().suppressRedraw();
+    tc.ctx.frame().request();
 
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_tasks_len);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_ticks_len);

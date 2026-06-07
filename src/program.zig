@@ -367,7 +367,7 @@ fn dispatchAppEvent(
 
 /// Apply one app message and return whether the app requested a redraw.
 ///
-/// `Ctx.suppressRedraw()` is message-scoped, so the flag is reset immediately
+/// `ctx.frame().suppressRedraw()` is message-scoped, so the flag is reset immediately
 /// before each app update. The helper also owns update timing and the
 /// `did_update` stats flag, which avoids duplicating that bookkeeping across
 /// every event kind.
@@ -397,7 +397,7 @@ fn applyMsg(
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
-/// Ctx.spawn/spawnWith only guarantee queueing; runtime start failures
+/// ctx.task().spawn/spawnWith only guarantee queueing; runtime start failures
 /// are currently dropped and may become observable via a future error hook.
 fn spawnPendingTasks(
     comptime Msg: type,

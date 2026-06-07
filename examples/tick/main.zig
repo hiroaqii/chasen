@@ -4,9 +4,9 @@ const chasen = @import("chasen");
 const reminder_id = "reminder";
 const reminder_delay_ns: u64 = 2 * std.time.ns_per_s;
 
-// This example demonstrates `ctx.tick`: a one-shot timer that sends one future
+// This example demonstrates `ctx.timer().tick`: a one-shot timer that sends one future
 // app message. Re-scheduling with the same id replaces the pending/running
-// timer, and cancelTimer stops it before it fires.
+// timer, and `ctx.timer().cancel` stops it before it fires.
 const TickDemo = struct {
     scheduled: bool = false,
     scheduled_count: u32 = 0,
@@ -27,7 +27,7 @@ const TickDemo = struct {
                 self.scheduled = true;
                 self.scheduled_count += 1;
                 self.last_event = "Scheduled. Press s again to replace it.";
-                try ctx.tick(reminder_id, reminder_delay_ns, .fired);
+                try ctx.timer().tick(reminder_id, reminder_delay_ns, .fired);
             },
             .fired => {
                 self.scheduled = false;
@@ -42,7 +42,7 @@ const TickDemo = struct {
                     self.last_event = "No scheduled tick to cancel.";
                 }
                 self.scheduled = false;
-                ctx.cancelTimer(reminder_id);
+                ctx.timer().cancel(reminder_id);
             },
             .quit => ctx.quit(),
         }

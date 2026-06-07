@@ -3,7 +3,7 @@ const chasen = @import("chasen");
 
 // This example demonstrates frame-driven rendering.
 //
-// `ctx.requestFrame()` does not start a permanent timer. It asks Chasen to
+// `ctx.frame().request()` does not start a permanent timer. It asks Chasen to
 // deliver one future `Event.frame`. If the app wants continuous animation, it
 // must request the next frame after handling the current one.
 const Animation = struct {
@@ -21,7 +21,7 @@ const Animation = struct {
         _ = self;
         // Kick off the first frame. Without this, the app stays idle until
         // terminal input arrives.
-        ctx.requestFrame();
+        ctx.frame().request();
     }
 
     pub fn update(self: *Animation, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -31,13 +31,13 @@ const Animation = struct {
                 self.last_delta_ms = frame.delta_ns / std.time.ns_per_ms;
                 // Request exactly one more frame while running. When this is
                 // skipped, the runtime returns to event-driven idle mode.
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .toggle => {
                 self.running = !self.running;
                 // Resuming from pause needs a fresh frame request because no
                 // frame future is kept alive while paused.
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .quit => ctx.quit(),
         }

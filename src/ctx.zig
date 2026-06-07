@@ -1,11 +1,12 @@
 const std = @import("std");
-const cmd_mod = @import("cmd.zig");
 const terminal_image = @import("terminal_image_types.zig");
 
-/// Context object passed to `update`, providing side-effect methods.
+/// Context object passed to `init` and `update`.
 ///
-/// Provides `quit()` to exit the application and `spawn()` to launch
-/// async tasks whose results are delivered back as messages.
+/// `Ctx` queues runtime effects for the program to drain after the current
+/// app callback returns. Effects are grouped by capability namespace, while
+/// `quit()` remains a direct shortcut because nearly every interactive app
+/// needs it.
 pub fn Ctx(comptime Msg: type) type {
     const TaskFn = *const fn (std.mem.Allocator, std.Io) Msg;
     const max_tasks = 16;
@@ -17,6 +18,8 @@ pub fn Ctx(comptime Msg: type) type {
     const max_cancels = 8;
 
     return struct {
+        const Self = @This();
+
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
 
@@ -66,19 +69,177 @@ pub fn Ctx(comptime Msg: type) type {
         redraw_suppressed: bool = false,
         frame_requested: bool = false,
 
+        pub const FrameEffects = struct {
+            ctx: *Self,
+
+            /// Request one future frame event.
+            ///
+            /// The runtime coalesces repeated calls while a frame is already
+            /// pending. Call this again from the frame update to keep animating.
+            pub fn request(self: FrameEffects) void {
+                self.ctx.frame_requested = true;
+            }
+
+            /// Suppress the default redraw for the current update cycle.
+            ///
+            /// By default, `view` is called after every `update`. Call this
+            /// method inside `update` when the message does not affect
+            /// the visual state and a redraw would be wasteful.
+            pub fn suppressRedraw(self: FrameEffects) void {
+                self.ctx.redraw_suppressed = true;
+            }
+        };
+
+        pub const TaskEffects = struct {
+            ctx: *Self,
+
+            /// Spawn an async task. The task function will be called
+            /// concurrently and its return value delivered as a message to
+            /// `update`.
+            ///
+            /// The task is queued here and started by the runtime after
+            /// `update` returns.
+            pub fn spawn(self: TaskEffects, task_fn: TaskFn) error{TaskLimitExceeded}!void {
+                if (self.ctx.pending_tasks_len + self.ctx.pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
+                self.ctx.pending_tasks[self.ctx.pending_tasks_len] = task_fn;
+                self.ctx.pending_tasks_len += 1;
+            }
+
+            /// Spawn an async task with captured context.
+            ///
+            /// The caller must ensure `ctx_ptr` remains valid until the task
+            /// finishes or is cancelled.
+            pub fn spawnWith(
+                self: TaskEffects,
+                ctx_ptr: *anyopaque,
+                run_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
+            ) error{TaskLimitExceeded}!void {
+                if (self.ctx.pending_tasks_len + self.ctx.pending_tasks_with_len >= max_tasks)
+                    return error.TaskLimitExceeded;
+                self.ctx.pending_tasks_with[self.ctx.pending_tasks_with_len] = .{
+                    .ctx = ctx_ptr,
+                    .run = run_fn,
+                };
+                self.ctx.pending_tasks_with_len += 1;
+            }
+        };
+
+        pub const TimerEffects = struct {
+            ctx: *Self,
+
+            /// Schedule a one-shot delayed message.
+            ///
+            /// The message will be delivered once after `after_ns`
+            /// nanoseconds. If a timer with the same `id` is already pending,
+            /// it is overwritten.
+            ///
+            /// `id` must point to memory that remains valid for the lifetime
+            /// of the timer, such as a string literal or application-owned
+            /// slice.
+            pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+                for (self.ctx.pending_ticks[0..self.ctx.pending_ticks_len]) |*entry| {
+                    if (std.mem.eql(u8, entry.id, id)) {
+                        entry.* = .{ .id = id, .after_ns = after_ns, .msg = msg };
+                        return;
+                    }
+                }
+                if (self.ctx.pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
+                self.ctx.pending_ticks[self.ctx.pending_ticks_len] = .{ .id = id, .after_ns = after_ns, .msg = msg };
+                self.ctx.pending_ticks_len += 1;
+            }
+
+            /// Schedule a repeating timer.
+            ///
+            /// The message will be delivered every `interval_ns` nanoseconds
+            /// until the future is cancelled. If a timer with the same `id` is
+            /// already pending, it is overwritten.
+            pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+                for (self.ctx.pending_everys[0..self.ctx.pending_everys_len]) |*entry| {
+                    if (std.mem.eql(u8, entry.id, id)) {
+                        entry.* = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
+                        return;
+                    }
+                }
+                if (self.ctx.pending_everys_len >= max_everys) return error.TimerLimitExceeded;
+                self.ctx.pending_everys[self.ctx.pending_everys_len] = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
+                self.ctx.pending_everys_len += 1;
+            }
+
+            /// Cancel a timer by id.
+            ///
+            /// Removes any matching entry from the pending tick/every queues.
+            /// Also queues the id for the runtime to cancel running timers.
+            /// If the pending cancel queue is full, the cancel request is
+            /// silently dropped.
+            pub fn cancel(self: TimerEffects, id: []const u8) void {
+                self.ctx.cancelTimerInternal(id);
+            }
+        };
+
+        pub const ImageEffects = struct {
+            ctx: *Self,
+
+            /// Queue a local terminal image path to be loaded by the runtime.
+            ///
+            /// The path is copied while queueing because effects are drained
+            /// after `init`/`update` returns. The runtime frees the copied path
+            /// after it posts either `loaded` or `failed`.
+            ///
+            /// The returned request id is passed back to the callbacks so apps
+            /// can ignore stale image loads without owning callback context
+            /// pointers. Once a loaded callback receives a handle, the app owns
+            /// that handle: if the result is stale or otherwise unused, queue
+            /// `unload` for the handle instead of silently dropping it.
+            pub fn loadPath(
+                self: ImageEffects,
+                path: []const u8,
+                loaded_fn: TerminalImageLoadedFn,
+                failed_fn: TerminalImageFailedFn,
+            ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!terminal_image.TerminalImageRequestId {
+                if (self.ctx.pending_terminal_image_loads_len >= max_terminal_image_loads)
+                    return error.TerminalImageLoadLimitExceeded;
+
+                const copied_path = try self.ctx._allocator.dupe(u8, path);
+                const request_id = terminal_image.TerminalImageRequestId{ .id = self.ctx.next_terminal_image_request_id };
+                self.ctx.next_terminal_image_request_id +%= 1;
+                self.ctx.pending_terminal_image_loads[self.ctx.pending_terminal_image_loads_len] = .{
+                    .request_id = request_id,
+                    .path = copied_path,
+                    .loaded = loaded_fn,
+                    .failed = failed_fn,
+                };
+                self.ctx.pending_terminal_image_loads_len += 1;
+                return request_id;
+            }
+
+            /// Queue a terminal image handle for release by the runtime.
+            pub fn unload(self: ImageEffects, handle: terminal_image.TerminalImageHandle) error{TerminalImageUnloadLimitExceeded}!void {
+                if (self.ctx.pending_terminal_image_unloads_len >= max_terminal_image_unloads)
+                    return error.TerminalImageUnloadLimitExceeded;
+                self.ctx.pending_terminal_image_unloads[self.ctx.pending_terminal_image_unloads_len] = handle;
+                self.ctx.pending_terminal_image_unloads_len += 1;
+            }
+        };
+
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
             self.should_quit = true;
         }
 
-        /// Spawn an async task. The task function will be called concurrently
-        /// and its return value delivered as a message to `update`.
-        /// The task is queued here and started by the runtime after `update` returns.
-        /// Returns `error.TaskLimitExceeded` if the pending task queue is full.
-        pub fn spawn(self: *@This(), task: TaskFn) error{TaskLimitExceeded}!void {
-            if (self.pending_tasks_len + self.pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
-            self.pending_tasks[self.pending_tasks_len] = task;
-            self.pending_tasks_len += 1;
+        pub fn frame(self: *@This()) FrameEffects {
+            return .{ .ctx = self };
+        }
+
+        pub fn task(self: *@This()) TaskEffects {
+            return .{ .ctx = self };
+        }
+
+        pub fn timer(self: *@This()) TimerEffects {
+            return .{ .ctx = self };
+        }
+
+        pub fn image(self: *@This()) ImageEffects {
+            return .{ .ctx = self };
         }
 
         /// Return a slice of pending tasks.
@@ -86,127 +247,22 @@ pub fn Ctx(comptime Msg: type) type {
             return self.pending_tasks[0..self.pending_tasks_len];
         }
 
-        /// Spawn an async task with captured context.
-        ///
-        /// The caller must ensure `ctx` remains valid until the task finishes
-        /// or is cancelled.
-        /// The task is queued here and started by the runtime after `update` returns.
-        /// Returns `error.TaskLimitExceeded` if the combined pending task queue is full.
-        pub fn spawnWith(
-            self: *@This(),
-            ctx_ptr: *anyopaque,
-            run_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
-        ) error{TaskLimitExceeded}!void {
-            if (self.pending_tasks_len + self.pending_tasks_with_len >= max_tasks)
-                return error.TaskLimitExceeded;
-            self.pending_tasks_with[self.pending_tasks_with_len] = .{
-                .ctx = ctx_ptr,
-                .run = run_fn,
-            };
-            self.pending_tasks_with_len += 1;
-        }
-
         /// Return a slice of pending task-with entries.
         pub fn pendingTaskWithSlice(self: *@This()) []const TaskWithEntry {
             return self.pending_tasks_with[0..self.pending_tasks_with_len];
-        }
-
-        /// Queue a local terminal image path to be loaded by the runtime.
-        ///
-        /// The path is copied while queueing because effects are drained after
-        /// `init`/`update` returns. The runtime frees the copied path after it
-        /// posts either `loaded` or `failed`.
-        ///
-        /// The returned request id is passed back to the callbacks so apps can
-        /// ignore stale image loads without owning callback context pointers.
-        /// Once a loaded callback receives a handle, the app owns that handle:
-        /// if the result is stale or otherwise unused, queue
-        /// `unloadTerminalImage` for the handle instead of silently dropping it.
-        pub fn loadTerminalImagePath(
-            self: *@This(),
-            path: []const u8,
-            loaded_fn: TerminalImageLoadedFn,
-            failed_fn: TerminalImageFailedFn,
-        ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!terminal_image.TerminalImageRequestId {
-            if (self.pending_terminal_image_loads_len >= max_terminal_image_loads)
-                return error.TerminalImageLoadLimitExceeded;
-
-            const copied_path = try self._allocator.dupe(u8, path);
-            const request_id = terminal_image.TerminalImageRequestId{ .id = self.next_terminal_image_request_id };
-            self.next_terminal_image_request_id +%= 1;
-            self.pending_terminal_image_loads[self.pending_terminal_image_loads_len] = .{
-                .request_id = request_id,
-                .path = copied_path,
-                .loaded = loaded_fn,
-                .failed = failed_fn,
-            };
-            self.pending_terminal_image_loads_len += 1;
-            return request_id;
         }
 
         pub fn pendingTerminalImageLoadSlice(self: *@This()) []const TerminalImageLoadEntry {
             return self.pending_terminal_image_loads[0..self.pending_terminal_image_loads_len];
         }
 
-        /// Queue a terminal image handle for release by the runtime.
-        ///
-        /// Unlike timer cancellation, image unload is an explicit resource
-        /// lifecycle operation, so queue pressure is observable to the app.
-        pub fn unloadTerminalImage(self: *@This(), handle: terminal_image.TerminalImageHandle) error{TerminalImageUnloadLimitExceeded}!void {
-            if (self.pending_terminal_image_unloads_len >= max_terminal_image_unloads)
-                return error.TerminalImageUnloadLimitExceeded;
-            self.pending_terminal_image_unloads[self.pending_terminal_image_unloads_len] = handle;
-            self.pending_terminal_image_unloads_len += 1;
-        }
-
         pub fn pendingTerminalImageUnloadSlice(self: *@This()) []const terminal_image.TerminalImageHandle {
             return self.pending_terminal_image_unloads[0..self.pending_terminal_image_unloads_len];
-        }
-
-        /// Schedule a one-shot delayed message.
-        /// The message will be delivered once after `after_ns` nanoseconds.
-        /// If a timer with the same `id` is already pending, it is overwritten.
-        /// Returns `error.TimerLimitExceeded` if the pending timer queue is full.
-        ///
-        /// `id` must point to memory that remains valid for the lifetime of the timer
-        /// (e.g. a string literal or application-owned slice).
-        pub fn tick(self: *@This(), id: []const u8, after_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
-            // Overwrite existing entry with the same id.
-            for (self.pending_ticks[0..self.pending_ticks_len]) |*entry| {
-                if (std.mem.eql(u8, entry.id, id)) {
-                    entry.* = .{ .id = id, .after_ns = after_ns, .msg = msg };
-                    return;
-                }
-            }
-            if (self.pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
-            self.pending_ticks[self.pending_ticks_len] = .{ .id = id, .after_ns = after_ns, .msg = msg };
-            self.pending_ticks_len += 1;
         }
 
         /// Return a slice of pending tick entries.
         pub fn pendingTickSlice(self: *@This()) []const TickEntry {
             return self.pending_ticks[0..self.pending_ticks_len];
-        }
-
-        /// Schedule a repeating timer.
-        /// The message will be delivered every `interval_ns` nanoseconds
-        /// until the future is cancelled.
-        /// If a timer with the same `id` is already pending, it is overwritten.
-        /// Returns `error.TimerLimitExceeded` if the pending timer queue is full.
-        ///
-        /// `id` must point to memory that remains valid for the lifetime of the timer
-        /// (e.g. a string literal or application-owned slice).
-        pub fn every(self: *@This(), id: []const u8, interval_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
-            // Overwrite existing entry with the same id.
-            for (self.pending_everys[0..self.pending_everys_len]) |*entry| {
-                if (std.mem.eql(u8, entry.id, id)) {
-                    entry.* = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
-                    return;
-                }
-            }
-            if (self.pending_everys_len >= max_everys) return error.TimerLimitExceeded;
-            self.pending_everys[self.pending_everys_len] = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
-            self.pending_everys_len += 1;
         }
 
         /// Return the current monotonic timestamp.
@@ -229,11 +285,7 @@ pub fn Ctx(comptime Msg: type) type {
             return self.pending_everys[0..self.pending_everys_len];
         }
 
-        /// Cancel a timer by id.
-        /// Removes any matching entry from the pending tick/every queues.
-        /// Also queues the id for the runtime to cancel running timers.
-        /// If the pending cancel queue is full, the cancel request is silently dropped.
-        pub fn cancelTimer(self: *@This(), id: []const u8) void {
+        fn cancelTimerInternal(self: *@This(), id: []const u8) void {
             // Remove from pending ticks (swap-remove).
             {
                 var i: u8 = 0;
@@ -273,51 +325,6 @@ pub fn Ctx(comptime Msg: type) type {
         pub fn pendingCancelSlice(self: *@This()) []const []const u8 {
             return self.pending_cancels[0..self.pending_cancels_len];
         }
-
-        /// Suppress the default redraw for the current update cycle.
-        ///
-        /// By default, `view` is called after every `update`. Call this
-        /// method inside `update` when the message does not affect
-        /// the visual state and a redraw would be wasteful.
-        pub fn suppressRedraw(self: *@This()) void {
-            self.redraw_suppressed = true;
-        }
-
-        /// Request one future frame event.
-        ///
-        /// The runtime coalesces repeated calls while a frame is already
-        /// pending. Call this again from the frame update to keep animating.
-        pub fn requestFrame(self: *@This()) void {
-            self.frame_requested = true;
-        }
-
-        /// Dispatch a command descriptor.
-        ///
-        /// Maps each `Cmd` variant to the corresponding `Ctx` method.
-        /// `batch` and `sequence` are dispatched recursively. Their command
-        /// slices must remain valid until this method returns.
-        ///
-        /// Note: `sequence` currently guarantees dispatch order only. It does
-        /// not wait for timer or task completion.
-        pub fn dispatch(self: *@This(), command: cmd_mod.Cmd(Msg)) (error{TaskLimitExceeded} || error{TimerLimitExceeded})!void {
-            switch (command) {
-                .none => {},
-                .quit => self.quit(),
-                .suppress_redraw => self.suppressRedraw(),
-                .request_frame => self.requestFrame(),
-                .cancel_timer => |id| self.cancelTimer(id),
-                .task => |task_fn| try self.spawn(task_fn),
-                .task_with => |tw| try self.spawnWith(tw.ctx, tw.run),
-                .tick => |t| try self.tick(t.id, t.after_ns, t.msg),
-                .every => |e| try self.every(e.id, e.interval_ns, e.msg),
-                .batch => |cmds| {
-                    for (cmds) |c| try self.dispatch(c);
-                },
-                .sequence => |cmds| {
-                    for (cmds) |c| try self.dispatch(c);
-                },
-            }
-        }
     };
 }
 
@@ -331,22 +338,22 @@ test "Ctx spawn accumulates tasks" {
         }
     }.run;
 
-    try ctx_val.spawn(task1);
+    try ctx_val.task().spawn(task1);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
 
-    try ctx_val.spawn(task1);
+    try ctx_val.task().spawn(task1);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_len);
 
     const slice = ctx_val.pendingSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
 }
 
-test "Ctx requestFrame marks a pending frame request" {
+test "Ctx frame request marks a pending frame request" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
 
     try std.testing.expectEqual(false, ctx_val.frame_requested);
-    ctx_val.requestFrame();
+    ctx_val.frame().request();
     try std.testing.expectEqual(true, ctx_val.frame_requested);
 }
 
@@ -360,18 +367,18 @@ test "Ctx spawn returns error when task queue is full" {
         }
     }.run;
 
-    for (0..16) |_| try ctx_val.spawn(task);
-    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawn(task));
+    for (0..16) |_| try ctx_val.task().spawn(task);
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawn(task));
 }
 
 test "Ctx tick accumulates entries" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try ctx_val.tick("t1", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
 
-    try ctx_val.tick("t2", 500_000_000, .ping);
+    try ctx_val.timer().tick("t2", 500_000_000, .ping);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_ticks_len);
 
     const slice = ctx_val.pendingTickSlice();
@@ -388,19 +395,19 @@ test "Ctx tick returns error when timer queue is full" {
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
-        try ctx_val.tick(ids[i], 1_000_000_000, .timeout);
+        try ctx_val.timer().tick(ids[i], 1_000_000_000, .timeout);
     }
-    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.tick("overflow", 1_000_000_000, .timeout));
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().tick("overflow", 1_000_000_000, .timeout));
 }
 
 test "Ctx every accumulates entries" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try ctx_val.every("e1", 1_000_000_000, .tick_msg);
+    try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    try ctx_val.every("e2", 500_000_000, .heartbeat);
+    try ctx_val.timer().every("e2", 500_000_000, .heartbeat);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_everys_len);
 
     const slice = ctx_val.pendingEverySlice();
@@ -417,20 +424,20 @@ test "Ctx every returns error when timer queue is full" {
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
-        try ctx_val.every(ids[i], 1_000_000_000, .tick_msg);
+        try ctx_val.timer().every(ids[i], 1_000_000_000, .tick_msg);
     }
-    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.every("overflow", 1_000_000_000, .tick_msg));
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().every("overflow", 1_000_000_000, .tick_msg));
 }
 
 test "Ctx tick same id overwrites existing entry" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try ctx_val.tick("timer1", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
 
     // Same id should overwrite, not grow the queue.
-    try ctx_val.tick("timer1", 2_000_000_000, .ping);
+    try ctx_val.timer().tick("timer1", 2_000_000_000, .ping);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
 
     const slice = ctx_val.pendingTickSlice();
@@ -442,11 +449,11 @@ test "Ctx every same id overwrites existing entry" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try ctx_val.every("refresh", 1_000_000_000, .tick_msg);
+    try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
     // Same id should overwrite.
-    try ctx_val.every("refresh", 500_000_000, .heartbeat);
+    try ctx_val.timer().every("refresh", 500_000_000, .heartbeat);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
     const slice = ctx_val.pendingEverySlice();
@@ -454,28 +461,28 @@ test "Ctx every same id overwrites existing entry" {
     try std.testing.expect(slice[0].msg == .heartbeat);
 }
 
-test "Ctx cancelTimer removes from pending queues" {
+test "Ctx timer cancel removes from pending queues" {
     const TestMsg = union(enum) { timeout, tick_msg };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try ctx_val.tick("t1", 1_000_000_000, .timeout);
-    try ctx_val.every("e1", 500_000_000, .tick_msg);
+    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
+    try ctx_val.timer().every("e1", 500_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    ctx_val.cancelTimer("t1");
+    ctx_val.timer().cancel("t1");
     try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    ctx_val.cancelTimer("e1");
+    ctx_val.timer().cancel("e1");
     try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_everys_len);
 }
 
-test "Ctx cancelTimer queues id for runtime cancellation" {
+test "Ctx timer cancel queues id for runtime cancellation" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    ctx_val.cancelTimer("running_timer");
+    ctx_val.timer().cancel("running_timer");
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
 
     const cancels = ctx_val.pendingCancelSlice();
@@ -494,22 +501,22 @@ test "Ctx spawnWith accumulates tasks" {
         }
     }.run;
 
-    try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_fn);
+    try ctx_val.task().spawnWith(@ptrCast(&dummy_ctx), run_fn);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_with_len);
 
-    try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_fn);
+    try ctx_val.task().spawnWith(@ptrCast(&dummy_ctx), run_fn);
     try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_with_len);
 
     const slice = ctx_val.pendingTaskWithSlice();
     try std.testing.expectEqual(@as(usize, 2), slice.len);
 }
 
-test "Ctx loadTerminalImagePath copies queued path" {
+test "Ctx image loadPath copies queued path" {
     const TestMsg = union(enum) { loaded, failed };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
 
     var path_buf = [_]u8{ 'a', '.', 'p', 'n', 'g' };
-    const request_id = try ctx_val.loadTerminalImagePath(&path_buf, &struct {
+    const request_id = try ctx_val.image().loadPath(&path_buf, &struct {
         fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) TestMsg {
             return .loaded;
         }
@@ -534,161 +541,26 @@ test "Ctx loadTerminalImagePath copies queued path" {
     try std.testing.expectEqualStrings("a.png", pending[0].path);
 }
 
-test "Ctx unloadTerminalImage queues handles" {
+test "Ctx image unload queues handles" {
     const TestMsg = union(enum) { done };
     var ctx_val: Ctx(TestMsg) = .{};
 
     const handle = terminal_image.TerminalImageHandle{ .id = 7, .generation = 2 };
-    try ctx_val.unloadTerminalImage(handle);
+    try ctx_val.image().unload(handle);
 
     const pending = ctx_val.pendingTerminalImageUnloadSlice();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqual(handle, pending[0]);
 }
 
-test "Ctx unloadTerminalImage returns error when queue is full" {
+test "Ctx image unload returns error when queue is full" {
     const TestMsg = union(enum) { done };
     var ctx_val: Ctx(TestMsg) = .{};
 
     const handle = terminal_image.TerminalImageHandle{ .id = 7, .generation = 2 };
-    for (0..8) |_| try ctx_val.unloadTerminalImage(handle);
+    for (0..8) |_| try ctx_val.image().unload(handle);
 
-    try std.testing.expectError(error.TerminalImageUnloadLimitExceeded, ctx_val.unloadTerminalImage(handle));
-}
-
-test "dispatch .none does nothing" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.none);
-
-    try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_tasks_len);
-    try std.testing.expectEqual(false, ctx_val.should_quit);
-}
-
-test "dispatch .quit sets should_quit" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.quit);
-
-    try std.testing.expectEqual(true, ctx_val.should_quit);
-}
-
-test "dispatch .suppress_redraw sets redraw_suppressed" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.suppress_redraw);
-
-    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
-}
-
-test "dispatch .request_frame marks a pending frame request" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.request_frame);
-
-    try std.testing.expectEqual(true, ctx_val.frame_requested);
-}
-
-test "dispatch .task queues a task" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.{ .task = &struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
-            return .hello;
-        }
-    }.run });
-
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
-}
-
-test "dispatch .task_with queues a task_with" {
-    const TestMsg = union(enum) { done };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    var dummy: u32 = 42;
-    try ctx_val.dispatch(.{ .task_with = .{
-        .ctx = @ptrCast(&dummy),
-        .run = &struct {
-            fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
-                return .done;
-            }
-        }.run,
-    } });
-
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_with_len);
-}
-
-test "dispatch .tick queues a tick" {
-    const TestMsg = union(enum) { timeout };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .timeout } });
-
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
-}
-
-test "dispatch .every queues an every" {
-    const TestMsg = union(enum) { tick_msg };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.{ .every = .{ .id = "e1", .interval_ns = 500_000, .msg = .tick_msg } });
-
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
-}
-
-test "dispatch .cancel_timer queues a cancel" {
-    const TestMsg = union(enum) { timeout };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    try ctx_val.dispatch(.{ .cancel_timer = "timer1" });
-
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
-    try std.testing.expectEqualStrings("timer1", ctx_val.pendingCancelSlice()[0]);
-}
-
-test "dispatch .batch processes multiple commands" {
-    const TestMsg = union(enum) { hello, timeout };
-    const C = cmd_mod.Cmd(TestMsg);
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    const cmds = [_]C{
-        .quit,
-        .request_frame,
-        .suppress_redraw,
-        .{ .tick = .{ .id = "t1", .after_ns = 1_000_000, .msg = .timeout } },
-        .{ .task = &struct {
-            fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
-                return .hello;
-            }
-        }.run },
-    };
-    try ctx_val.dispatch(.{ .batch = &cmds });
-
-    try std.testing.expectEqual(true, ctx_val.should_quit);
-    try std.testing.expectEqual(true, ctx_val.frame_requested);
-    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
-}
-
-test "dispatch .sequence processes multiple commands" {
-    const TestMsg = union(enum) { hello, timeout };
-    const C = cmd_mod.Cmd(TestMsg);
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    const cmds = [_]C{
-        .quit,
-        .{ .every = .{ .id = "e1", .interval_ns = 500_000, .msg = .timeout } },
-    };
-    try ctx_val.dispatch(.{ .sequence = &cmds });
-
-    try std.testing.expectEqual(true, ctx_val.should_quit);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectError(error.TerminalImageUnloadLimitExceeded, ctx_val.image().unload(handle));
 }
 
 test "Ctx redraw_suppressed defaults to false" {
@@ -702,7 +574,7 @@ test "Ctx suppressRedraw sets redraw_suppressed to true" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    ctx_val.suppressRedraw();
+    ctx_val.frame().suppressRedraw();
     try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
 }
 
@@ -724,10 +596,10 @@ test "Ctx spawn and spawnWith share task limit" {
     }.run;
 
     // Fill 10 with spawn, 6 with spawnWith = 16 total (max_tasks)
-    for (0..10) |_| try ctx_val.spawn(task);
-    for (0..6) |_| try ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_with);
+    for (0..10) |_| try ctx_val.task().spawn(task);
+    for (0..6) |_| try ctx_val.task().spawnWith(@ptrCast(&dummy_ctx), run_with);
 
     // Both should fail now
-    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawn(task));
-    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.spawnWith(@ptrCast(&dummy_ctx), run_with));
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawn(task));
+    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawnWith(@ptrCast(&dummy_ctx), run_with));
 }

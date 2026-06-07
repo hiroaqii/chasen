@@ -42,18 +42,18 @@ const RuntimeTraceDemo = struct {
 
     pub fn init(self: *RuntimeTraceDemo, ctx: *chasen.Ctx(Msg)) !void {
         _ = self;
-        ctx.requestFrame();
+        ctx.frame().request();
     }
 
     pub fn update(self: *RuntimeTraceDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .frame => |frame| {
                 self.frame_index = frame.index;
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .toggle => {
                 self.running = !self.running;
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .quit => ctx.quit(),
         }

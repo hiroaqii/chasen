@@ -3,9 +3,6 @@ const std = @import("std");
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
 
-pub const cmd = @import("cmd.zig");
-pub const Cmd = cmd.Cmd;
-
 pub const stats = @import("stats.zig");
 pub const RuntimeEventKind = stats.RuntimeEventKind;
 pub const RuntimeStats = stats.RuntimeStats;

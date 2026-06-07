@@ -31,9 +31,6 @@ pub const TerminalImageLoaderImage = terminal_image.LoaderImage;
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;
 
-pub const cmd = runtime.cmd;
-pub const Cmd = runtime.Cmd;
-
 pub const testing = @import("testing.zig");
 
 pub const state_store = @import("state_store.zig");

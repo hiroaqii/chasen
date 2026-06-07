@@ -23,7 +23,7 @@ const AnimTransition = struct {
 
     pub fn init(self: *AnimTransition, ctx: *chasen.Ctx(Msg)) !void {
         _ = self;
-        ctx.requestFrame();
+        ctx.frame().request();
     }
 
     pub fn update(self: *AnimTransition, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -34,12 +34,12 @@ const AnimTransition = struct {
                 if (self.transition.done()) {
                     self.completed_count += 1;
                 } else {
-                    ctx.requestFrame();
+                    ctx.frame().request();
                 }
             },
             .restart => {
                 self.transition = anim.Transition.init(.sweep, transition_max_frame);
-                ctx.requestFrame();
+                ctx.frame().request();
             },
             .quit => ctx.quit(),
         }

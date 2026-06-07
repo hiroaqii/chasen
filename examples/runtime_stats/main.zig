@@ -57,7 +57,7 @@ const RuntimeStatsDemo = struct {
         // Drive continuous runtime iterations so the stats callback has values
         // to collect. Without frame requests, stats update only when input or
         // other events arrive.
-        ctx.requestFrame();
+        ctx.frame().request();
     }
 
     pub fn update(self: *RuntimeStatsDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -66,13 +66,13 @@ const RuntimeStatsDemo = struct {
                 self.frame_index = frame.index;
                 // Request one more frame only while running. This keeps the
                 // example close to how an app would opt in to repeated redraws.
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .toggle => {
                 self.running = !self.running;
                 // Resuming needs a new frame request because paused mode leaves
                 // no frame future in flight.
-                if (self.running) ctx.requestFrame();
+                if (self.running) ctx.frame().request();
             },
             .quit => ctx.quit(),
         }

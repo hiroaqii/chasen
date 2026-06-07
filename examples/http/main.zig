@@ -143,7 +143,7 @@ const HttpDemo = struct {
                 .loading => {},
                 else => {
                     self.state = .loading;
-                    try ctx.spawn(&doFetch);
+                    try ctx.task().spawn(&doFetch);
                 },
             },
             .got_response => |body| {
