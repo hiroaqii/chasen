@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
         "runtime_stats",
         "runtime_trace",
         "surface_basics",
+        "surface_layout",
         "key_hint",
     };
 
