@@ -46,6 +46,9 @@ packages layered above the core.
 A Chasen app is a Zig type with a `Msg` type and lifecycle functions.
 
 ```zig
+const std = @import("std");
+const chasen = @import("chasen");
+
 const App = struct {
     // The application owns its state. Chasen does not keep a separate widget
     // tree or hidden model for this counter.
@@ -99,6 +102,12 @@ const App = struct {
         _ = surface.borrowTextAt(0, 2, "j/k: change  q: quit", .{ .fg = .gray });
     }
 };
+
+// `chasen.run` owns terminal setup and cleanup. The app value passed here is
+// the initial application state.
+pub fn main(init: std.process.Init) !void {
+    try chasen.run(init, App{});
+}
 ```
 
 The runtime owns terminal setup, the event loop, effect draining, redraw policy,
@@ -359,7 +368,6 @@ zig build run-counter        # minimal state/update/view loop
 zig build run-stopwatch      # repeating timer with ctx.timer().every
 zig build run-tick           # one-shot timer and timer cancellation
 zig build run-animation      # frame request loop
-zig build run-surface_basics # Surface text APIs, clipping, and child surfaces
 zig build run-surface_layout # Rect-based regions and child surfaces
 zig build run-key_hint       # key hint drawing primitive
 zig build run-runtime_stats  # runtime timing stats callback
