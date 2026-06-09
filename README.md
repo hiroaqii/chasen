@@ -294,14 +294,15 @@ valid until rendering finishes:
 _ = surface.borrowTextAt(0, 0, "static label", .{});
 ```
 
-Do not pass stack buffers or `std.fmt.bufPrint` results to `borrowTextAt`.
-`borrowTextAt` does not copy the bytes, so this is unsafe:
-
-```zig
-var buf: [64]u8 = undefined;
-const label = try std.fmt.bufPrint(&buf, "count: {d}", .{count});
-_ = surface.borrowTextAt(0, 0, label, .{}); // wrong: label points to stack memory
-```
+> [!WARNING]
+> Do not pass stack buffers or `std.fmt.bufPrint` results to `borrowTextAt`.
+> `borrowTextAt` does not copy the bytes, so this can render corrupted text:
+>
+> ```text
+> var buf: [64]u8 = undefined;
+> const label = try std.fmt.bufPrint(&buf, "count: {d}", .{count});
+> _ = surface.borrowTextAt(0, 0, label, .{}); // wrong: label points to stack memory
+> ```
 
 Use `printAt` for formatted text created during `view`. It formats into
 Chasen's frame arena, so the text remains valid until the current render
