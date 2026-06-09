@@ -51,14 +51,15 @@ const Animation = struct {
         _ = sfc.borrowTextAt(0, 0, "requestFrame animation", .{ .bold = true });
 
         const status = if (self.running) "running" else "paused";
-        // `frameAllocator()` is reset after this frame, which makes it useful
-        // for temporary text formatting during drawing.
-        const info = try std.fmt.allocPrint(
-            sfc.frameAllocator(),
+        // Formatted text created during view should use printAt so the
+        // temporary string is stored in the frame arena.
+        _ = try sfc.printAt(
+            0,
+            1,
+            .{ .fg = .gray },
             "frame: {d}  delta: {d}ms  {s}",
             .{ self.frame_index, self.last_delta_ms, status },
         );
-        _ = sfc.borrowTextAt(0, 1, info, .{ .fg = .gray });
         _ = sfc.borrowTextAt(0, 2, "space: pause/resume  q: quit", .{ .dim = true });
 
         if (size.width == 0 or size.height < 4) return;

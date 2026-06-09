@@ -286,24 +286,41 @@ This gives applications direct access to:
 
 Chasen has both borrowed and frame-owned text drawing APIs.
 
-Use `borrowTextAt` for static strings or model-owned strings:
+Use `borrowTextAt` only when the text outlives the current render. Good inputs
+are string literals, app state owned by the model, and other buffers that remain
+valid until rendering finishes:
 
 ```zig
 _ = surface.borrowTextAt(0, 0, "static label", .{});
 ```
 
-Use `printAt` for formatted text:
+Do not pass stack buffers or `std.fmt.bufPrint` results to `borrowTextAt`.
+`borrowTextAt` does not copy the bytes, so this is unsafe:
+
+```zig
+var buf: [64]u8 = undefined;
+const label = try std.fmt.bufPrint(&buf, "count: {d}", .{count});
+_ = surface.borrowTextAt(0, 0, label, .{}); // wrong: label points to stack memory
+```
+
+Use `printAt` for formatted text created during `view`. It formats into
+Chasen's frame arena, so the text remains valid until the current render
+finishes:
 
 ```zig
 _ = try surface.printAt(0, 0, .{}, "count: {d}", .{count});
 ```
 
 Use `copyTextAt` when the text slice is dynamic and should be copied into the
-current frame:
+current frame before drawing:
 
 ```zig
 _ = try surface.copyTextAt(0, 0, dynamic_label, .{});
 ```
+
+As a rule of thumb: literals and model-owned strings can use `borrowTextAt`;
+anything formatted or assembled inside `view` should use `printAt` or
+`copyTextAt`.
 
 Frame-owned text is allocated from a frame arena. The arena is reset before each
 render and retains capacity so repeated redraws do not churn the allocator.
