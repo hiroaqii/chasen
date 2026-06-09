@@ -365,6 +365,7 @@ Useful examples:
 
 ```sh
 zig build run-counter        # minimal state/update/view loop
+zig build run-selection      # selectable menu with Event -> Msg -> update
 zig build run-stopwatch      # repeating timer with ctx.timer().every
 zig build run-tick           # one-shot timer and timer cancellation
 zig build run-animation      # frame request loop
