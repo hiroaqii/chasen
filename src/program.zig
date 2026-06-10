@@ -232,6 +232,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // size for first-frame layout and scroll bounds.
     if (tty.getWinsize()) |ws| {
         var initial_stats: ?root.RuntimeStats = null;
+        // Keep the vaxis screen size in sync before the first render. The app
+        // also receives the winsize event below to initialize layout state.
+        try vx.resize(allocator, tty.writer(), ws);
+        useUnicodeWidth(&vx);
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
