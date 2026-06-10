@@ -418,7 +418,9 @@ Effect drain currently processes pending work in this order:
 `ctx.timer().tick(id, after_ns, msg)` schedules one future message.
 `ctx.timer().every(id, interval_ns, msg)` schedules repeated messages until
 cancelled. Scheduling a new `tick` or `every` with the same id replaces the
-existing running timer with that id.
+existing running timer with that id. Timer ids are copied into runtime-owned
+memory while queueing, so callers may pass temporary or dynamically formatted
+ids.
 
 The `tick` example shows a one-shot timer, same-id replacement, and
 `ctx.timer().cancel` in a runnable app:
@@ -429,8 +431,7 @@ zig build run-tick
 
 `ctx.timer().cancel(id)` removes matching timers queued in the current `Ctx`
 and also queues cancellation for matching timers already running in the runtime.
-Timer ids are borrowed text and must remain valid until the runtime drains the
-cancel request.
+It returns an error if the cancel request cannot be queued.
 
 `ctx.frame().request()` requests one future `Event.frame`. It is coalesced
 while a frame request is already in flight; it does not create an idle render

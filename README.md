@@ -231,7 +231,7 @@ try ctx.timer().tick("reload", 1_000_000_000, .reload);
 try ctx.timer().every("clock", 1_000_000_000, .tick);
 
 // Cancel a pending or running timer with this id.
-ctx.timer().cancel("clock");
+try ctx.timer().cancel("clock");
 
 // Queue a terminal image load. The request id lets the app ignore stale results.
 const request_id = try ctx.image().loadPath(path, loaded, failed);

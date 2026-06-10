@@ -19,6 +19,8 @@ pub fn Ctx(comptime Msg: type) type {
 
     return struct {
         const Self = @This();
+        const TimerScheduleError = error{TimerLimitExceeded} || std.mem.Allocator.Error;
+        const TimerCancelError = error{TimerCancelLimitExceeded} || std.mem.Allocator.Error;
 
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
@@ -133,18 +135,22 @@ pub fn Ctx(comptime Msg: type) type {
             /// nanoseconds. If a timer with the same `id` is already pending,
             /// it is overwritten.
             ///
-            /// `id` must point to memory that remains valid for the lifetime
-            /// of the timer, such as a string literal or application-owned
-            /// slice.
-            pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+            /// The id is copied into runtime-owned memory while queueing, so
+            /// callers may pass temporary or dynamically formatted ids.
+            pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx.pending_ticks[0..self.ctx.pending_ticks_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
-                        entry.* = .{ .id = id, .after_ns = after_ns, .msg = msg };
+                        entry.after_ns = after_ns;
+                        entry.msg = msg;
                         return;
                     }
                 }
                 if (self.ctx.pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
-                self.ctx.pending_ticks[self.ctx.pending_ticks_len] = .{ .id = id, .after_ns = after_ns, .msg = msg };
+                self.ctx.pending_ticks[self.ctx.pending_ticks_len] = .{
+                    .id = try self.ctx._allocator.dupe(u8, id),
+                    .after_ns = after_ns,
+                    .msg = msg,
+                };
                 self.ctx.pending_ticks_len += 1;
             }
 
@@ -153,15 +159,23 @@ pub fn Ctx(comptime Msg: type) type {
             /// The message will be delivered every `interval_ns` nanoseconds
             /// until the future is cancelled. If a timer with the same `id` is
             /// already pending, it is overwritten.
-            pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) error{TimerLimitExceeded}!void {
+            ///
+            /// The id is copied into runtime-owned memory while queueing, so
+            /// callers may pass temporary or dynamically formatted ids.
+            pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx.pending_everys[0..self.ctx.pending_everys_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
-                        entry.* = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
+                        entry.interval_ns = interval_ns;
+                        entry.msg = msg;
                         return;
                     }
                 }
                 if (self.ctx.pending_everys_len >= max_everys) return error.TimerLimitExceeded;
-                self.ctx.pending_everys[self.ctx.pending_everys_len] = .{ .id = id, .interval_ns = interval_ns, .msg = msg };
+                self.ctx.pending_everys[self.ctx.pending_everys_len] = .{
+                    .id = try self.ctx._allocator.dupe(u8, id),
+                    .interval_ns = interval_ns,
+                    .msg = msg,
+                };
                 self.ctx.pending_everys_len += 1;
             }
 
@@ -169,10 +183,12 @@ pub fn Ctx(comptime Msg: type) type {
             ///
             /// Removes any matching entry from the pending tick/every queues.
             /// Also queues the id for the runtime to cancel running timers.
-            /// If the pending cancel queue is full, the cancel request is
-            /// silently dropped.
-            pub fn cancel(self: TimerEffects, id: []const u8) void {
-                self.ctx.cancelTimerInternal(id);
+            ///
+            /// The id is copied into runtime-owned memory while queueing. If
+            /// the cancel queue is full, an error is returned instead of
+            /// silently dropping the request.
+            pub fn cancel(self: TimerEffects, id: []const u8) TimerCancelError!void {
+                try self.ctx.cancelTimerInternal(id);
             }
         };
 
@@ -285,12 +301,17 @@ pub fn Ctx(comptime Msg: type) type {
             return self.pending_everys[0..self.pending_everys_len];
         }
 
-        fn cancelTimerInternal(self: *@This(), id: []const u8) void {
+        fn cancelTimerInternal(self: *@This(), id: []const u8) TimerCancelError!void {
+            if (self.pending_cancels_len >= max_cancels) return error.TimerCancelLimitExceeded;
+            const copied_id = try self._allocator.dupe(u8, id);
+            errdefer self._allocator.free(copied_id);
+
             // Remove from pending ticks (swap-remove).
             {
                 var i: u8 = 0;
                 while (i < self.pending_ticks_len) {
                     if (std.mem.eql(u8, self.pending_ticks[i].id, id)) {
+                        self._allocator.free(self.pending_ticks[i].id);
                         self.pending_ticks_len -= 1;
                         if (i < self.pending_ticks_len) {
                             self.pending_ticks[i] = self.pending_ticks[self.pending_ticks_len];
@@ -305,6 +326,7 @@ pub fn Ctx(comptime Msg: type) type {
                 var i: u8 = 0;
                 while (i < self.pending_everys_len) {
                     if (std.mem.eql(u8, self.pending_everys[i].id, id)) {
+                        self._allocator.free(self.pending_everys[i].id);
                         self.pending_everys_len -= 1;
                         if (i < self.pending_everys_len) {
                             self.pending_everys[i] = self.pending_everys[self.pending_everys_len];
@@ -315,15 +337,31 @@ pub fn Ctx(comptime Msg: type) type {
                 }
             }
             // Queue for runtime to cancel running timers.
-            if (self.pending_cancels_len < max_cancels) {
-                self.pending_cancels[self.pending_cancels_len] = id;
-                self.pending_cancels_len += 1;
-            }
+            self.pending_cancels[self.pending_cancels_len] = copied_id;
+            self.pending_cancels_len += 1;
         }
 
         /// Return a slice of pending cancel ids.
         pub fn pendingCancelSlice(self: *@This()) []const []const u8 {
             return self.pending_cancels[0..self.pending_cancels_len];
+        }
+
+        /// Release queued timer ids that have not been handed to the runtime.
+        pub fn clearPendingTimerEffects(self: *@This()) void {
+            for (self.pending_ticks[0..self.pending_ticks_len]) |entry| {
+                self._allocator.free(entry.id);
+            }
+            self.pending_ticks_len = 0;
+
+            for (self.pending_everys[0..self.pending_everys_len]) |entry| {
+                self._allocator.free(entry.id);
+            }
+            self.pending_everys_len = 0;
+
+            for (self.pending_cancels[0..self.pending_cancels_len]) |id| {
+                self._allocator.free(id);
+            }
+            self.pending_cancels_len = 0;
         }
     };
 }
@@ -373,7 +411,8 @@ test "Ctx spawn returns error when task queue is full" {
 
 test "Ctx tick accumulates entries" {
     const TestMsg = union(enum) { timeout, ping };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
@@ -391,7 +430,8 @@ test "Ctx tick accumulates entries" {
 
 test "Ctx tick returns error when timer queue is full" {
     const TestMsg = union(enum) { timeout };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -402,7 +442,8 @@ test "Ctx tick returns error when timer queue is full" {
 
 test "Ctx every accumulates entries" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
@@ -420,7 +461,8 @@ test "Ctx every accumulates entries" {
 
 test "Ctx every returns error when timer queue is full" {
     const TestMsg = union(enum) { tick_msg };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -431,7 +473,8 @@ test "Ctx every returns error when timer queue is full" {
 
 test "Ctx tick same id overwrites existing entry" {
     const TestMsg = union(enum) { timeout, ping };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
@@ -447,7 +490,8 @@ test "Ctx tick same id overwrites existing entry" {
 
 test "Ctx every same id overwrites existing entry" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
@@ -463,31 +507,47 @@ test "Ctx every same id overwrites existing entry" {
 
 test "Ctx timer cancel removes from pending queues" {
     const TestMsg = union(enum) { timeout, tick_msg };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try ctx_val.timer().every("e1", 500_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    ctx_val.timer().cancel("t1");
+    try ctx_val.timer().cancel("t1");
     try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
 
-    ctx_val.timer().cancel("e1");
+    try ctx_val.timer().cancel("e1");
     try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_everys_len);
 }
 
 test "Ctx timer cancel queues id for runtime cancellation" {
     const TestMsg = union(enum) { timeout };
-    var ctx_val: Ctx(TestMsg) = .{};
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
 
-    ctx_val.timer().cancel("running_timer");
+    try ctx_val.timer().cancel("running_timer");
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
 
     const cancels = ctx_val.pendingCancelSlice();
     try std.testing.expectEqual(@as(usize, 1), cancels.len);
     try std.testing.expectEqualStrings("running_timer", cancels[0]);
+}
+
+test "Ctx timer cancel leaves pending timers unchanged when cancel queue is full" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingTimerEffects();
+
+    const cancel_ids = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7" };
+    for (cancel_ids) |id| try ctx_val.timer().cancel(id);
+    try ctx_val.timer().tick("pending", 1_000_000_000, .timeout);
+
+    try std.testing.expectError(error.TimerCancelLimitExceeded, ctx_val.timer().cancel("pending"));
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqualStrings("pending", ctx_val.pendingTickSlice()[0].id);
 }
 
 test "Ctx spawnWith accumulates tasks" {

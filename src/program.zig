@@ -208,6 +208,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     defer {
         for (running_timers.items) |*h| {
             _ = h.future.cancel(io);
+            allocator.free(h.id);
         }
         running_timers.deinit(allocator);
     }
@@ -222,7 +223,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         trace(opts, .effect_drain_end);
     }
@@ -243,7 +244,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         trace(opts, .effect_drain_end);
     } else |_| {}
@@ -312,7 +313,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
         try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, io);
+        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
         startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -470,14 +471,18 @@ fn spawnPendingTicks(
 ) !void {
     for (app_ctx.pendingTickSlice()) |entry| {
         // Cancel existing timer with the same id.
-        cancelRunningTimer(running_timers, entry.id, io);
+        cancelRunningTimer(running_timers, allocator, entry.id, io);
 
         var future = io.concurrent(
             TickHelper(Msg).run,
             .{ entry.after_ns, entry.msg, io, loop },
-        ) catch continue;
+        ) catch {
+            allocator.free(entry.id);
+            continue;
+        };
         running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
+            allocator.free(entry.id);
             continue;
         };
     }
@@ -496,14 +501,18 @@ fn spawnPendingEvery(
 ) !void {
     for (app_ctx.pendingEverySlice()) |entry| {
         // Cancel existing timer with the same id.
-        cancelRunningTimer(running_timers, entry.id, io);
+        cancelRunningTimer(running_timers, allocator, entry.id, io);
 
         var future = io.concurrent(
             EveryHelper(Msg).run,
             .{ entry.interval_ns, entry.msg, io, loop },
-        ) catch continue;
+        ) catch {
+            allocator.free(entry.id);
+            continue;
+        };
         running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
+            allocator.free(entry.id);
             continue;
         };
     }
@@ -511,11 +520,12 @@ fn spawnPendingEvery(
 }
 
 /// Cancel a running timer by id (swap-remove).
-fn cancelRunningTimer(running_timers: *std.ArrayList(TimerHandle), id: []const u8, io: std.Io) void {
+fn cancelRunningTimer(running_timers: *std.ArrayList(TimerHandle), allocator: std.mem.Allocator, id: []const u8, io: std.Io) void {
     var i: usize = 0;
     while (i < running_timers.items.len) {
         if (std.mem.eql(u8, running_timers.items[i].id, id)) {
             _ = running_timers.items[i].future.cancel(io);
+            allocator.free(running_timers.items[i].id);
             _ = running_timers.swapRemove(i);
         } else {
             i += 1;
@@ -528,10 +538,12 @@ fn processPendingCancels(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
     running_timers: *std.ArrayList(TimerHandle),
+    allocator: std.mem.Allocator,
     io: std.Io,
 ) void {
     for (app_ctx.pendingCancelSlice()) |id| {
-        cancelRunningTimer(running_timers, id, io);
+        cancelRunningTimer(running_timers, allocator, id, io);
+        allocator.free(id);
     }
     app_ctx.pending_cancels_len = 0;
 }

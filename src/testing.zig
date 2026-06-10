@@ -138,9 +138,7 @@ pub fn TestCtx(comptime Msg: type) type {
         pub fn resetTransient(self: *@This()) void {
             self.ctx.pending_tasks_len = 0;
             self.ctx.pending_tasks_with_len = 0;
-            self.ctx.pending_ticks_len = 0;
-            self.ctx.pending_everys_len = 0;
-            self.ctx.pending_cancels_len = 0;
+            self.ctx.clearPendingTimerEffects();
             self.ctx.redraw_suppressed = false;
             self.ctx.frame_requested = false;
         }
@@ -174,7 +172,7 @@ test "resetTransient clears pending queues and redraw_suppressed" {
     try tc.ctx.task().spawn(task);
     try tc.ctx.timer().tick("t1", 1_000, .inc);
     try tc.ctx.timer().every("e1", 2_000, .dec);
-    tc.ctx.timer().cancel("x");
+    try tc.ctx.timer().cancel("x");
     tc.ctx.frame().suppressRedraw();
     tc.ctx.frame().request();
 

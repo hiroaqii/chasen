@@ -42,7 +42,7 @@ const TickDemo = struct {
                     self.last_event = "No scheduled tick to cancel.";
                 }
                 self.scheduled = false;
-                ctx.timer().cancel(reminder_id);
+                try ctx.timer().cancel(reminder_id);
             },
             .quit => ctx.quit(),
         }
