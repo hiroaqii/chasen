@@ -244,6 +244,13 @@ Effects are not executed immediately. They are stored in `Ctx` and drained by
 the runtime after `init` or `update` returns. This keeps state changes and
 runtime work in a clear order.
 
+Timer and frame effects are intentionally simple. `ctx.timer().every` is a
+fixed-delay repeating timer: it waits for the interval, posts a message, then
+waits for the interval again. It does not compensate for app update/render time.
+`ctx.frame().request` requests one future frame event and is coalesced while a
+frame is already in flight; animation code should use `Frame.delta_ns` or
+`Frame.now_ns` for time-based movement instead of assuming an exact frame rate.
+
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct
 accessors because they are not runtime effects.

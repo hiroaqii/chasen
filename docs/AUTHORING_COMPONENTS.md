@@ -433,10 +433,24 @@ zig build run-tick
 and also queues cancellation for matching timers already running in the runtime.
 It returns an error if the cancel request cannot be queued.
 
+`ctx.timer().every` is a fixed-delay timer, not a fixed-rate scheduler. The
+runtime sleeps for `interval_ns`, posts the message, then sleeps for
+`interval_ns` again. Time spent in the app's `update`, effect drain, `view`, and
+terminal render path is not subtracted from the next interval. Use it for
+periodic polling, refresh prompts, clocks, and low-precision UI updates. For
+animations, compute progress from `ctx.now()`, `Frame.now_ns`, or
+`Frame.delta_ns` instead of counting timer ticks.
+
 `ctx.frame().request()` requests one future `Event.frame`. It is coalesced
 while a frame request is already in flight; it does not create an idle render
 loop by itself. Re-request from `update` while animation should continue, and
 stop requesting when the animation is done.
+
+Frame requests are also fixed-delay in the current terminal runtime. Chasen
+waits for the runtime's frame interval before posting the next frame event, and
+the app receives timing data in `Frame` so animation state can be time-based.
+The frame API is therefore a render driver, not a guarantee that every frame is
+delivered at an exact fixed-rate cadence.
 
 `ctx.frame().suppressRedraw()` is message-scoped. The runtime resets that flag
 immediately before each `update`; if the update suppresses redraw, pending
