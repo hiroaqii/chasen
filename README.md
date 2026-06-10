@@ -22,6 +22,24 @@ The goal is to keep the core predictable and small, while letting applications
 and extension packages define their own look, layout, components, animation,
 and domain behavior.
 
+## Requirements
+
+- Zig 0.16.0 or newer
+
+Chasen uses Zig's `std.Io` runtime APIs, so older Zig versions are not a
+supported target.
+
+## Installation
+
+Add Chasen to your Zig project with `zig fetch`:
+
+```sh
+zig fetch --save git+https://github.com/hiroaqii/chasen.git
+```
+
+Then import the dependency from your `build.zig` and expose it to your
+executable or library module as `chasen`.
+
 ## What Chasen Is Not
 
 Chasen intentionally does not include:
@@ -130,7 +148,7 @@ application author. The other nodes are handled by the Chasen runtime.
 
 ```mermaid
 flowchart TD
-    Event["Runtime event<br/>key / mouse / paste / resize / frame"]
+    Event["Runtime event<br/>key / mouse / paste / resize / focus / frame"]
     RuntimeMsg["App message<br/>timer result / task result"]
     Handle["app.handleEvent?(Event) ?Msg"]
     Update["app.update(Msg, *Ctx)"]
@@ -182,7 +200,7 @@ details. Timer and task results already arrive as app messages, so they skip
 through `handleEvent`, which lets animation apps decide whether a frame matters
 for their current state.
 
-For apps that do not need keyboard, mouse, paste, or resize handling,
+For apps that do not need keyboard, mouse, paste, resize, or focus handling,
 `handleEvent` can be omitted entirely.
 
 ## Effects Through Ctx
