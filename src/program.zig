@@ -219,12 +219,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try app.init(&app_ctx);
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
-        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
-        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, tty.writer(), allocator, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -240,12 +235,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
-        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, tty.writer(), allocator, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -309,12 +299,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during update
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
-        try spawnPendingTasks(Msg, &app_ctx, &pending_futures, allocator, io, &loop);
-        try spawnPendingTicks(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try spawnPendingEvery(Msg, &app_ctx, &running_timers, allocator, io, &loop);
-        try processPendingTerminalImages(Msg, &app_ctx, &terminal_images, &vx, tty.writer(), allocator, &loop, opts);
-        processPendingCancels(Msg, &app_ctx, &running_timers, allocator, io);
-        startPendingFrame(Msg, &app_ctx, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index);
+        try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, tty.writer(), allocator, io, &loop, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
 
@@ -399,6 +384,35 @@ fn applyMsg(
     trace(opts, .update_end);
 
     return !app_ctx.redraw_suppressed;
+}
+
+/// Drains effects queued in Ctx using the documented runtime order.
+///
+/// Trace and stats boundaries stay at the call sites because init, initial
+/// winsize, and main-loop updates account for effect drain differently.
+fn drainPendingEffects(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    pending_futures: *std.ArrayList(std.Io.Future(void)),
+    running_timers: *std.ArrayList(TimerHandle),
+    terminal_images: *terminal_image.Registry,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+    frame_in_flight: *bool,
+    frame_future: *?std.Io.Future(void),
+    last_frame_ns: u64,
+    next_frame_index: u64,
+    opts: root.RunOptions,
+) !void {
+    try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
+    try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
+    try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop);
+    try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty, allocator, loop, opts);
+    processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
+    startPendingFrame(Msg, app_ctx, io, loop, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
