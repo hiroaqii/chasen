@@ -216,7 +216,7 @@ ctx.quit();
 ctx.frame().request();
 
 // Skip the redraw after this update. Queued effects are still drained.
-ctx.frame().suppressRedraw();
+ctx.redraw().skip();
 
 // Run background work that does not need captured app-owned context.
 try ctx.task().spawn(Task.run);

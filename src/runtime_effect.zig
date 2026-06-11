@@ -10,7 +10,7 @@ pub const RuntimeEffectKind = enum {
     every,
     cancel_timer,
     request_frame,
-    suppress_redraw,
+    skip_redraw,
     quit,
     spawn,
     spawn_with,
@@ -39,7 +39,7 @@ pub const BrowserInitialEffects = struct {
             .every,
             .cancel_timer,
             .request_frame,
-            .suppress_redraw,
+            .skip_redraw,
             .quit,
             => .supported,
 
@@ -62,7 +62,7 @@ test "browser initial effects support update-sharing subset" {
     try std.testing.expect(BrowserInitialEffects.isSupported(.every));
     try std.testing.expect(BrowserInitialEffects.isSupported(.cancel_timer));
     try std.testing.expect(BrowserInitialEffects.isSupported(.request_frame));
-    try std.testing.expect(BrowserInitialEffects.isSupported(.suppress_redraw));
+    try std.testing.expect(BrowserInitialEffects.isSupported(.skip_redraw));
     try std.testing.expect(BrowserInitialEffects.isSupported(.quit));
 }
 

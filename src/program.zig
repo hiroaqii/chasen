@@ -264,7 +264,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             },
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
-                // terminal size; suppressRedraw only applies to app-driven messages.
+                // terminal size; redraw().skip() only applies to app-driven messages.
                 try vx.resize(allocator, tty.writer(), ws);
                 useUnicodeWidth(&vx);
                 _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &stats, opts);
@@ -361,7 +361,7 @@ fn dispatchAppEvent(
 
 /// Apply one app message and return whether the app requested a redraw.
 ///
-/// `ctx.frame().suppressRedraw()` is message-scoped, so the flag is reset immediately
+/// `ctx.redraw().skip()` is message-scoped, so the flag is reset immediately
 /// before each app update. The helper also owns update timing and the
 /// `did_update` stats flag, which avoids duplicating that bookkeeping across
 /// every event kind.

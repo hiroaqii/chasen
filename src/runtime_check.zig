@@ -4,7 +4,7 @@ pub export fn chasen_runtime_compile_check() void {
     const Msg = enum { done };
     var ctx: runtime.Ctx(Msg) = .{};
     ctx.quit();
-    ctx.frame().suppressRedraw();
+    ctx.redraw().skip();
     ctx.frame().request();
 
     const stats = runtime.RuntimeStats{

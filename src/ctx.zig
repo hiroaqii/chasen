@@ -81,13 +81,18 @@ pub fn Ctx(comptime Msg: type) type {
             pub fn request(self: FrameEffects) void {
                 self.ctx.frame_requested = true;
             }
+        };
 
-            /// Suppress the default redraw for the current update cycle.
+        pub const RedrawEffects = struct {
+            ctx: *Self,
+
+            /// Skip the default redraw for the current update cycle.
             ///
             /// By default, `view` is called after every `update`. Call this
             /// method inside `update` when the message does not affect
-            /// the visual state and a redraw would be wasteful.
-            pub fn suppressRedraw(self: FrameEffects) void {
+            /// the visual state and a redraw would be wasteful. This is a
+            /// one-shot request; the runtime clears it before the next update.
+            pub fn skip(self: RedrawEffects) void {
                 self.ctx.redraw_suppressed = true;
             }
         };
@@ -243,6 +248,10 @@ pub fn Ctx(comptime Msg: type) type {
         }
 
         pub fn frame(self: *@This()) FrameEffects {
+            return .{ .ctx = self };
+        }
+
+        pub fn redraw(self: *@This()) RedrawEffects {
             return .{ .ctx = self };
         }
 
@@ -636,11 +645,11 @@ test "Ctx redraw_suppressed defaults to false" {
     try std.testing.expectEqual(false, ctx_val.redraw_suppressed);
 }
 
-test "Ctx suppressRedraw sets redraw_suppressed to true" {
+test "Ctx redraw skip sets redraw_suppressed to true" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    ctx_val.frame().suppressRedraw();
+    ctx_val.redraw().skip();
     try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
 }
 

@@ -476,7 +476,7 @@ the app receives timing data in `Frame` so animation state can be time-based.
 The frame API is therefore a render driver, not a guarantee that every frame is
 delivered at an exact fixed-rate cadence.
 
-`ctx.frame().suppressRedraw()` is message-scoped. The runtime resets that flag
+`ctx.redraw().skip()` is message-scoped. The runtime resets that flag
 immediately before each `update`; if the update suppresses redraw, pending
 effects are still drained, but the redraw for that message is skipped.
 
