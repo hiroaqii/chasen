@@ -346,8 +346,13 @@ pub fn Ctx(comptime Msg: type) type {
             return self.pending_cancels[0..self.pending_cancels_len];
         }
 
-        /// Release queued timer ids that have not been handed to the runtime.
-        pub fn clearPendingTimerEffects(self: *@This()) void {
+        /// Release copied data for queued effects that have not been handed to
+        /// the runtime.
+        ///
+        /// App callbacks may queue effects and then return an error before the
+        /// runtime drains them. This cleanup is for that unwind path; normally
+        /// the runtime consumes and frees these copies while draining effects.
+        pub fn clearPendingEffectCopies(self: *@This()) void {
             for (self.pending_ticks[0..self.pending_ticks_len]) |entry| {
                 self._allocator.free(entry.id);
             }
@@ -362,6 +367,13 @@ pub fn Ctx(comptime Msg: type) type {
                 self._allocator.free(id);
             }
             self.pending_cancels_len = 0;
+
+            for (self.pending_terminal_image_loads[0..self.pending_terminal_image_loads_len]) |entry| {
+                self._allocator.free(entry.path);
+            }
+            self.pending_terminal_image_loads_len = 0;
+
+            self.pending_terminal_image_unloads_len = 0;
         }
     };
 }
@@ -412,7 +424,7 @@ test "Ctx spawn returns error when task queue is full" {
 test "Ctx tick accumulates entries" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
@@ -431,7 +443,7 @@ test "Ctx tick accumulates entries" {
 test "Ctx tick returns error when timer queue is full" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -443,7 +455,7 @@ test "Ctx tick returns error when timer queue is full" {
 test "Ctx every accumulates entries" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
@@ -462,7 +474,7 @@ test "Ctx every accumulates entries" {
 test "Ctx every returns error when timer queue is full" {
     const TestMsg = union(enum) { tick_msg };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -474,7 +486,7 @@ test "Ctx every returns error when timer queue is full" {
 test "Ctx tick same id overwrites existing entry" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
@@ -491,7 +503,7 @@ test "Ctx tick same id overwrites existing entry" {
 test "Ctx every same id overwrites existing entry" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg);
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
@@ -508,7 +520,7 @@ test "Ctx every same id overwrites existing entry" {
 test "Ctx timer cancel removes from pending queues" {
     const TestMsg = union(enum) { timeout, tick_msg };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try ctx_val.timer().every("e1", 500_000_000, .tick_msg);
@@ -526,7 +538,7 @@ test "Ctx timer cancel removes from pending queues" {
 test "Ctx timer cancel queues id for runtime cancellation" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     try ctx_val.timer().cancel("running_timer");
     try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
@@ -539,7 +551,7 @@ test "Ctx timer cancel queues id for runtime cancellation" {
 test "Ctx timer cancel leaves pending timers unchanged when cancel queue is full" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingTimerEffects();
+    defer ctx_val.clearPendingEffectCopies();
 
     const cancel_ids = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7" };
     for (cancel_ids) |id| try ctx_val.timer().cancel(id);
@@ -574,6 +586,7 @@ test "Ctx spawnWith accumulates tasks" {
 test "Ctx image loadPath copies queued path" {
     const TestMsg = union(enum) { loaded, failed };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingEffectCopies();
 
     var path_buf = [_]u8{ 'a', '.', 'p', 'n', 'g' };
     const request_id = try ctx_val.image().loadPath(&path_buf, &struct {
@@ -585,13 +598,6 @@ test "Ctx image loadPath copies queued path" {
             return .failed;
         }
     }.failed);
-    defer {
-        for (ctx_val.pendingTerminalImageLoadSlice()) |entry| {
-            std.testing.allocator.free(entry.path);
-        }
-        ctx_val.pending_terminal_image_loads_len = 0;
-    }
-
     path_buf[0] = 'b';
 
     const pending = ctx_val.pendingTerminalImageLoadSlice();

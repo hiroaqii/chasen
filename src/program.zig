@@ -176,6 +176,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // Ctx keeps Io privately so user code can call ctx.now() without receiving
     // direct access to the runtime Io handle.
     var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
+    defer app_ctx.clearPendingEffectCopies();
     var frame_in_flight = false;
     var frame_future: ?std.Io.Future(void) = null;
     defer {
@@ -204,6 +205,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     }
 
     // --- Running timers (id-tracked for cancel support) ---
+    // Completed one-shot ticks remain here until shutdown because std.Io.Future
+    // has no non-blocking completion check. This is not a leak, but apps should
+    // avoid creating unbounded unique timer ids in long-lived sessions.
     var running_timers: std.ArrayList(TimerHandle) = .empty;
     defer {
         for (running_timers.items) |*h| {

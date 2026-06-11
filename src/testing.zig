@@ -138,7 +138,7 @@ pub fn TestCtx(comptime Msg: type) type {
         pub fn resetTransient(self: *@This()) void {
             self.ctx.pending_tasks_len = 0;
             self.ctx.pending_tasks_with_len = 0;
-            self.ctx.clearPendingTimerEffects();
+            self.ctx.clearPendingEffectCopies();
             self.ctx.redraw_suppressed = false;
             self.ctx.frame_requested = false;
         }
