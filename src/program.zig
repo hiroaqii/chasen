@@ -487,24 +487,29 @@ fn spawnPendingTicks(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
 ) !void {
-    for (app_ctx.pendingTickSlice()) |entry| {
+    // Take ownership of queued copies before processing. Zeroing the queue
+    // first keeps run()'s unwind cleanup from freeing ids after they have been
+    // handed to running_timers.
+    const pending_ticks = app_ctx.pendingTickSlice();
+    app_ctx.pending_ticks_len = 0;
+
+    for (pending_ticks) |entry| {
+        var owned_id: ?[]const u8 = entry.id;
+        defer if (owned_id) |id| allocator.free(id);
+
         // Cancel existing timer with the same id.
         cancelRunningTimer(running_timers, allocator, entry.id, io);
 
         var future = io.concurrent(
             TickHelper(Msg).run,
             .{ entry.after_ns, entry.msg, io, loop },
-        ) catch {
-            allocator.free(entry.id);
-            continue;
-        };
+        ) catch continue;
         running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
-            allocator.free(entry.id);
             continue;
         };
+        owned_id = null;
     }
-    app_ctx.pending_ticks_len = 0;
 }
 
 /// Starts repeating timers queued in Ctx and tracks their futures for shutdown.
@@ -517,24 +522,29 @@ fn spawnPendingEvery(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
 ) !void {
-    for (app_ctx.pendingEverySlice()) |entry| {
+    // Take ownership of queued copies before processing. Zeroing the queue
+    // first keeps run()'s unwind cleanup from freeing ids after they have been
+    // handed to running_timers.
+    const pending_everys = app_ctx.pendingEverySlice();
+    app_ctx.pending_everys_len = 0;
+
+    for (pending_everys) |entry| {
+        var owned_id: ?[]const u8 = entry.id;
+        defer if (owned_id) |id| allocator.free(id);
+
         // Cancel existing timer with the same id.
         cancelRunningTimer(running_timers, allocator, entry.id, io);
 
         var future = io.concurrent(
             EveryHelper(Msg).run,
             .{ entry.interval_ns, entry.msg, io, loop },
-        ) catch {
-            allocator.free(entry.id);
-            continue;
-        };
+        ) catch continue;
         running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
-            allocator.free(entry.id);
             continue;
         };
+        owned_id = null;
     }
-    app_ctx.pending_everys_len = 0;
 }
 
 /// Cancel a running timer by id (swap-remove).
@@ -559,11 +569,15 @@ fn processPendingCancels(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) void {
-    for (app_ctx.pendingCancelSlice()) |id| {
-        cancelRunningTimer(running_timers, allocator, id, io);
-        allocator.free(id);
-    }
+    // Take ownership of queued cancel ids before processing so unwind cleanup
+    // only sees entries that have not reached the drain step.
+    const pending_cancels = app_ctx.pendingCancelSlice();
     app_ctx.pending_cancels_len = 0;
+
+    for (pending_cancels) |id| {
+        defer allocator.free(id);
+        cancelRunningTimer(running_timers, allocator, id, io);
+    }
 }
 
 fn processPendingTerminalImages(
@@ -576,12 +590,19 @@ fn processPendingTerminalImages(
     loop: *vaxis.Loop(InternalEvent(Msg)),
     opts: root.RunOptions,
 ) !void {
-    for (app_ctx.pendingTerminalImageUnloadSlice()) |handle| {
-        _ = registry.unload(vx.*, tty, handle);
-    }
+    // Take ownership of queued image effects before processing so unwind
+    // cleanup only sees entries that have not reached the drain step.
+    const pending_unloads = app_ctx.pendingTerminalImageUnloadSlice();
     app_ctx.pending_terminal_image_unloads_len = 0;
 
-    for (app_ctx.pendingTerminalImageLoadSlice()) |entry| {
+    for (pending_unloads) |handle| {
+        _ = registry.unload(vx.*, tty, handle);
+    }
+
+    const pending_loads = app_ctx.pendingTerminalImageLoadSlice();
+    app_ctx.pending_terminal_image_loads_len = 0;
+
+    for (pending_loads) |entry| {
         defer allocator.free(entry.path);
 
         switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
@@ -595,7 +616,6 @@ fn processPendingTerminalImages(
             },
         }
     }
-    app_ctx.pending_terminal_image_loads_len = 0;
 }
 
 const TerminalImageLoadResult = union(enum) {
