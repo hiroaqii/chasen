@@ -423,7 +423,6 @@ zig build run-stopwatch      # repeating timer with ctx.timer().every
 zig build run-tick           # one-shot timer and timer cancellation
 zig build run-animation      # frame request loop
 zig build run-surface_layout # Rect-based regions and child surfaces
-zig build run-key_hint       # key hint drawing primitive
 zig build run-runtime_stats  # runtime timing stats callback
 zig build run-runtime_trace  # runtime trace callback
 ```

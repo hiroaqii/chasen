@@ -57,7 +57,6 @@ pub fn build(b: *std.Build) void {
         "runtime_trace",
         "surface_basics",
         "surface_layout",
-        "key_hint",
     };
 
     const check_examples_step = b.step("check-examples", "Build all examples");

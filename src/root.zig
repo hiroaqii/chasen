@@ -40,7 +40,6 @@ pub const ComponentStateInitContext = state_store.ComponentStateInitContext;
 pub const ComponentStateDeinitContext = state_store.ComponentStateDeinitContext;
 
 pub const text = @import("text.zig");
-pub const key_hint = @import("key_hint.zig");
 
 pub const stats = runtime.stats;
 pub const RuntimeEventKind = runtime.RuntimeEventKind;
