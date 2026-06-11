@@ -221,6 +221,28 @@ surface.hideCursor();
 surface.setCursorShape(shape);
 ```
 
+`Cell` is a Chasen-owned text/style value, not a libvaxis cell. It represents
+the drawing state Chasen APIs create directly: grapheme, display width, and
+`TextStyle`. Backend metadata such as terminal-image placement, hyperlinks,
+wrapped flags, and Kitty text scaling is intentionally not part of this public
+type.
+
+`CellChar.width = 0` means unknown or backend-measured width. It is not a
+trailing/continuation-cell marker for the second cell of wide text. Components
+that need wide-text traversal should use their own text model or an explicit
+helper, not width-zero cells as hidden structural state.
+
+`writeCell` borrows `cell.char.grapheme`; keep the bytes alive until the current
+render finishes. `readCell` also returns a borrowed view of the screen buffer.
+Use it for same-frame inspection or read-modify-write operations. Do not store
+the returned `Cell` in model or component state unless you copy
+`cell.char.grapheme` into app-owned memory.
+
+`readCell` -> mutation -> `writeCell` is therefore a text/style roundtrip, not a
+lossless backend-cell roundtrip. If a surface contains terminal images and an
+app performs full-screen traversal, redraw the images afterward or use a future
+image-aware traversal helper.
+
 Use `child(rect)` for clipping and nested layout. A child surface is clipped to
 the requested rectangle, clamped to the parent bounds, and shares the same frame
 allocator as its parent. Coordinates passed to drawing APIs on a child are local
@@ -320,6 +342,8 @@ try ts.expectSnapshot("title \nbody  \nfooter");
 and includes padding spaces out to the full surface width. Use
 `ts.surface.readCell` or `ts.expectCellText` directly when a test needs to
 inspect style, cursor behavior, wide-character layout, or individual cells.
+Remember that `readCell` returns borrowed grapheme data; test assertions should
+inspect it immediately.
 
 ## Animation
 

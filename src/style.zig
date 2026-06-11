@@ -1,5 +1,3 @@
-const vaxis = @import("vaxis");
-
 /// Terminal color. Use `.default` for the terminal's default color,
 /// `.gray` as a convenience alias for ANSI index 8, or specify an
 /// explicit palette index or RGB value.
@@ -9,13 +7,23 @@ pub const Color = union(enum) {
     index: u8,
     rgb: [3]u8,
 
-    /// Convert to the underlying vaxis color representation.
-    pub fn toVaxis(self: Color) vaxis.Cell.Color {
+    pub fn eql(self: Color, other: Color) bool {
         return switch (self) {
-            .default => .default,
-            .gray => .{ .index = 8 },
-            .index => |i| .{ .index = i },
-            .rgb => |c| .{ .rgb = c },
+            .default => other == .default,
+            .gray => switch (other) {
+                .gray => true,
+                .index => |i| i == 8,
+                else => false,
+            },
+            .index => |i| switch (other) {
+                .gray => i == 8,
+                .index => |j| i == j,
+                else => false,
+            },
+            .rgb => |a| switch (other) {
+                .rgb => |b| a[0] == b[0] and a[1] == b[1] and a[2] == b[2],
+                else => false,
+            },
         };
     }
 };
@@ -28,21 +36,9 @@ pub const Underline = enum {
     curly,
     dotted,
     dashed,
-
-    /// Convert to the underlying vaxis underline representation.
-    pub fn toVaxis(self: Underline) vaxis.Cell.Style.Underline {
-        return switch (self) {
-            .off => .off,
-            .single => .single,
-            .double => .double,
-            .curly => .curly,
-            .dotted => .dotted,
-            .dashed => .dashed,
-        };
-    }
 };
 
-/// Text styling attributes for use with `Column.borrowText()`.
+/// Text styling attributes for use with `Surface` and `Column` drawing APIs.
 /// All fields default to off/default, so `.{ .bold = true }` is sufficient
 /// to create a bold style with default colors.
 pub const TextStyle = struct {
@@ -56,48 +52,33 @@ pub const TextStyle = struct {
     underline: Underline = .off,
     underline_color: Color = .default,
 
-    /// Convert to the underlying vaxis style representation.
-    pub fn toVaxis(self: TextStyle) vaxis.Cell.Style {
-        return .{
-            .bold = self.bold,
-            .italic = self.italic,
-            .dim = self.dim,
-            .reverse = self.reverse,
-            .strikethrough = self.strikethrough,
-            .fg = self.fg.toVaxis(),
-            .bg = self.bg.toVaxis(),
-            .ul = self.underline_color.toVaxis(),
-            .ul_style = self.underline.toVaxis(),
-        };
+    pub fn eql(self: TextStyle, other: TextStyle) bool {
+        return self.bold == other.bold and
+            self.italic == other.italic and
+            self.dim == other.dim and
+            self.reverse == other.reverse and
+            self.strikethrough == other.strikethrough and
+            self.fg.eql(other.fg) and
+            self.bg.eql(other.bg) and
+            self.underline == other.underline and
+            self.underline_color.eql(other.underline_color);
     }
 };
 
-test "Color.toVaxis default" {
-    const c: Color = .default;
-    const vc = c.toVaxis();
-    try @import("std").testing.expect(vc.eql(.default));
+test "Color.eql treats gray and index 8 as equivalent" {
+    const gray: Color = .gray;
+    try @import("std").testing.expect(gray.eql(.{ .index = 8 }));
+    try @import("std").testing.expect((Color{ .index = 8 }).eql(.gray));
+    try @import("std").testing.expect(!(Color{ .index = 7 }).eql(.gray));
 }
 
-test "Color.toVaxis gray maps to index 8" {
-    const c: Color = .gray;
-    const vc = c.toVaxis();
-    try @import("std").testing.expect(vc.eql(.{ .index = 8 }));
+test "Color.eql compares rgb values" {
+    try @import("std").testing.expect((Color{ .rgb = .{ 255, 128, 0 } }).eql(.{ .rgb = .{ 255, 128, 0 } }));
+    try @import("std").testing.expect(!(Color{ .rgb = .{ 255, 128, 0 } }).eql(.{ .rgb = .{ 255, 128, 1 } }));
 }
 
-test "Color.toVaxis index" {
-    const c: Color = .{ .index = 42 };
-    const vc = c.toVaxis();
-    try @import("std").testing.expect(vc.eql(.{ .index = 42 }));
-}
-
-test "Color.toVaxis rgb" {
-    const c: Color = .{ .rgb = .{ 255, 128, 0 } };
-    const vc = c.toVaxis();
-    try @import("std").testing.expect(vc.eql(.{ .rgb = .{ 255, 128, 0 } }));
-}
-
-test "TextStyle.toVaxis preserves all fields" {
-    const style: TextStyle = .{
+test "TextStyle.eql compares all Chasen-owned fields" {
+    const a: TextStyle = .{
         .bold = true,
         .italic = true,
         .dim = true,
@@ -108,28 +89,21 @@ test "TextStyle.toVaxis preserves all fields" {
         .underline = .curly,
         .underline_color = .{ .index = 5 },
     };
-    const vs = style.toVaxis();
-    try @import("std").testing.expect(vs.bold);
-    try @import("std").testing.expect(vs.italic);
-    try @import("std").testing.expect(vs.dim);
-    try @import("std").testing.expect(vs.reverse);
-    try @import("std").testing.expect(vs.strikethrough);
-    try @import("std").testing.expect(vs.fg.eql(.{ .rgb = .{ 255, 0, 0 } }));
-    try @import("std").testing.expect(vs.bg.eql(.{ .index = 4 }));
-    try @import("std").testing.expect(vs.ul.eql(.{ .index = 5 }));
-    try @import("std").testing.expectEqual(vaxis.Cell.Style.Underline.curly, vs.ul_style);
+    var b = a;
+    try @import("std").testing.expect(a.eql(b));
+    b.underline = .single;
+    try @import("std").testing.expect(!a.eql(b));
 }
 
 test "TextStyle default is all false/default" {
-    const style: TextStyle = .{};
-    const vs = style.toVaxis();
-    try @import("std").testing.expect(!vs.bold);
-    try @import("std").testing.expect(!vs.italic);
-    try @import("std").testing.expect(!vs.dim);
-    try @import("std").testing.expect(!vs.reverse);
-    try @import("std").testing.expect(!vs.strikethrough);
-    try @import("std").testing.expect(vs.fg.eql(.default));
-    try @import("std").testing.expect(vs.bg.eql(.default));
-    try @import("std").testing.expect(vs.ul.eql(.default));
-    try @import("std").testing.expectEqual(vaxis.Cell.Style.Underline.off, vs.ul_style);
+    const text_style: TextStyle = .{};
+    try @import("std").testing.expect(!text_style.bold);
+    try @import("std").testing.expect(!text_style.italic);
+    try @import("std").testing.expect(!text_style.dim);
+    try @import("std").testing.expect(!text_style.reverse);
+    try @import("std").testing.expect(!text_style.strikethrough);
+    try @import("std").testing.expect(text_style.fg.eql(.default));
+    try @import("std").testing.expect(text_style.bg.eql(.default));
+    try @import("std").testing.expectEqual(Underline.off, text_style.underline);
+    try @import("std").testing.expect(text_style.underline_color.eql(.default));
 }

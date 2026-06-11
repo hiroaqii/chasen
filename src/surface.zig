@@ -1,14 +1,16 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const cell_mod = @import("cell.zig");
 const style = @import("style.zig");
 const terminal_image = @import("terminal_image.zig");
+const vaxis_convert = @import("vaxis_convert.zig");
 const TextStyle = style.TextStyle;
 
-/// A terminal cell in the underlying screen buffer.
-pub const Cell = vaxis.Cell;
+pub const Cell = cell_mod.Cell;
+pub const CellChar = cell_mod.CellChar;
 
 /// Terminal cursor shape.
-pub const CursorShape = vaxis.Cell.CursorShape;
+pub const CursorShape = cell_mod.CursorShape;
 
 pub const TerminalImageHandle = terminal_image.TerminalImageHandle;
 pub const TerminalImageOptions = terminal_image.TerminalImageOptions;
@@ -112,12 +114,17 @@ pub const Surface = struct {
     ///
     /// Out-of-bounds writes are ignored by libvaxis.
     pub fn writeCell(self: *Surface, col: u16, row: u16, cell: Cell) void {
-        self.vaxisWindow().writeCell(col, row, cell);
+        self.vaxisWindow().writeCell(col, row, vaxis_convert.cellToVaxis(cell));
     }
 
     /// Read one cell at `col`, `row`.
+    ///
+    /// The returned cell is a borrowed view of screen-buffer text. Use it for
+    /// same-frame inspection or read-modify-write operations. Copy
+    /// `cell.char.grapheme` before storing the result in app or component state.
     pub fn readCell(self: *const Surface, col: u16, row: u16) ?Cell {
-        return self.vaxisWindowConst().readCell(col, row);
+        const cell = self.vaxisWindowConst().readCell(col, row) orelse return null;
+        return vaxis_convert.cellFromVaxis(cell);
     }
 
     /// Print borrowed styled text at `col`, `row` without wrapping.
@@ -134,7 +141,7 @@ pub const Surface = struct {
     pub fn borrowTextAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) PrintResult {
         return .fromVaxis(self.vaxisWindow().printSegment(.{
             .text = str,
-            .style = ts.toVaxis(),
+            .style = vaxis_convert.textStyleToVaxis(ts),
         }, .{
             .col_offset = col,
             .row_offset = row,
@@ -190,12 +197,12 @@ pub const Surface = struct {
 
     /// Fill `rect` with `cell`.
     pub fn fill(self: *Surface, rect: Rect, cell: Cell) void {
-        self.windowForRect(rect).fill(cell);
+        self.windowForRect(rect).fill(vaxis_convert.cellToVaxis(cell));
     }
 
     /// Clear `rect` to the default terminal cell.
     pub fn clear(self: *Surface, rect: Rect) void {
-        self.fill(rect, .{ .default = true });
+        self.windowForRect(rect).clear();
     }
 
     /// Create a child surface clipped to `rect`.
@@ -216,28 +223,27 @@ pub const Surface = struct {
     pub fn scroll(self: *Surface, rect: Rect, rows: u16) void {
         if (rows == 0 or rect.width == 0 or rect.height == 0) return;
 
-        var child_surface = self.child(rect);
-        const child_size = child_surface.size();
-        if (rows >= child_size.height) {
-            child_surface.clearAll();
+        var child_window = self.windowForRect(rect);
+        if (rows >= child_window.height) {
+            child_window.clear();
             return;
         }
 
         var row: u16 = 0;
-        while (row < child_size.height - rows) : (row += 1) {
+        while (row < child_window.height - rows) : (row += 1) {
             var col: u16 = 0;
-            while (col < child_size.width) : (col += 1) {
-                const cell = child_surface.readCell(col, row + rows) orelse Cell{};
-                child_surface.writeCell(col, row, cell);
+            while (col < child_window.width) : (col += 1) {
+                const cell = child_window.readCell(col, row + rows) orelse vaxis.Cell{};
+                child_window.writeCell(col, row, cell);
             }
         }
 
-        child_surface.clear(.{
-            .col = 0,
-            .row = child_size.height - rows,
-            .width = child_size.width,
+        child_window.child(.{
+            .x_off = 0,
+            .y_off = @intCast(child_window.height - rows),
+            .width = child_window.width,
             .height = rows,
-        });
+        }).clear();
     }
 
     fn windowForRect(self: *Surface, rect: Rect) vaxis.Window {
@@ -261,12 +267,12 @@ pub const Surface = struct {
 
     /// Set the terminal cursor shape.
     pub fn setCursorShape(self: *Surface, shape: CursorShape) void {
-        self.vaxisWindow().setCursorShape(shape);
+        self.vaxisWindow().setCursorShape(vaxis_convert.cursorShapeToVaxis(shape));
     }
 
     /// Fill the entire surface with `cell`.
     pub fn fillAll(self: *Surface, cell: Cell) void {
-        self.vaxisWindow().fill(cell);
+        self.vaxisWindow().fill(vaxis_convert.cellToVaxis(cell));
     }
 
     /// Clear the entire surface to the default terminal cell.
@@ -315,7 +321,7 @@ pub const Column = struct {
     pub fn borrowText(self: *Column, str: []const u8, ts: TextStyle) void {
         const result = self.vaxisWindow().printSegment(.{
             .text = str,
-            .style = ts.toVaxis(),
+            .style = vaxis_convert.textStyleToVaxis(ts),
         }, .{ .row_offset = self.row });
         self.row = result.row + self.gap;
     }
@@ -417,6 +423,50 @@ test "Surface.writeCell writes through to the window" {
     const cell = ts.surface.readCell(1, 0).?;
     try std.testing.expectEqualStrings("x", cell.char.grapheme);
     try std.testing.expect(cell.style.bold);
+}
+
+test "Surface.writeCell and readCell roundtrip Chasen-owned cell fields" {
+    var ts = try testSurface(3, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    const expected: Cell = .{
+        .char = .{ .grapheme = "x", .width = 1 },
+        .style = .{
+            .bold = true,
+            .fg = .gray,
+            .underline = .curly,
+            .underline_color = .{ .index = 5 },
+        },
+    };
+    ts.surface.writeCell(1, 0, expected);
+
+    const actual = ts.surface.readCell(1, 0).?;
+    try std.testing.expect(actual.eql(expected));
+}
+
+test "Surface.writeCell and readCell roundtrip wide text cell" {
+    var ts = try testSurface(3, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    ts.surface.writeCell(1, 0, .{ .char = .{ .grapheme = "あ", .width = 2 } });
+
+    const actual = ts.surface.readCell(1, 0).?;
+    try std.testing.expectEqualStrings("あ", actual.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 2), actual.char.width);
+}
+
+test "Surface.writeCell and readCell preserve unknown text width" {
+    var ts = try testSurface(3, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    ts.surface.writeCell(1, 0, .{ .char = .{ .grapheme = "x", .width = 0 } });
+
+    const actual = ts.surface.readCell(1, 0).?;
+    try std.testing.expectEqualStrings("x", actual.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 0), actual.char.width);
 }
 
 test "Surface.readCell reads through from the window" {
@@ -545,6 +595,9 @@ test "Surface.fill and clear affect a rect" {
     const cleared = ts.surface.readCell(2, 2).?;
     try std.testing.expectEqualStrings(" ", cleared.char.grapheme);
     try std.testing.expect(!cleared.style.dim);
+
+    const cleared_raw = ts.screen.readCell(2, 2).?;
+    try std.testing.expect(cleared_raw.default);
 }
 
 test "Surface.child returns a clipped child surface" {
@@ -643,6 +696,23 @@ test "Surface.scroll affects only the requested rect" {
     try std.testing.expectEqualStrings(" ", row3.char.grapheme);
 }
 
+test "Surface.scroll preserves backend cell metadata" {
+    var ts = try testSurface(4, 4);
+    ts.bind();
+    defer ts.deinit();
+
+    ts.screen.writeCell(1, 2, .{
+        .char = .{ .grapheme = "i", .width = 1 },
+        .image = .{ .img_id = 42, .options = .{} },
+    });
+
+    ts.surface.scroll(.{ .col = 1, .row = 1, .width = 2, .height = 2 }, 1);
+
+    const moved = ts.screen.readCell(1, 1).?;
+    try std.testing.expect(moved.image != null);
+    try std.testing.expectEqual(@as(u32, 42), moved.image.?.img_id);
+}
+
 test "Surface.scroll clears rect when rows reaches height" {
     var ts = try testSurface(4, 4);
     ts.bind();
@@ -661,6 +731,9 @@ test "Surface.scroll clears rect when rows reaches height" {
     try std.testing.expectEqualStrings("x", unchanged.char.grapheme);
     try std.testing.expectEqualStrings(" ", cleared_top.char.grapheme);
     try std.testing.expectEqualStrings(" ", cleared_bottom.char.grapheme);
+
+    const cleared_raw = ts.screen.readCell(1, 1).?;
+    try std.testing.expect(cleared_raw.default);
 }
 
 test "Surface cursor APIs update screen cursor state" {
@@ -674,7 +747,7 @@ test "Surface cursor APIs update screen cursor state" {
     try std.testing.expectEqual(@as(u16, 1), ts.screen.cursor.row);
 
     ts.surface.setCursorShape(.beam);
-    try std.testing.expectEqual(CursorShape.beam, ts.screen.cursor_shape);
+    try std.testing.expectEqual(vaxis.Cell.CursorShape.beam, ts.screen.cursor_shape);
 
     ts.surface.hideCursor();
     try std.testing.expect(!ts.screen.cursor_vis);
@@ -699,4 +772,7 @@ test "Surface.fillAll and clearAll affect the whole surface" {
     const cleared = ts.surface.readCell(1, 1).?;
     try std.testing.expectEqualStrings(" ", cleared.char.grapheme);
     try std.testing.expect(!cleared.style.dim);
+
+    const cleared_raw = ts.screen.readCell(1, 1).?;
+    try std.testing.expect(cleared_raw.default);
 }

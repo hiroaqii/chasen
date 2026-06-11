@@ -83,7 +83,7 @@ const SurfaceLayout = struct {
 fn drawRegion(surface: *chasen.Surface, rect: chasen.Rect, label: []const u8, color: chasen.Color) void {
     surface.fill(rect, .{
         .char = .{ .grapheme = " ", .width = 1 },
-        .style = .{ .bg = color.toVaxis() },
+        .style = .{ .bg = color },
     });
 
     var child = surface.child(rect);

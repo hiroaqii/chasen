@@ -307,6 +307,16 @@ This gives applications direct access to:
 - terminal image handles
 - frame-scoped text allocation
 
+`chasen.Cell` is a Chasen-owned text/style cell. It does not expose the
+underlying terminal backend cell type. `Surface.readCell` is useful for tests
+and same-frame read-modify-write effects, but the returned `char.grapheme` is
+borrowed from the screen buffer. Copy it before storing it in model or
+component state.
+
+`CellChar.width = 0` means "unknown or backend-measured width". It is not a
+trailing/continuation marker for wide text. If an app needs wide-text traversal,
+it should derive that policy from its own text model, not from width-zero cells.
+
 ### Text Lifetimes
 
 Chasen has both borrowed and frame-owned text drawing APIs.

@@ -12,6 +12,7 @@ pub const surface = @import("surface.zig");
 pub const Surface = surface.Surface;
 pub const Column = surface.Column;
 pub const Cell = surface.Cell;
+pub const CellChar = surface.CellChar;
 pub const CursorShape = surface.CursorShape;
 pub const Size = surface.Size;
 pub const Rect = surface.Rect;
