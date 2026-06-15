@@ -18,6 +18,7 @@ const surface_mod = @import("surface.zig");
 /// try ts.expectSnapshot("ok                  \n                    \n                    \n                    ");
 /// ```
 pub const TestSurface = struct {
+    allocator: std.mem.Allocator,
     screen: vaxis.Screen,
     arena: std.heap.ArenaAllocator,
     surface: surface_mod.Surface,
@@ -27,7 +28,15 @@ pub const TestSurface = struct {
     /// `Surface` stores a window that points at `screen`, so `TestSurface`
     /// should not be moved after `init`.
     pub fn init(self: *TestSurface, width: u16, height: u16) !void {
-        const screen = try vaxis.Screen.init(std.testing.allocator, .{
+        try self.initWithAllocator(width, height, std.testing.allocator);
+    }
+
+    /// Initialize this fixture with an explicit allocator.
+    ///
+    /// This is useful for executable benchmarks that want the same headless
+    /// surface fixture without depending on `std.testing.allocator`.
+    pub fn initWithAllocator(self: *TestSurface, width: u16, height: u16, allocator: std.mem.Allocator) !void {
+        const screen = try vaxis.Screen.init(allocator, .{
             .cols = width,
             .rows = height,
             .x_pixel = 0,
@@ -35,8 +44,9 @@ pub const TestSurface = struct {
         });
 
         self.* = .{
+            .allocator = allocator,
             .screen = screen,
-            .arena = .init(std.testing.allocator),
+            .arena = .init(allocator),
             .surface = surface_mod.Surface.initVaxis(
                 .{
                     .x_off = 0,
@@ -57,8 +67,9 @@ pub const TestSurface = struct {
 
     /// Release resources owned by this fixture.
     pub fn deinit(self: *TestSurface) void {
+        const allocator = self.allocator;
         self.arena.deinit();
-        self.screen.deinit(std.testing.allocator);
+        self.screen.deinit(allocator);
         self.* = undefined;
     }
 
