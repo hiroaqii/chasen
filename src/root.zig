@@ -29,6 +29,11 @@ pub const TerminalImagePathLoaderFn = terminal_image.PathLoaderFn;
 pub const TerminalImageLoaderVaxis = terminal_image.LoaderVaxis;
 pub const TerminalImageLoaderImage = terminal_image.LoaderImage;
 
+pub const foreground_command = @import("foreground_command.zig");
+pub const ForegroundCommandRequestId = foreground_command.ForegroundCommandRequestId;
+pub const ForegroundCommandOutcome = foreground_command.ForegroundCommandOutcome;
+pub const ForegroundCommandResult = foreground_command.ForegroundCommandResult;
+
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;
 

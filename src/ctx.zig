@@ -1,5 +1,6 @@
 const std = @import("std");
 const terminal_image = @import("terminal_image_types.zig");
+const foreground_command = @import("foreground_command.zig");
 
 /// Context object passed to `init` and `update`.
 ///
@@ -14,6 +15,7 @@ pub fn Ctx(comptime Msg: type) type {
     const max_everys = 8;
     const max_terminal_image_loads = 8;
     const max_terminal_image_unloads = 8;
+    const max_foreground_commands = 1;
 
     const max_cancels = 8;
 
@@ -24,6 +26,7 @@ pub fn Ctx(comptime Msg: type) type {
 
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
+        pub const ForegroundCommandFinishedFn = *const fn (foreground_command.ForegroundCommandResult) Msg;
 
         pub const TickEntry = struct {
             id: []const u8,
@@ -49,6 +52,13 @@ pub fn Ctx(comptime Msg: type) type {
             failed: TerminalImageFailedFn,
         };
 
+        pub const ForegroundCommandEntry = struct {
+            request_id: foreground_command.ForegroundCommandRequestId,
+            argv: []const []const u8,
+            cwd: ?[]const u8,
+            finished: ForegroundCommandFinishedFn,
+        };
+
         // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
         _allocator: std.mem.Allocator = undefined,
@@ -68,6 +78,9 @@ pub fn Ctx(comptime Msg: type) type {
         next_terminal_image_request_id: u64 = 1,
         pending_terminal_image_unloads: [max_terminal_image_unloads]terminal_image.TerminalImageHandle = undefined,
         pending_terminal_image_unloads_len: u8 = 0,
+        pending_foreground_commands: [max_foreground_commands]ForegroundCommandEntry = undefined,
+        pending_foreground_commands_len: u8 = 0,
+        next_foreground_command_request_id: u64 = 1,
         redraw_suppressed: bool = false,
         frame_requested: bool = false,
 
@@ -242,6 +255,62 @@ pub fn Ctx(comptime Msg: type) type {
             }
         };
 
+        pub const TerminalEffects = struct {
+            ctx: *Self,
+
+            pub const ForegroundCommandOptions = struct {
+                argv: []const []const u8,
+                cwd: ?[]const u8 = null,
+                finished: ForegroundCommandFinishedFn,
+            };
+
+            /// Queue an interactive terminal foreground command.
+            ///
+            /// The runtime temporarily restores the terminal, runs the child
+            /// connected to `/dev/tty`, then re-enters Chasen's terminal mode.
+            /// argv and cwd are copied while queueing because effects are
+            /// drained after `update` returns.
+            pub fn runForegroundCommand(
+                self: TerminalEffects,
+                opts: ForegroundCommandOptions,
+            ) (error{ ForegroundCommandLimitExceeded, ForegroundCommandEmptyArgv } || std.mem.Allocator.Error)!foreground_command.ForegroundCommandRequestId {
+                if (opts.argv.len == 0) return error.ForegroundCommandEmptyArgv;
+                if (self.ctx.pending_foreground_commands_len >= max_foreground_commands)
+                    return error.ForegroundCommandLimitExceeded;
+
+                var copied_argv = try self.ctx._allocator.alloc([]const u8, opts.argv.len);
+                errdefer self.ctx._allocator.free(copied_argv);
+
+                var copied_count: usize = 0;
+                errdefer {
+                    for (copied_argv[0..copied_count]) |arg| {
+                        self.ctx._allocator.free(arg);
+                    }
+                }
+
+                for (opts.argv, 0..) |arg, i| {
+                    copied_argv[i] = try self.ctx._allocator.dupe(u8, arg);
+                    copied_count += 1;
+                }
+
+                const copied_cwd = if (opts.cwd) |cwd| try self.ctx._allocator.dupe(u8, cwd) else null;
+                errdefer if (copied_cwd) |cwd| self.ctx._allocator.free(cwd);
+
+                const request_id = foreground_command.ForegroundCommandRequestId{
+                    .id = self.ctx.next_foreground_command_request_id,
+                };
+                self.ctx.next_foreground_command_request_id +%= 1;
+                self.ctx.pending_foreground_commands[self.ctx.pending_foreground_commands_len] = .{
+                    .request_id = request_id,
+                    .argv = copied_argv,
+                    .cwd = copied_cwd,
+                    .finished = opts.finished,
+                };
+                self.ctx.pending_foreground_commands_len += 1;
+                return request_id;
+            }
+        };
+
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
             self.should_quit = true;
@@ -267,6 +336,10 @@ pub fn Ctx(comptime Msg: type) type {
             return .{ .ctx = self };
         }
 
+        pub fn terminal(self: *@This()) TerminalEffects {
+            return .{ .ctx = self };
+        }
+
         /// Return a slice of pending tasks.
         pub fn pendingSlice(self: *@This()) []const TaskFn {
             return self.pending_tasks[0..self.pending_tasks_len];
@@ -283,6 +356,10 @@ pub fn Ctx(comptime Msg: type) type {
 
         pub fn pendingTerminalImageUnloadSlice(self: *@This()) []const terminal_image.TerminalImageHandle {
             return self.pending_terminal_image_unloads[0..self.pending_terminal_image_unloads_len];
+        }
+
+        pub fn pendingForegroundCommandSlice(self: *@This()) []const ForegroundCommandEntry {
+            return self.pending_foreground_commands[0..self.pending_foreground_commands_len];
         }
 
         /// Return a slice of pending tick entries.
@@ -383,6 +460,15 @@ pub fn Ctx(comptime Msg: type) type {
             self.pending_terminal_image_loads_len = 0;
 
             self.pending_terminal_image_unloads_len = 0;
+
+            for (self.pending_foreground_commands[0..self.pending_foreground_commands_len]) |entry| {
+                for (entry.argv) |arg| {
+                    self._allocator.free(arg);
+                }
+                self._allocator.free(entry.argv);
+                if (entry.cwd) |cwd| self._allocator.free(cwd);
+            }
+            self.pending_foreground_commands_len = 0;
         }
     };
 }
@@ -636,6 +722,66 @@ test "Ctx image unload returns error when queue is full" {
     for (0..8) |_| try ctx_val.image().unload(handle);
 
     try std.testing.expectError(error.TerminalImageUnloadLimitExceeded, ctx_val.image().unload(handle));
+}
+
+test "Ctx terminal foreground command copies argv and cwd" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingEffectCopies();
+
+    const finished = &struct {
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+
+    var arg0 = [_]u8{ 'e', 'd' };
+    var arg1 = [_]u8{ 'f', 'i', 'l', 'e' };
+    var cwd = [_]u8{ '/', 't', 'm', 'p' };
+    const request_id = try ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{ arg0[0..], arg1[0..] },
+        .cwd = cwd[0..],
+        .finished = finished,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), request_id.id);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_foreground_commands_len);
+
+    arg0[0] = 'X';
+    arg1[0] = 'Y';
+    cwd[1] = 'z';
+
+    const entry = ctx_val.pendingForegroundCommandSlice()[0];
+    try std.testing.expectEqual(@as(u64, 1), entry.request_id.id);
+    try std.testing.expectEqualStrings("ed", entry.argv[0]);
+    try std.testing.expectEqualStrings("file", entry.argv[1]);
+    try std.testing.expectEqualStrings("/tmp", entry.cwd.?);
+}
+
+test "Ctx terminal foreground command rejects empty argv and overflow" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingEffectCopies();
+
+    const finished = &struct {
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+
+    try std.testing.expectError(error.ForegroundCommandEmptyArgv, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{},
+        .finished = finished,
+    }));
+
+    _ = try ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .finished = finished,
+    });
+    try std.testing.expectError(error.ForegroundCommandLimitExceeded, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"false"},
+        .finished = finished,
+    }));
 }
 
 test "Ctx redraw_suppressed defaults to false" {
