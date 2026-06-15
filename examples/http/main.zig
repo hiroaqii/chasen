@@ -137,6 +137,18 @@ const HttpDemo = struct {
         quit,
     };
 
+    pub fn handleEvent(self: *const HttpDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .fetch,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *HttpDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .fetch => switch (self.state) {
@@ -261,18 +273,6 @@ const HttpDemo = struct {
         }
 
         col.borrowText("space: fetch  q: quit", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const HttpDemo, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                ' ' => .fetch,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

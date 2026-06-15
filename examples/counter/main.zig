@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 
+// Minimal Event -> Msg -> update -> Surface drawing example.
 const Counter = struct {
     count: i32 = 0,
 
@@ -9,6 +10,19 @@ const Counter = struct {
         decrement,
         quit,
     };
+
+    pub fn handleEvent(self: *const Counter, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                '+', '=' => .increment,
+                '-' => .decrement,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
 
     pub fn update(self: *Counter, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
@@ -23,19 +37,6 @@ const Counter = struct {
         col.borrowText("Counter Example", .{ .bold = true });
         try col.print("Count: {d}", .{self.count});
         col.borrowText("Press +/- to change, q to quit", .{ .fg = .gray });
-    }
-
-    pub fn handleEvent(self: *const Counter, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                '+', '=' => .increment,
-                '-' => .decrement,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

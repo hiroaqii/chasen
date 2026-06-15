@@ -60,6 +60,19 @@ const RuntimeStatsDemo = struct {
         ctx.frame().request();
     }
 
+    pub fn handleEvent(self: *const RuntimeStatsDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .frame => |frame| .{ .frame = frame },
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .toggle,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *RuntimeStatsDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .frame => |frame| {
@@ -127,19 +140,6 @@ const RuntimeStatsDemo = struct {
         col.borrowText("", .{});
         col.borrowText("The stats callback updates this summary after each event loop iteration.", .{ .dim = true });
         col.borrowText("Use chasen.run(...) instead of runWith(... stats_fn ...) to disable it.", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const RuntimeStatsDemo, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .frame => |frame| .{ .frame = frame },
-            .key_press => |key| switch (key.codepoint) {
-                ' ' => .toggle,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

@@ -26,6 +26,19 @@ const AnimTransition = struct {
         ctx.frame().request();
     }
 
+    pub fn handleEvent(self: *const AnimTransition, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .frame => |frame| .{ .frame = frame },
+            .key_press => |key| switch (key.codepoint) {
+                'r' => .restart,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *AnimTransition, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .frame => |frame| {
@@ -73,19 +86,6 @@ const AnimTransition = struct {
         col.borrowText("", .{});
         col.borrowText("The app requests the next frame only while transition.done() is false.", .{ .dim = true });
         col.borrowText("When progress reaches 100%, no frame loop remains in flight.", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const AnimTransition, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .frame => |frame| .{ .frame = frame },
-            .key_press => |key| switch (key.codepoint) {
-                'r' => .restart,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

@@ -1,6 +1,8 @@
 const std = @import("std");
 const chasen = @import("chasen");
 
+// Demonstrates running a foreground child process on /dev/tty while Chasen
+// temporarily leaves the alternate screen.
 const ForegroundCommandDemo = struct {
     env_map: *std.process.Environ.Map,
     last_result_buf: [128]u8 = undefined,
@@ -14,6 +16,20 @@ const ForegroundCommandDemo = struct {
         foreground_done: chasen.ForegroundCommandResult,
         quit,
     };
+
+    pub fn handleEvent(self: *const ForegroundCommandDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                't' => .run_true,
+                'f' => .run_false,
+                'e' => .run_editor,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
 
     pub fn update(self: *ForegroundCommandDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
@@ -50,20 +66,6 @@ const ForegroundCommandDemo = struct {
         col.borrowText(self.last_result, .{ .dim = true });
         col.borrowText("", .{});
         col.borrowText("The child runs on /dev/tty while Chasen temporarily leaves the alternate screen.", .{});
-    }
-
-    pub fn handleEvent(self: *const ForegroundCommandDemo, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                't' => .run_true,
-                'f' => .run_false,
-                'e' => .run_editor,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 
     fn done(result: chasen.ForegroundCommandResult) Msg {

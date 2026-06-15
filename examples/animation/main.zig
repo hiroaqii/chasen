@@ -24,6 +24,22 @@ const Animation = struct {
         ctx.frame().request();
     }
 
+    pub fn handleEvent(self: *const Animation, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            // The runtime delivers requested frames as terminal events. The
+            // app maps that event into its own Msg, then update owns the state
+            // transition and decides whether to request another frame.
+            .frame => |frame| .{ .frame = frame },
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .toggle,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *Animation, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .frame => |frame| {
@@ -80,22 +96,6 @@ const Animation = struct {
             .char = .{ .grapheme = "o", .width = 1 },
             .style = .{ .bold = true, .fg = .{ .index = 2 } },
         });
-    }
-
-    pub fn handleEvent(self: *const Animation, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            // The runtime delivers requested frames as terminal events. The
-            // app maps that event into its own Msg, then update owns the state
-            // transition and decides whether to request another frame.
-            .frame => |frame| .{ .frame = frame },
-            .key_press => |key| switch (key.codepoint) {
-                ' ' => .toggle,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

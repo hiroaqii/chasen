@@ -15,6 +15,24 @@ const SurfaceLayout = struct {
         quit,
     };
 
+    pub fn handleEvent(self: *const SurfaceLayout, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn update(self: *SurfaceLayout, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+        _ = self;
+        switch (msg) {
+            .quit => ctx.quit(),
+        }
+    }
+
     pub fn view(self: *const SurfaceLayout, surface: *chasen.Surface) !void {
         _ = self;
         surface.clearAll();
@@ -59,24 +77,6 @@ const SurfaceLayout = struct {
 
         var footer_surface = surface.child(footer);
         _ = footer_surface.borrowTextAt(1, 0, "q: quit", .{ .fg = .gray });
-    }
-
-    pub fn handleEvent(self: *const SurfaceLayout, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
-    }
-
-    pub fn update(self: *SurfaceLayout, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
-        _ = self;
-        switch (msg) {
-            .quit => ctx.quit(),
-        }
     }
 };
 

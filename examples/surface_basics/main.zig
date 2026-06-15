@@ -9,6 +9,24 @@ const SurfaceBasics = struct {
         quit,
     };
 
+    pub fn handleEvent(self: *const SurfaceBasics, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn update(self: *SurfaceBasics, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+        _ = self;
+        switch (msg) {
+            .quit => ctx.quit(),
+        }
+    }
+
     pub fn view(self: *const SurfaceBasics, sfc: *chasen.Surface) !void {
         _ = self;
         sfc.clearAll();
@@ -56,24 +74,6 @@ const SurfaceBasics = struct {
         child.showCursor(4, 2);
 
         _ = sfc.borrowTextAt(0, 15, "child.showCursor(4, 2) is relative to the child", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const SurfaceBasics, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
-    }
-
-    pub fn update(self: *SurfaceBasics, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
-        _ = self;
-        switch (msg) {
-            .quit => ctx.quit(),
-        }
     }
 };
 

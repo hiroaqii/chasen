@@ -21,6 +21,19 @@ const TickDemo = struct {
         quit,
     };
 
+    pub fn handleEvent(self: *const TickDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                's' => .schedule,
+                'c' => .cancel,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *TickDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .schedule => {
@@ -65,19 +78,6 @@ const TickDemo = struct {
             self.cancelled_count,
         });
         col.borrowText(self.last_event, .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const TickDemo, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                's' => .schedule,
-                'c' => .cancel,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

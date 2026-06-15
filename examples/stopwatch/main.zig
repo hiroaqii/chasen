@@ -29,6 +29,19 @@ const Stopwatch = struct {
         try ctx.timer().every("refresh", refresh_interval_ns, .tick);
     }
 
+    pub fn handleEvent(self: *const Stopwatch, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .toggle,
+                'r' => .reset,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *Stopwatch, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .tick => if (self.running) {
@@ -69,19 +82,6 @@ const Stopwatch = struct {
         const status: []const u8 = if (self.running) "Running" else "Stopped";
         col.borrowText(status, .{ .fg = .gray });
         col.borrowText("space: start/stop  r: reset  q: quit", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const Stopwatch, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                ' ' => .toggle,
-                'r' => .reset,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 

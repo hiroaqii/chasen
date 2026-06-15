@@ -45,6 +45,19 @@ const RuntimeTraceDemo = struct {
         ctx.frame().request();
     }
 
+    pub fn handleEvent(self: *const RuntimeTraceDemo, event: chasen.Event) ?Msg {
+        _ = self;
+        return switch (event) {
+            .frame => |frame| .{ .frame = frame },
+            .key_press => |key| switch (key.codepoint) {
+                ' ' => .toggle,
+                'q' => .quit,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     pub fn update(self: *RuntimeTraceDemo, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .frame => |frame| {
@@ -96,19 +109,6 @@ const RuntimeTraceDemo = struct {
         col.borrowText("", .{});
         col.borrowText("The trace callback only counts lifecycle boundaries.", .{ .dim = true });
         col.borrowText("Use chasen.run(...) instead of runWith(... trace_fn ...) to disable it.", .{ .dim = true });
-    }
-
-    pub fn handleEvent(self: *const RuntimeTraceDemo, event: chasen.Event) ?Msg {
-        _ = self;
-        return switch (event) {
-            .frame => |frame| .{ .frame = frame },
-            .key_press => |key| switch (key.codepoint) {
-                ' ' => .toggle,
-                'q' => .quit,
-                else => null,
-            },
-            else => null,
-        };
     }
 };
 
