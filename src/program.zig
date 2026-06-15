@@ -10,6 +10,10 @@ const foreground_command = @import("foreground_command.zig");
 
 const frame_interval_ns: u64 = std.time.ns_per_s / 60;
 
+const EffectDrainResult = struct {
+    needs_render: bool = false,
+};
+
 fn InternalEvent(comptime Msg: type) type {
     return union(enum) {
         key_press: vaxis.Key,
@@ -318,8 +322,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         const effect_drain_start = timingStart(stats_enabled, io);
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effects_need_render = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
-        needs_render = needs_render or effects_need_render;
+        const effect_result = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
+        needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
 
@@ -410,6 +414,10 @@ fn applyMsg(
 ///
 /// Trace and stats boundaries stay at the call sites because init, initial
 /// winsize, and main-loop updates account for effect drain differently.
+///
+/// Always call this as a statement and merge `EffectDrainResult` afterwards.
+/// Placing the call on the right side of short-circuit logic can skip the
+/// effect drain itself.
 fn drainPendingEffects(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
@@ -427,16 +435,17 @@ fn drainPendingEffects(
     last_frame_ns: u64,
     next_frame_index: u64,
     opts: root.RunOptions,
-) !bool {
-    var force_render = false;
-    force_render = force_render or try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended);
+) !EffectDrainResult {
+    var result: EffectDrainResult = .{};
+    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended);
+    result.needs_render = result.needs_render or foreground_needs_render;
     try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop, suspended);
     try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
     try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
     try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
     processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
     startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
-    return force_render;
+    return result;
 }
 
 fn processPendingForegroundCommands(
