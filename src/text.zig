@@ -41,6 +41,26 @@ pub fn clipToWidth(str: []const u8, max_width: u16) []const u8 {
     return str[0..end];
 }
 
+/// Drop leading text until at least `width` terminal cells have been skipped.
+///
+/// The returned slice always points into `str` and starts on a Unicode
+/// grapheme boundary. If `width` lands in the middle of a wide grapheme, that
+/// whole grapheme is skipped and the result snaps to the next boundary.
+pub fn dropToWidth(str: []const u8, width: usize) []const u8 {
+    if (width == 0 or str.len == 0) return str;
+
+    var skipped_width: usize = 0;
+    var start: usize = str.len;
+    var iter = graphemeIterator(str);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(str);
+        skipped_width += displayWidth(bytes);
+        start = @intFromPtr(bytes.ptr) - @intFromPtr(str.ptr) + bytes.len;
+        if (skipped_width >= width) return str[start..];
+    }
+    return str[str.len..];
+}
+
 test "displayWidth handles ascii and wide characters" {
     try std.testing.expectEqual(@as(u16, 3), displayWidth("abc"));
     try std.testing.expectEqual(@as(u16, 2), displayWidth("あ"));
@@ -85,6 +105,15 @@ test "clipToWidth keeps maxInt width within bounds" {
 
     const clipped = clipToWidth(text, max_width);
     try std.testing.expectEqual(@as(usize, max_width), clipped.len);
+}
+
+test "dropToWidth does not split grapheme clusters" {
+    try std.testing.expectEqualStrings("AあB", dropToWidth("AあB", 0));
+    try std.testing.expectEqualStrings("あB", dropToWidth("AあB", 1));
+    try std.testing.expectEqualStrings("B", dropToWidth("AあB", 2));
+    try std.testing.expectEqualStrings("B", dropToWidth("AあB", 3));
+    try std.testing.expectEqualStrings("", dropToWidth("AあB", 4));
+    try std.testing.expectEqualStrings("x", dropToWidth("e\u{301}x", 1));
 }
 
 test {
