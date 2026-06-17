@@ -41,6 +41,36 @@ pub fn clipToWidth(str: []const u8, max_width: u16) []const u8 {
     return str[0..end];
 }
 
+/// Result of clipping text with an optional marker such as `…`.
+///
+/// `prefix` and `marker` are borrowed slices. Draw `prefix` first and then
+/// `marker` when `marker.len > 0`.
+pub const MarkedClip = struct {
+    prefix: []const u8,
+    marker: []const u8 = "",
+    clipped: bool = false,
+};
+
+/// Return a clipped prefix and append `marker` when text does not fit.
+///
+/// The helper is allocation-free and never splits a Unicode grapheme cluster.
+/// If `marker` itself does not fit, it falls back to plain clipping.
+pub fn clipToWidthWithMarker(str: []const u8, max_width: u16, marker: []const u8) MarkedClip {
+    const clipped = clipToWidth(str, max_width);
+    if (clipped.len == str.len) return .{ .prefix = clipped };
+
+    const marker_width = displayWidth(marker);
+    if (marker.len == 0 or marker_width == 0 or marker_width > max_width) {
+        return .{ .prefix = clipped, .clipped = true };
+    }
+
+    return .{
+        .prefix = clipToWidth(str, max_width - marker_width),
+        .marker = marker,
+        .clipped = true,
+    };
+}
+
 /// Drop leading text until at least `width` terminal cells have been skipped.
 ///
 /// The returned slice always points into `str` and starts on a Unicode
@@ -105,6 +135,34 @@ test "clipToWidth keeps maxInt width within bounds" {
 
     const clipped = clipToWidth(text, max_width);
     try std.testing.expectEqual(@as(usize, max_width), clipped.len);
+}
+
+test "clipToWidthWithMarker appends marker when clipped" {
+    const clipped = clipToWidthWithMarker("abcdef", 4, "…");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expectEqualStrings("abc", clipped.prefix);
+    try std.testing.expectEqualStrings("…", clipped.marker);
+}
+
+test "clipToWidthWithMarker does not append marker when text fits" {
+    const clipped = clipToWidthWithMarker("abc", 4, "…");
+    try std.testing.expect(!clipped.clipped);
+    try std.testing.expectEqualStrings("abc", clipped.prefix);
+    try std.testing.expectEqualStrings("", clipped.marker);
+}
+
+test "clipToWidthWithMarker falls back when marker cannot fit" {
+    const clipped = clipToWidthWithMarker("abcdef", 1, "xx");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expectEqualStrings("a", clipped.prefix);
+    try std.testing.expectEqualStrings("", clipped.marker);
+}
+
+test "clipToWidthWithMarker preserves grapheme boundaries" {
+    const clipped = clipToWidthWithMarker("AあB", 3, "…");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expectEqualStrings("A", clipped.prefix);
+    try std.testing.expectEqualStrings("…", clipped.marker);
 }
 
 test "dropToWidth does not split grapheme clusters" {
