@@ -103,6 +103,11 @@ pub const TerminalOptions = struct {
     image_path_loader: ?TerminalImagePathLoaderFn = null,
     /// Optional caller-owned context passed to `image_path_loader`.
     image_loader_context: ?*anyopaque = null,
+    /// Enable terminal mouse reporting for apps that handle `Event.mouse`.
+    ///
+    /// This is opt-in because terminal mouse reporting can interfere with
+    /// normal text selection/copy in many terminal emulators.
+    mouse: bool = false,
 };
 
 /// Options for the low-level `runWith` entry point.
@@ -162,6 +167,14 @@ test "validateApp accepts apps without handleEvent" {
     };
 
     comptime validateApp(App);
+}
+
+test "TerminalOptions mouse defaults to disabled" {
+    const opts: TerminalOptions = .{
+        .env_map = undefined,
+    };
+
+    try std.testing.expectEqual(false, opts.mouse);
 }
 
 test {

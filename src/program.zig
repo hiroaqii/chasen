@@ -173,6 +173,15 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
+    if (opts.terminal.mouse) {
+        try vx.setMouseMode(tty.writer(), true);
+    }
+    defer {
+        if (opts.terminal.mouse) {
+            _ = vx.setMouseMode(tty.writer(), false) catch {};
+        }
+    }
+
     if (!vx.state.in_band_resize) try loop.installResizeHandler();
 
     // --- Frame arena ---
@@ -437,7 +446,7 @@ fn drainPendingEffects(
     opts: root.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
-    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended);
+    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse);
     result.needs_render = result.needs_render or foreground_needs_render;
     try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop, suspended);
     try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
@@ -457,6 +466,7 @@ fn processPendingForegroundCommands(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
     suspended: *std.atomic.Value(bool),
+    mouse_enabled: bool,
 ) !bool {
     const pending_commands = app_ctx.pendingForegroundCommandSlice();
     app_ctx.pending_foreground_commands_len = 0;
@@ -464,7 +474,7 @@ fn processPendingForegroundCommands(
     for (pending_commands) |entry| {
         defer freeForegroundCommandEntry(allocator, entry);
 
-        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, entry);
+        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, mouse_enabled, entry);
         const result: foreground_command.ForegroundCommandResult = .{
             .request_id = entry.request_id,
             .outcome = outcome,
@@ -493,6 +503,7 @@ fn runForegroundCommand(
     io: std.Io,
     loop: anytype,
     suspended: *std.atomic.Value(bool),
+    mouse_enabled: bool,
     entry: anytype,
 ) !foreground_command.ForegroundCommandOutcome {
     if (builtin.os.tag == .windows) {
@@ -502,6 +513,11 @@ fn runForegroundCommand(
     suspended.store(true, .seq_cst);
     defer suspended.store(false, .seq_cst);
 
+    // Mouse reporting is part of Chasen's terminal ownership. Disable it
+    // before handing /dev/tty to an interactive child process.
+    if (mouse_enabled) {
+        _ = vx.setMouseMode(tty.writer(), false) catch {};
+    }
     loop.stop();
     _ = vx.exitAltScreen(tty.writer()) catch {};
 
@@ -510,7 +526,7 @@ fn runForegroundCommand(
     try leaveRawMode(tty);
 
     const outcome = runChildOnControllingTty(io, entry.argv, entry.cwd);
-    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop);
+    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_enabled);
 
     return outcome;
 }
@@ -554,6 +570,7 @@ fn restoreTerminalAfterForeground(
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: anytype,
+    mouse_enabled: bool,
 ) !void {
     _ = io;
     try enterRawMode(tty);
@@ -563,6 +580,9 @@ fn restoreTerminalAfterForeground(
     // Capability and size refresh are useful after returning from an editor,
     // but failure here should not leave the runtime stopped.
     vx.queryTerminal(tty.writer(), .fromSeconds(1)) catch {};
+    if (mouse_enabled) {
+        _ = vx.setMouseMode(tty.writer(), true) catch {};
+    }
 
     if (tty.getWinsize()) |ws| {
         vx.resize(allocator, tty.writer(), ws) catch {};
