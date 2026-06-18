@@ -8,6 +8,11 @@ const surface_mod = @import("surface.zig");
 /// Use this from core and component tests that need to verify rendered cells
 /// without starting a terminal runtime.
 ///
+/// `TestSurface` must be initialized in its final storage location. It owns a
+/// backing screen, and `surface` stores a window that points into that screen.
+/// Declare the value first, then call `init` on it; do not treat `init` as a
+/// value-returning factory.
+///
 /// Usage:
 /// ```
 /// var ts: chasen.testing.TestSurface = undefined;
@@ -250,6 +255,8 @@ test "update call pattern with a counter app" {
 const TestMsg = union(enum) { inc, dec };
 
 test "TestSurface exposes a drawable headless surface" {
+    // Keep TestSurface in stable storage: the embedded Surface points at the
+    // backing screen initialized by ts.init.
     var ts: TestSurface = undefined;
     try ts.init(6, 2);
     defer ts.deinit();

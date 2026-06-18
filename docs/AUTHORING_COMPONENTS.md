@@ -327,6 +327,10 @@ component or app has a clear need.
 Use `chasen.testing.TestSurface` when a component test needs to verify drawing
 without starting a terminal runtime.
 
+`TestSurface` is initialized in-place. Declare the fixture first, then call
+`init` on that value. This keeps the embedded `Surface` pointing at the backing
+screen owned by the same fixture.
+
 ```zig
 var ts: chasen.testing.TestSurface = undefined;
 try ts.init(6, 3);
