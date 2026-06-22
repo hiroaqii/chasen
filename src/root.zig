@@ -92,6 +92,18 @@ pub const AppDeinitContext = runtime.AppDeinitContext;
 
 pub const RuntimeOptions = runtime.RuntimeOptions;
 
+pub const KeyboardProtocol = enum {
+    /// Do not enable enhanced keyboard protocols. This is the most compatible
+    /// mode for IME composition and language toggles.
+    legacy,
+    /// Enable Kitty keyboard protocol when the terminal reports support.
+    ///
+    /// This can improve modified-key reporting, but some terminal/IME
+    /// combinations deliver language toggle keys to the app instead of the
+    /// input method while this mode is active.
+    kitty,
+};
+
 /// Terminal-backend options for `runWith`.
 pub const TerminalOptions = struct {
     env_map: *std.process.Environ.Map,
@@ -108,6 +120,8 @@ pub const TerminalOptions = struct {
     /// This is opt-in because terminal mouse reporting can interfere with
     /// normal text selection/copy in many terminal emulators.
     mouse: bool = false,
+    /// Keyboard protocol used by the terminal backend.
+    keyboard_protocol: KeyboardProtocol = .legacy,
 };
 
 /// Options for the low-level `runWith` entry point.
@@ -175,6 +189,7 @@ test "TerminalOptions mouse defaults to disabled" {
     };
 
     try std.testing.expectEqual(false, opts.mouse);
+    try std.testing.expectEqual(KeyboardProtocol.legacy, opts.keyboard_protocol);
 }
 
 test {

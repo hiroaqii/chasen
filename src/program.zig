@@ -171,7 +171,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     defer loop.stop();
 
     try vx.enterAltScreen(tty.writer());
-    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    try queryTerminal(&vx, tty.writer(), io, .fromSeconds(1), opts.terminal.keyboard_protocol);
 
     if (opts.terminal.mouse) {
         try vx.setMouseMode(tty.writer(), true);
@@ -353,6 +353,36 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     trace(opts, .shutdown);
 }
 
+fn queryTerminal(
+    vx: *vaxis.Vaxis,
+    writer: *std.Io.Writer,
+    io: std.Io,
+    timeout: std.Io.Duration,
+    keyboard_protocol: root.KeyboardProtocol,
+) !void {
+    // Split vaxis' query/wait/enable flow so Chasen can keep enhanced
+    // keyboard reporting opt-in while still using the other detected features.
+    try vx.queryTerminalSend(writer);
+    try std.Io.futexWaitTimeout(
+        io,
+        std.atomic.Value(u32),
+        &vx.query_futex,
+        .init(0),
+        .{
+            .duration = .{
+                .clock = .real,
+                .raw = timeout,
+            },
+        },
+    );
+
+    vx.queries_done.store(true, .unordered);
+    if (keyboard_protocol == .legacy) {
+        vx.caps.kitty_keyboard = false;
+    }
+    try vx.enableDetectedFeatures(writer);
+}
+
 /// Route an app-facing event through optional `handleEvent`, then apply the
 /// returned message if the app handled it.
 ///
@@ -446,7 +476,7 @@ fn drainPendingEffects(
     opts: root.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
-    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse);
+    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol);
     result.needs_render = result.needs_render or foreground_needs_render;
     try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop, suspended);
     try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
@@ -467,6 +497,7 @@ fn processPendingForegroundCommands(
     loop: *vaxis.Loop(InternalEvent(Msg)),
     suspended: *std.atomic.Value(bool),
     mouse_enabled: bool,
+    keyboard_protocol: root.KeyboardProtocol,
 ) !bool {
     const pending_commands = app_ctx.pendingForegroundCommandSlice();
     app_ctx.pending_foreground_commands_len = 0;
@@ -474,7 +505,7 @@ fn processPendingForegroundCommands(
     for (pending_commands) |entry| {
         defer freeForegroundCommandEntry(allocator, entry);
 
-        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, mouse_enabled, entry);
+        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, mouse_enabled, keyboard_protocol, entry);
         const result: foreground_command.ForegroundCommandResult = .{
             .request_id = entry.request_id,
             .outcome = outcome,
@@ -504,6 +535,7 @@ fn runForegroundCommand(
     loop: anytype,
     suspended: *std.atomic.Value(bool),
     mouse_enabled: bool,
+    keyboard_protocol: root.KeyboardProtocol,
     entry: anytype,
 ) !foreground_command.ForegroundCommandOutcome {
     if (builtin.os.tag == .windows) {
@@ -526,7 +558,7 @@ fn runForegroundCommand(
     try leaveRawMode(tty);
 
     const outcome = runChildOnControllingTty(io, entry.argv, entry.cwd);
-    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_enabled);
+    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_enabled, keyboard_protocol);
 
     return outcome;
 }
@@ -571,15 +603,15 @@ fn restoreTerminalAfterForeground(
     io: std.Io,
     loop: anytype,
     mouse_enabled: bool,
+    keyboard_protocol: root.KeyboardProtocol,
 ) !void {
-    _ = io;
     try enterRawMode(tty);
     try loop.start();
     try vx.enterAltScreen(tty.writer());
 
     // Capability and size refresh are useful after returning from an editor,
     // but failure here should not leave the runtime stopped.
-    vx.queryTerminal(tty.writer(), .fromSeconds(1)) catch {};
+    queryTerminal(vx, tty.writer(), io, .fromSeconds(1), keyboard_protocol) catch {};
     if (mouse_enabled) {
         _ = vx.setMouseMode(tty.writer(), true) catch {};
     }
