@@ -22,10 +22,121 @@ fn InternalEvent(comptime Msg: type) type {
         focus_in,
         focus_out,
         paste: []const u8,
+        paste_start,
+        paste_end,
         frame: root.Frame,
 
         /// Async task result injected via postEvent.
         user_msg: Msg,
+    };
+}
+
+/// Converts terminal bracketed-paste marker events into one public Event.paste.
+///
+/// vaxis exposes bracketed paste as `paste_start`, many ordinary `key_press`
+/// events, then `paste_end`. Apps should not have to know that transport detail:
+/// they should receive one paste payload and should never see the intermediate
+/// key events as normal typing.
+const BracketedPasteAccumulator = struct {
+    active: bool = false,
+    failed: bool = false,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn start(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
+        self.cancel(allocator);
+        self.active = true;
+    }
+
+    fn appendKey(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator, key: vaxis.Key) !void {
+        if (!self.active) return;
+        if (self.failed) return;
+
+        // Prefer vaxis' decoded text. The slice is event-scoped, so copy it
+        // before the next parser event can reuse the backing buffer.
+        if (key.text) |text| {
+            try self.bytes.appendSlice(allocator, text);
+            return;
+        }
+
+        if (pasteControlText(key)) |text| {
+            try self.bytes.appendSlice(allocator, text);
+            return;
+        }
+
+        if (key.mods.ctrl) return;
+        if (!isPasteTextCodepoint(key.codepoint)) return;
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(key.codepoint, &buf) catch return;
+        try self.bytes.appendSlice(allocator, buf[0..len]);
+    }
+
+    fn finish(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) ?[]u8 {
+        if (!self.active) return null;
+        self.active = false;
+
+        if (self.failed) {
+            self.failed = false;
+            self.bytes.clearRetainingCapacity();
+            return null;
+        }
+        if (self.bytes.items.len == 0) {
+            self.bytes.clearRetainingCapacity();
+            return null;
+        }
+        if (!std.unicode.utf8ValidateSlice(self.bytes.items)) {
+            self.bytes.clearRetainingCapacity();
+            return null;
+        }
+
+        return self.bytes.toOwnedSlice(allocator) catch {
+            self.bytes.clearRetainingCapacity();
+            return null;
+        };
+    }
+
+    fn fail(self: *BracketedPasteAccumulator) void {
+        // Keep `active` true so the rest of this bracketed paste is swallowed
+        // until `paste_end`; otherwise a failed paste tail becomes key input.
+        self.active = true;
+        self.failed = true;
+        self.bytes.clearRetainingCapacity();
+    }
+
+    fn cancel(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.active = false;
+        self.failed = false;
+        self.bytes.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+fn isPasteTextCodepoint(codepoint: u21) bool {
+    return switch (codepoint) {
+        '\n', vaxis.Key.tab, vaxis.Key.enter => true,
+        0x20...0xD7FF, 0xE000...0x10FFFF => codepoint < vaxis.Key.insert or codepoint > vaxis.Key.iso_level_5_shift,
+        else => false,
+    };
+}
+
+fn pasteControlText(key: vaxis.Key) ?[]const u8 {
+    if (!key.mods.ctrl) return null;
+    if (key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta) return null;
+    if (key.codepoint > std.math.maxInt(u8)) return null;
+
+    // Some terminals report pasted LF/TAB/CR through their legacy control-key
+    // encodings (Ctrl+J / Ctrl+I / Ctrl+M) without decoded `key.text`.
+    // Treat only those textual controls as paste bytes; other Ctrl keys are
+    // shortcuts/special input and must not become printable letters.
+    return switch (std.ascii.toLower(@as(u8, @intCast(key.codepoint)))) {
+        'i' => "\t",
+        'j' => "\n",
+        'm' => "\r",
+        else => null,
     };
 }
 
@@ -219,6 +330,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     var last_frame_ns = timestampNs(io);
     var next_frame_index: u64 = 0;
     var runtime_suspended: std.atomic.Value(bool) = .init(false);
+    var bracketed_paste: BracketedPasteAccumulator = .{};
+    defer bracketed_paste.deinit(allocator);
     var event_count: u64 = 0;
     var frame_count: u64 = 0;
     const stats_enabled = opts.runtime.stats_fn != null;
@@ -293,7 +406,16 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
 
         switch (event) {
             .key_press => |key| {
-                needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats, opts);
+                if (bracketed_paste.active) {
+                    // These key events are paste payload bytes, not app input.
+                    // Swallow them and dispatch one Event.paste at paste_end.
+                    if (stats) |*s| s.event_kind = .paste;
+                    bracketed_paste.appendKey(allocator, key) catch {
+                        bracketed_paste.fail();
+                    };
+                } else {
+                    needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats, opts);
+                }
             },
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
@@ -316,8 +438,20 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats, opts);
             },
             .paste => |text| {
+                bracketed_paste.cancel(allocator);
                 defer allocator.free(text);
                 needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats, opts);
+            },
+            .paste_start => {
+                bracketed_paste.start(allocator);
+                if (stats) |*s| s.event_kind = .paste;
+            },
+            .paste_end => {
+                if (stats) |*s| s.event_kind = .paste;
+                if (bracketed_paste.finish(allocator)) |text| {
+                    defer allocator.free(text);
+                    needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats, opts);
+                }
             },
             .frame => |frame| {
                 frame_count += 1;
@@ -336,6 +470,9 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during update
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
+        if (app_ctx.pending_foreground_commands_len > 0) {
+            bracketed_paste.cancel(allocator);
+        }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
         const effect_result = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
@@ -890,6 +1027,8 @@ fn eventKind(event: anytype) root.RuntimeEventKind {
         .focus_in => .focus_in,
         .focus_out => .focus_out,
         .paste => .paste,
+        .paste_start => .paste,
+        .paste_end => .paste,
         .frame => .frame,
     };
 }
@@ -967,8 +1106,114 @@ test "InternalEvent instantiation" {
     const paste_ev: Event = .{ .paste = "hello" };
     try std.testing.expect(paste_ev == .paste);
 
+    const paste_start_ev: Event = .paste_start;
+    try std.testing.expect(paste_start_ev == .paste_start);
+
+    const paste_end_ev: Event = .paste_end;
+    try std.testing.expect(paste_end_ev == .paste_end);
+
     const frame_ev: Event = .{ .frame = .{ .now_ns = 100, .delta_ns = 16, .index = 2 } };
     try std.testing.expect(frame_ev == .frame);
+}
+
+test "BracketedPasteAccumulator combines pasted key text" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = "hello" });
+    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.enter });
+    try paste.appendKey(allocator, .{ .codepoint = '世', .text = "世界" });
+
+    const text = paste.finish(allocator).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("hello\r世界", text);
+}
+
+test "BracketedPasteAccumulator restarts nested paste" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "old" });
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = 'n', .text = "new" });
+
+    const text = paste.finish(allocator).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("new", text);
+}
+
+test "BracketedPasteAccumulator ignores non-text special keys" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.up });
+    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.left_shift });
+
+    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
+}
+
+test "BracketedPasteAccumulator drops invalid utf8" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    var invalid = [_]u8{0xff};
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = invalid[0..] });
+
+    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
+}
+
+test "BracketedPasteAccumulator failure swallows until paste end" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    paste.fail();
+    try paste.appendKey(allocator, .{ .codepoint = 't', .text = "tail" });
+
+    try std.testing.expect(paste.active);
+    try std.testing.expect(paste.failed);
+    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
+    try std.testing.expect(!paste.active);
+    try std.testing.expect(!paste.failed);
+}
+
+test "BracketedPasteAccumulator maps ctrl-j paste key to newline" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
+    try paste.appendKey(allocator, .{ .codepoint = 'j', .mods = .{ .ctrl = true } });
+    try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
+
+    const text = paste.finish(allocator).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("aaaaa\nbbbbb", text);
+}
+
+test "BracketedPasteAccumulator preserves direct line-feed codepoint" {
+    const allocator = std.testing.allocator;
+    var paste: BracketedPasteAccumulator = .{};
+    defer paste.deinit(allocator);
+
+    paste.start(allocator);
+    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
+    try paste.appendKey(allocator, .{ .codepoint = '\n' });
+    try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
+
+    const text = paste.finish(allocator).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("aaaaa\nbbbbb", text);
 }
 
 test "SpawnHelper instantiation" {
