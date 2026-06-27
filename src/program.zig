@@ -173,6 +173,13 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     try vx.enterAltScreen(tty.writer());
     try queryTerminal(&vx, tty.writer(), io, .fromSeconds(1), opts.terminal.keyboard_protocol);
 
+    // Bracketed paste belongs to Chasen's terminal ownership. It is enabled
+    // by default so apps can receive Event.paste instead of raw paste markers.
+    try vx.setBracketedPaste(tty.writer(), true);
+    defer {
+        _ = vx.setBracketedPaste(tty.writer(), false) catch {};
+    }
+
     if (opts.terminal.mouse) {
         try vx.setMouseMode(tty.writer(), true);
     }
@@ -550,6 +557,8 @@ fn runForegroundCommand(
     if (mouse_enabled) {
         _ = vx.setMouseMode(tty.writer(), false) catch {};
     }
+    // Do not leak Chasen's paste mode into the foreground child process.
+    _ = vx.setBracketedPaste(tty.writer(), false) catch {};
     loop.stop();
     _ = vx.exitAltScreen(tty.writer()) catch {};
 
@@ -615,6 +624,7 @@ fn restoreTerminalAfterForeground(
     if (mouse_enabled) {
         _ = vx.setMouseMode(tty.writer(), true) catch {};
     }
+    _ = vx.setBracketedPaste(tty.writer(), true) catch {};
 
     if (tty.getWinsize()) |ws| {
         vx.resize(allocator, tty.writer(), ws) catch {};
