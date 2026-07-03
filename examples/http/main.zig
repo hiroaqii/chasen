@@ -280,7 +280,7 @@ pub fn main(init: std.process.Init) !void {
     try chasen.run(init, HttpDemo{});
 }
 
-fn fetchFailed(failure: chasen.TaskFailure) Msg {
+fn fetchFailed(failure: chasen.TaskFailure) HttpDemo.Msg {
     return .{ .got_error = switch (failure) {
         .start_failed => |message| BoundedStr.from(message),
     } };
