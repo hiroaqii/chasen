@@ -180,12 +180,15 @@ test "resetTransient clears pending queues and redraw_suppressed" {
     var tc: TestCtx(TestMsg) = .{};
 
     // Accumulate some state
-    const task = &struct {
+    const task = struct {
         fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
             return .inc;
         }
-    }.run;
-    try tc.ctx.task().spawn(task);
+        fn failed(_: ctx_mod.TaskFailure) TestMsg {
+            return .dec;
+        }
+    };
+    try tc.ctx.task().spawn(.{ .run = task.run, .failed = task.failed });
     try tc.ctx.timer().tick("t1", 1_000, .inc);
     try tc.ctx.timer().every("e1", 2_000, .dec);
     try tc.ctx.timer().cancel("x");

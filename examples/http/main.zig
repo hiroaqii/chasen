@@ -155,7 +155,7 @@ const HttpDemo = struct {
                 .loading => {},
                 else => {
                     self.state = .loading;
-                    try ctx.task().spawn(&doFetch);
+                    try ctx.task().spawn(.{ .run = doFetch, .failed = fetchFailed });
                 },
             },
             .got_response => |body| {
@@ -278,4 +278,10 @@ const HttpDemo = struct {
 
 pub fn main(init: std.process.Init) !void {
     try chasen.run(init, HttpDemo{});
+}
+
+fn fetchFailed(failure: chasen.TaskFailure) Msg {
+    return .{ .got_error = switch (failure) {
+        .start_failed => |message| BoundedStr.from(message),
+    } };
 }

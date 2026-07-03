@@ -219,10 +219,17 @@ ctx.frame().request();
 ctx.redraw().skip();
 
 // Run background work that does not need captured app-owned context.
-try ctx.task().spawn(Task.run);
+try ctx.task().spawn(.{
+    .run = Task.run,
+    .failed = Task.failed,
+});
 
 // Run background work with an explicit context pointer owned by the app.
-try ctx.task().spawnWith(task, Task.run);
+try ctx.task().spawnWith(.{
+    .ctx = task,
+    .run = Task.run,
+    .failed = Task.failed,
+});
 
 // Send `.reload` once after the given delay.
 try ctx.timer().tick("reload", 1_000_000_000, .reload);
@@ -244,12 +251,22 @@ Effects are not executed immediately. They are stored in `Ctx` and drained by
 the runtime after `init` or `update` returns. This keeps state changes and
 runtime work in a clear order.
 
+Task effects are delivered as either the task's success message or the required
+`failed(.start_failed)` message when the runtime cannot start the task. If a
+terminal foreground command is running, completed task results are queued by the
+event loop and delivered after Chasen resumes. Apps must still use request ids,
+generations, or other identity checks for stale results; foreground completion
+ordering is not a correctness contract.
+
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
 waits for the interval again. It does not compensate for app update/render time.
 `ctx.frame().request` requests one future frame event and is coalesced while a
 frame is already in flight; animation code should use `Frame.delta_ns` or
 `Frame.now_ns` for time-based movement instead of assuming an exact frame rate.
+If a foreground command interrupts a scheduled frame, Chasen drops the stale
+frame and requests a fresh one after returning; the next delivered frame can
+therefore include a large elapsed delta.
 
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct

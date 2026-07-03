@@ -36,6 +36,7 @@ pub const ForegroundCommandResult = foreground_command.ForegroundCommandResult;
 
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;
+pub const TaskFailure = runtime.TaskFailure;
 
 pub const testing = @import("testing.zig");
 

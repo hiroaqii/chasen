@@ -25,10 +25,18 @@ fn InternalEvent(comptime Msg: type) type {
         paste_start,
         paste_end,
         frame: root.Frame,
+        frame_canceled,
 
         /// Async task result injected via postEvent.
         user_msg: Msg,
     };
+}
+
+fn postInternalEvent(comptime Msg: type, loop_ptr: *vaxis.Loop(InternalEvent(Msg)), event: InternalEvent(Msg)) void {
+    // vaxis' event queue survives loop.stop()/loop.start() and blocks on
+    // normal backpressure. Remaining errors are teardown/cancel paths where
+    // the runtime is no longer able to deliver app messages.
+    loop_ptr.postEvent(event) catch {};
 }
 
 /// Converts terminal bracketed-paste marker events into one public Event.paste.
@@ -145,15 +153,13 @@ fn SpawnHelper(comptime Msg: type) type {
     const Event = InternalEvent(Msg);
     return struct {
         fn run(
-            task_fn: *const fn (std.mem.Allocator, std.Io) Msg,
+            task: ctx_mod.Ctx(Msg).TaskEntry,
             alloc: std.mem.Allocator,
             spawn_io: std.Io,
             loop_ptr: *vaxis.Loop(Event),
-            suspended: *std.atomic.Value(bool),
         ) void {
-            const msg = task_fn(alloc, spawn_io);
-            if (suspended.load(.seq_cst)) return;
-            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+            const msg = task.run(alloc, spawn_io);
+            postInternalEvent(Msg, loop_ptr, .{ .user_msg = msg });
         }
     };
 }
@@ -168,11 +174,9 @@ fn SpawnWithHelper(comptime Msg: type) type {
             alloc: std.mem.Allocator,
             spawn_io: std.Io,
             loop_ptr: *vaxis.Loop(Event),
-            suspended: *std.atomic.Value(bool),
         ) void {
             const msg = run_fn(ctx_ptr, alloc, spawn_io);
-            if (suspended.load(.seq_cst)) return;
-            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+            postInternalEvent(Msg, loop_ptr, .{ .user_msg = msg });
         }
     };
 }
@@ -186,11 +190,9 @@ fn TickHelper(comptime Msg: type) type {
             msg: Msg,
             tick_io: std.Io,
             loop_ptr: *vaxis.Loop(Event),
-            suspended: *std.atomic.Value(bool),
         ) void {
             tick_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
-            if (suspended.load(.seq_cst)) return;
-            loop_ptr.postEvent(.{ .user_msg = msg }) catch {};
+            postInternalEvent(Msg, loop_ptr, .{ .user_msg = msg });
         }
     };
 }
@@ -229,13 +231,16 @@ fn FrameHelper(comptime Msg: type) type {
             suspended: *std.atomic.Value(bool),
         ) void {
             frame_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
-            if (suspended.load(.seq_cst)) return;
+            if (suspended.load(.seq_cst)) {
+                postInternalEvent(Msg, loop_ptr, .frame_canceled);
+                return;
+            }
             const now_ns = timestampNs(frame_io);
-            loop_ptr.postEvent(.{ .frame = .{
+            postInternalEvent(Msg, loop_ptr, .{ .frame = .{
                 .now_ns = now_ns,
                 .delta_ns = deltaNs(last_frame_ns, now_ns),
                 .index = index,
-            } }) catch {};
+            } });
         }
     };
 }
@@ -369,7 +374,8 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         try app.init(&app_ctx);
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
+        var init_stats: ?root.RuntimeStats = null;
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, &init_stats, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -385,7 +391,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, &initial_stats, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -465,6 +471,15 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 next_frame_index = frame.index + 1;
                 needs_render = try dispatchAppEvent(App, &app, .{ .frame = frame }, &app_ctx, io, &stats, opts);
             },
+            .frame_canceled => {
+                if (frame_future) |*f| {
+                    _ = f.await(io);
+                    frame_future = null;
+                }
+                frame_in_flight = false;
+                app_ctx.frame_requested = true;
+                if (stats) |*s| s.event_kind = .frame;
+            },
         }
 
         // Process tasks, ticks, and everys spawned during update
@@ -475,7 +490,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(Msg, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &frame_in_flight, &frame_future, last_frame_ns, next_frame_index, &stats, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -602,8 +617,9 @@ fn applyMsg(
 /// Placing the call on the right side of short-circuit logic can skip the
 /// effect drain itself.
 fn drainPendingEffects(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
+    comptime App: type,
+    app: *App,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
     pending_futures: *std.ArrayList(std.Io.Future(void)),
     running_timers: *std.ArrayList(TimerHandle),
     terminal_images: *terminal_image.Registry,
@@ -611,19 +627,21 @@ fn drainPendingEffects(
     tty: *vaxis.Tty,
     allocator: std.mem.Allocator,
     io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
+    loop: *vaxis.Loop(InternalEvent(App.Msg)),
     suspended: *std.atomic.Value(bool),
     frame_in_flight: *bool,
     frame_future: *?std.Io.Future(void),
     last_frame_ns: u64,
     next_frame_index: u64,
+    stats: *?root.RuntimeStats,
     opts: root.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
-    const foreground_needs_render = try processPendingForegroundCommands(Msg, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol);
+    const Msg = App.Msg;
+    const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
     result.needs_render = result.needs_render or foreground_needs_render;
-    try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop, suspended);
-    try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
+    try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
+    try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
     try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
     try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
     processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
@@ -632,19 +650,23 @@ fn drainPendingEffects(
 }
 
 fn processPendingForegroundCommands(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
+    comptime App: type,
+    app: *App,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
     vx: *vaxis.Vaxis,
     tty: *vaxis.Tty,
     allocator: std.mem.Allocator,
     io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
+    loop: *vaxis.Loop(InternalEvent(App.Msg)),
     suspended: *std.atomic.Value(bool),
     mouse_enabled: bool,
     keyboard_protocol: root.KeyboardProtocol,
+    stats: *?root.RuntimeStats,
+    opts: root.RunOptions,
 ) !bool {
     const pending_commands = app_ctx.pendingForegroundCommandSlice();
     app_ctx.pending_foreground_commands_len = 0;
+    var needs_render = false;
 
     for (pending_commands) |entry| {
         defer freeForegroundCommandEntry(allocator, entry);
@@ -654,10 +676,10 @@ fn processPendingForegroundCommands(
             .request_id = entry.request_id,
             .outcome = outcome,
         };
-        try loop.postEvent(.{ .user_msg = entry.finished(result) });
+        needs_render = try applyMsg(App, app, entry.finished(result), app_ctx, io, stats, opts) or needs_render;
     }
 
-    return false;
+    return needs_render;
 }
 
 fn freeForegroundCommandEntry(
@@ -780,8 +802,8 @@ fn enterRawMode(tty: *vaxis.Tty) !void {
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
-/// ctx.task().spawn/spawnWith only guarantee queueing; runtime start failures
-/// are currently dropped and may become observable via a future error hook.
+/// Task start failures are delivered through the app-provided failure callback
+/// before ownership is transferred to the concurrent task body.
 fn spawnPendingTasks(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
@@ -789,29 +811,36 @@ fn spawnPendingTasks(
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
-    suspended: *std.atomic.Value(bool),
 ) !void {
-    for (app_ctx.pendingSlice()) |task_fn| {
-        var future = io.concurrent(
-            SpawnHelper(Msg).run,
-            .{ task_fn, allocator, io, loop, suspended },
-        ) catch continue;
-        pending_futures.append(allocator, future) catch {
-            _ = future.cancel(io);
+    for (app_ctx.pendingSlice()) |task| {
+        pending_futures.ensureUnusedCapacity(allocator, 1) catch |err| {
+            postInternalEvent(Msg, loop, .{ .user_msg = task.failed(.{ .start_failed = @errorName(err) }) });
             continue;
         };
+        const future = io.concurrent(
+            SpawnHelper(Msg).run,
+            .{ task, allocator, io, loop },
+        ) catch |err| {
+            postInternalEvent(Msg, loop, .{ .user_msg = task.failed(.{ .start_failed = @errorName(err) }) });
+            continue;
+        };
+        pending_futures.appendAssumeCapacity(future);
     }
     app_ctx.pending_tasks_len = 0;
 
     for (app_ctx.pendingTaskWithSlice()) |entry| {
-        var future = io.concurrent(
-            SpawnWithHelper(Msg).run,
-            .{ entry.ctx, entry.run, allocator, io, loop, suspended },
-        ) catch continue;
-        pending_futures.append(allocator, future) catch {
-            _ = future.cancel(io);
+        pending_futures.ensureUnusedCapacity(allocator, 1) catch |err| {
+            postInternalEvent(Msg, loop, .{ .user_msg = entry.failed(entry.ctx, .{ .start_failed = @errorName(err) }, allocator) });
             continue;
         };
+        const future = io.concurrent(
+            SpawnWithHelper(Msg).run,
+            .{ entry.ctx, entry.run, allocator, io, loop },
+        ) catch |err| {
+            postInternalEvent(Msg, loop, .{ .user_msg = entry.failed(entry.ctx, .{ .start_failed = @errorName(err) }, allocator) });
+            continue;
+        };
+        pending_futures.appendAssumeCapacity(future);
     }
     app_ctx.pending_tasks_with_len = 0;
 }
@@ -848,7 +877,6 @@ fn spawnPendingTicks(
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
-    suspended: *std.atomic.Value(bool),
 ) !void {
     // Take ownership of queued copies before processing. Zeroing the queue
     // first keeps run()'s unwind cleanup from freeing ids after they have been
@@ -865,7 +893,7 @@ fn spawnPendingTicks(
 
         var future = io.concurrent(
             TickHelper(Msg).run,
-            .{ entry.after_ns, entry.msg, io, loop, suspended },
+            .{ entry.after_ns, entry.msg, io, loop },
         ) catch continue;
         running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
             _ = future.cancel(io);
@@ -1030,6 +1058,7 @@ fn eventKind(event: anytype) root.RuntimeEventKind {
         .paste_start => .paste,
         .paste_end => .paste,
         .frame => .frame,
+        .frame_canceled => .frame,
     };
 }
 

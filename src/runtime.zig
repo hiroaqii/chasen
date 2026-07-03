@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
+pub const TaskFailure = ctx.TaskFailure;
 
 pub const stats = @import("stats.zig");
 pub const RuntimeEventKind = stats.RuntimeEventKind;
