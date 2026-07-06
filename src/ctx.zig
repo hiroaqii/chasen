@@ -300,6 +300,11 @@ pub fn Ctx(comptime Msg: type) type {
             /// connected to `/dev/tty`, then re-enters Chasen's terminal mode.
             /// argv and cwd are copied while queueing because effects are
             /// drained after `update` returns.
+            ///
+            /// A follow-up foreground command queued from `finished` is
+            /// processed by bounded drain rounds without waiting for unrelated
+            /// input. Commands beyond that guard remain queued for a later
+            /// event loop iteration.
             pub fn runForegroundCommand(
                 self: TerminalEffects,
                 opts: ForegroundCommandOptions,

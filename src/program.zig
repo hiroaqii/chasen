@@ -9,6 +9,7 @@ const terminal_image = @import("terminal_image.zig");
 const foreground_command = @import("foreground_command.zig");
 
 const frame_interval_ns: u64 = std.time.ns_per_s / 60;
+const max_foreground_drain_rounds: usize = 8;
 
 const EffectDrainResult = struct {
     needs_render: bool = false,
@@ -608,7 +609,7 @@ fn applyMsg(
     return !app_ctx.redraw_suppressed;
 }
 
-/// Drains effects queued in Ctx using the documented runtime order:
+/// Drains effects queued in Ctx using the documented per-pass runtime order:
 ///
 /// 1. foreground commands
 /// 2. async tasks
@@ -622,6 +623,10 @@ fn applyMsg(
 /// queue effects, but before tick/every spawn. That makes `cancel(id)` apply
 /// to timers that were already running before this drain pass, while allowing
 /// a same-update `cancel(id); tick(id, ...)` restart to keep the replacement.
+///
+/// Foreground command completions may queue follow-up foreground commands.
+/// Drain a bounded number of full passes so those follow-ups do not wait for
+/// unrelated input/timer/frame events, while preserving the same per-pass order.
 ///
 /// Trace and stats boundaries stay at the call sites because init, initial
 /// winsize, and main-loop updates account for effect drain differently.
@@ -651,14 +656,20 @@ fn drainPendingEffects(
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
     const Msg = App.Msg;
-    const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
-    result.needs_render = result.needs_render or foreground_needs_render;
-    try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
-    processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
-    try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
-    try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
-    try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
-    startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
+
+    for (0..max_foreground_drain_rounds) |_| {
+        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
+        result.needs_render = result.needs_render or foreground_needs_render;
+        try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
+        processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
+        try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
+        try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
+        try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
+        startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
+
+        if (app_ctx.pending_foreground_commands_len == 0) break;
+    }
+
     return result;
 }
 
@@ -677,6 +688,9 @@ fn processPendingForegroundCommands(
     stats: *?root.RuntimeStats,
     opts: root.RunOptions,
 ) !bool {
+    // This iterates Ctx storage directly. That is safe while the foreground
+    // queue capacity is 1; if capacity grows, copy entries out before callbacks
+    // can queue new commands into the same backing array.
     const pending_commands = app_ctx.pendingForegroundCommandSlice();
     app_ctx.pending_foreground_commands_len = 0;
     var needs_render = false;
