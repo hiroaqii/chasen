@@ -141,6 +141,8 @@ pub fn Ctx(comptime Msg: type) type {
             ///
             /// The task is queued here and started by the runtime after
             /// `update` returns.
+            /// Started task futures are awaited during terminal shutdown and
+            /// should eventually return.
             pub fn spawn(self: TaskEffects, opts: SpawnOptions) error{TaskLimitExceeded}!void {
                 if (self.ctx.pending_tasks_len + self.ctx.pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
                 self.ctx.pending_tasks[self.ctx.pending_tasks_len] = .{
@@ -152,8 +154,9 @@ pub fn Ctx(comptime Msg: type) type {
 
             /// Spawn an async task with captured context.
             ///
-            /// The caller must ensure `ctx_ptr` remains valid until the task
-            /// finishes or is cancelled.
+            /// The caller must ensure `opts.ctx` remains valid until the task
+            /// returns. Started task futures are awaited during terminal
+            /// shutdown and should eventually return.
             pub fn spawnWith(
                 self: TaskEffects,
                 opts: SpawnWithOptions,
@@ -180,6 +183,10 @@ pub fn Ctx(comptime Msg: type) type {
             ///
             /// The id is copied into runtime-owned memory while queueing, so
             /// callers may pass temporary or dynamically formatted ids.
+            ///
+            /// If the runtime cannot start or track the timer helper, this
+            /// API currently has no failure callback and the timer message may
+            /// never be delivered.
             pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx.pending_ticks[0..self.ctx.pending_ticks_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
@@ -205,6 +212,10 @@ pub fn Ctx(comptime Msg: type) type {
             ///
             /// The id is copied into runtime-owned memory while queueing, so
             /// callers may pass temporary or dynamically formatted ids.
+            ///
+            /// If the runtime cannot start or track the timer helper, this
+            /// API currently has no failure callback and the timer message may
+            /// never be delivered.
             pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx.pending_everys[0..self.ctx.pending_everys_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {

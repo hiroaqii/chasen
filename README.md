@@ -256,11 +256,18 @@ Task effects are delivered as either the task's success message or the required
 terminal foreground command is running, completed task results are queued by the
 event loop and delivered after Chasen resumes. Apps must still use request ids,
 generations, or other identity checks for stale results; foreground completion
-ordering is not a correctness contract.
+ordering is not a correctness contract. Started task futures are awaited during
+terminal shutdown, so task functions should eventually return; a task that never
+returns can block shutdown.
 
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
 waits for the interval again. It does not compensate for app update/render time.
+If the runtime cannot start or track a `tick` / `every` helper, there is no
+timer failure callback and the timer message may never be delivered. Timers are
+canceled during shutdown, but completed one-shot timer handles can remain
+tracked until shutdown, so long-lived apps should avoid creating unbounded
+unique timer ids.
 `ctx.frame().request` requests one future frame event and is coalesced while a
 frame is already in flight; animation code should use `Frame.delta_ns` or
 `Frame.now_ns` for time-based movement instead of assuming an exact frame rate.
