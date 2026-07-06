@@ -608,7 +608,20 @@ fn applyMsg(
     return !app_ctx.redraw_suppressed;
 }
 
-/// Drains effects queued in Ctx using the documented runtime order.
+/// Drains effects queued in Ctx using the documented runtime order:
+///
+/// 1. foreground commands
+/// 2. async tasks
+/// 3. pending timer cancels
+/// 4. pending ticks
+/// 5. pending everys
+/// 6. terminal images
+/// 7. frame request
+///
+/// Timer cancels must run after foreground callbacks have had a chance to
+/// queue effects, but before tick/every spawn. That makes `cancel(id)` apply
+/// to timers that were already running before this drain pass, while allowing
+/// a same-update `cancel(id); tick(id, ...)` restart to keep the replacement.
 ///
 /// Trace and stats boundaries stay at the call sites because init, initial
 /// winsize, and main-loop updates account for effect drain differently.
@@ -641,10 +654,10 @@ fn drainPendingEffects(
     const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
     result.needs_render = result.needs_render or foreground_needs_render;
     try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
+    processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
     try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
     try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended);
     try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
-    processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
     startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
     return result;
 }

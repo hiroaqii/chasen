@@ -230,6 +230,11 @@ pub fn Ctx(comptime Msg: type) type {
             /// The id is copied into runtime-owned memory while queueing. If
             /// the cancel queue is full, an error is returned instead of
             /// silently dropping the request.
+            ///
+            /// If the same update queues `cancel(id)` and then queues a
+            /// `tick(id, ...)` or `every(id, ...)`, the cancel applies to the
+            /// previously running timer and the newly queued replacement
+            /// remains scheduled.
             pub fn cancel(self: TimerEffects, id: []const u8) TimerCancelError!void {
                 try self.ctx.cancelTimerInternal(id);
             }
@@ -673,6 +678,22 @@ test "Ctx timer cancel queues id for runtime cancellation" {
     const cancels = ctx_val.pendingCancelSlice();
     try std.testing.expectEqual(@as(usize, 1), cancels.len);
     try std.testing.expectEqualStrings("running_timer", cancels[0]);
+}
+
+test "Ctx timer cancel then tick queues cancel and replacement" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.clearPendingEffectCopies();
+
+    try ctx_val.timer().cancel("restart");
+    try ctx_val.timer().tick("restart", 1_000_000_000, .timeout);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+
+    try std.testing.expectEqualStrings("restart", ctx_val.pendingCancelSlice()[0]);
+    try std.testing.expectEqualStrings("restart", ctx_val.pendingTickSlice()[0].id);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), ctx_val.pendingTickSlice()[0].after_ns);
 }
 
 test "Ctx timer cancel leaves pending timers unchanged when cancel queue is full" {
