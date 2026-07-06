@@ -262,18 +262,19 @@ returns can block shutdown.
 
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
-waits for the interval again. It does not compensate for app update/render time.
+waits for the interval again. Timer intervals do not compensate for app
+update/render time.
 If the runtime cannot start or track a `tick` / `every` helper, there is no
 timer failure callback and the timer message may never be delivered. Timers are
 canceled during shutdown, but completed one-shot timer handles can remain
 tracked until shutdown, so long-lived apps should avoid creating unbounded
 unique timer ids.
-`ctx.frame().request` requests one future frame event and is coalesced while a
-frame is already in flight; animation code should use `Frame.delta_ns` or
-`Frame.now_ns` for time-based movement instead of assuming an exact frame rate.
-If a foreground command interrupts a scheduled frame, Chasen drops the stale
-frame and requests a fresh one after returning; the next delivered frame can
-therefore include a large elapsed delta.
+`ctx.frame().request` requests one future frame event paced from the last
+delivered frame, and is coalesced while a frame is already in flight. Animation
+code should use `Frame.delta_ns` or `Frame.now_ns` for time-based movement
+instead of assuming an exact frame rate. If an app has been idle without
+frames, or if a foreground command interrupts a scheduled frame, the next
+delivered frame can include a large elapsed delta.
 
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct

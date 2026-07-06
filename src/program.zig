@@ -888,9 +888,10 @@ fn startPendingFrame(
 
     if (frame_in_flight.*) return;
 
+    const after_ns = frameDelayNs(last_frame_ns, timestampNs(io));
     frame_future.* = io.concurrent(
         FrameHelper(Msg).run,
-        .{ frame_interval_ns, last_frame_ns, next_frame_index, io, loop, suspended },
+        .{ after_ns, last_frame_ns, next_frame_index, io, loop, suspended },
     ) catch return;
     frame_in_flight.* = true;
 }
@@ -1071,6 +1072,10 @@ fn timestampNs(io: std.Io) u64 {
 fn deltaNs(previous_ns: u64, now_ns: u64) u64 {
     if (now_ns <= previous_ns) return 0;
     return now_ns - previous_ns;
+}
+
+fn frameDelayNs(last_frame_ns: u64, now_ns: u64) u64 {
+    return frame_interval_ns -| deltaNs(last_frame_ns, now_ns);
 }
 
 fn eventKind(event: anytype) root.RuntimeEventKind {
@@ -1291,6 +1296,14 @@ test "deltaNs clamps non-monotonic timestamps" {
     try std.testing.expectEqual(@as(u64, 5), deltaNs(10, 15));
     try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 10));
     try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 9));
+}
+
+test "frameDelayNs paces relative to last delivered frame" {
+    try std.testing.expectEqual(frame_interval_ns, frameDelayNs(100, 100));
+    try std.testing.expectEqual(frame_interval_ns - 5, frameDelayNs(100, 105));
+    try std.testing.expectEqual(@as(u64, 0), frameDelayNs(100, 100 + frame_interval_ns));
+    try std.testing.expectEqual(@as(u64, 0), frameDelayNs(100, 101 + frame_interval_ns));
+    try std.testing.expectEqual(frame_interval_ns, frameDelayNs(100, 99));
 }
 
 test "elapsedNs uses deltaNs clamping" {
