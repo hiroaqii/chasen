@@ -103,21 +103,27 @@ pub const ComponentStateStore = struct {
     }
 
     pub fn clearNamespace(self: *ComponentStateStore, prefix: []const u8) void {
+        var matching_keys: [32][]const u8 = undefined;
+
         while (true) {
-            var found: ?[]const u8 = null;
+            var matching_count: usize = 0;
             var iter = self.map.iterator();
             while (iter.next()) |entry| {
-                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                    found = entry.key_ptr.*;
-                    break;
+                const key = entry.key_ptr.*;
+                if (std.mem.startsWith(u8, key, prefix)) {
+                    matching_keys[matching_count] = key;
+                    matching_count += 1;
+                    if (matching_count == matching_keys.len) break;
                 }
             }
 
-            if (found) |id| {
+            // Keys are arena-owned and remove() does not reclaim arena memory,
+            // so collected key slices remain valid after iteration ends.
+            for (matching_keys[0..matching_count]) |id| {
                 self.remove(id);
-            } else {
-                break;
             }
+
+            if (matching_count < matching_keys.len) break;
         }
     }
 
@@ -256,6 +262,96 @@ test "ComponentStateStore clearNamespace removes matching entries" {
     try std.testing.expect(store.get("screen/a", State) == null);
     try std.testing.expect(store.get("screen/b", State) == null);
     try std.testing.expect(store.get("other/c", State) != null);
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+test "ComponentStateStore clearNamespace leaves store unchanged when no ids match" {
+    const State = struct {
+        value: u32,
+
+        fn init(_: ComponentStateInitContext) !@This() {
+            return .{ .value = 1 };
+        }
+    };
+
+    var store = ComponentStateStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.getOrCreate("screen/a", State, State.init);
+    _ = try store.getOrCreate("other/b", State, State.init);
+
+    store.clearNamespace("missing/");
+
+    try std.testing.expect(store.get("screen/a", State) != null);
+    try std.testing.expect(store.get("other/b", State) != null);
+    try std.testing.expectEqual(@as(usize, 2), store.count());
+}
+
+test "ComponentStateStore clearNamespace empty prefix clears all entries" {
+    const State = struct {
+        counter: *u32,
+
+        fn init(ctx: ComponentStateInitContext) !@This() {
+            const counter = try ctx.allocator.create(u32);
+            counter.* = 0;
+            return .{ .counter = counter };
+        }
+
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+            self.counter.* += 1;
+        }
+    };
+
+    var store = ComponentStateStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const a = try store.getOrCreate("screen/a", State, State.init);
+    const b = try store.getOrCreate("other/b", State, State.init);
+    const a_counter = a.counter;
+    const b_counter = b.counter;
+
+    store.clearNamespace("");
+
+    try std.testing.expectEqual(@as(u32, 1), a_counter.*);
+    try std.testing.expectEqual(@as(u32, 1), b_counter.*);
+    try std.testing.expect(store.get("screen/a", State) == null);
+    try std.testing.expect(store.get("other/b", State) == null);
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+}
+
+test "ComponentStateStore clearNamespace removes more entries than one chunk" {
+    const State = struct {
+        counter: *u32,
+
+        fn init(ctx: ComponentStateInitContext) !@This() {
+            const counter = try ctx.allocator.create(u32);
+            counter.* = 0;
+            return .{ .counter = counter };
+        }
+
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+            self.counter.* += 1;
+        }
+    };
+
+    var store = ComponentStateStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    var counters: [40]*u32 = undefined;
+    for (&counters, 0..) |*counter, i| {
+        const id = try std.fmt.allocPrint(std.testing.allocator, "screen/{d}", .{i});
+        defer std.testing.allocator.free(id);
+        const state = try store.getOrCreate(id, State, State.init);
+        counter.* = state.counter;
+    }
+    _ = try store.getOrCreate("other/kept", State, State.init);
+
+    store.clearNamespace("screen/");
+
+    for (counters) |counter| {
+        try std.testing.expectEqual(@as(u32, 1), counter.*);
+    }
+    try std.testing.expect(store.get("other/kept", State) != null);
     try std.testing.expectEqual(@as(usize, 1), store.count());
 }
 
