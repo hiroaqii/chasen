@@ -51,8 +51,8 @@ const BracketedPasteAccumulator = struct {
     failed: bool = false,
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn start(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
-        self.cancel(allocator);
+    fn start(self: *BracketedPasteAccumulator) void {
+        self.cancel();
         self.active = true;
     }
 
@@ -111,8 +111,7 @@ const BracketedPasteAccumulator = struct {
         self.bytes.clearRetainingCapacity();
     }
 
-    fn cancel(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
-        _ = allocator;
+    fn cancel(self: *BracketedPasteAccumulator) void {
         self.active = false;
         self.failed = false;
         self.bytes.clearRetainingCapacity();
@@ -445,12 +444,12 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                 needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats, opts);
             },
             .paste => |text| {
-                bracketed_paste.cancel(allocator);
+                bracketed_paste.cancel();
                 defer allocator.free(text);
                 needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats, opts);
             },
             .paste_start => {
-                bracketed_paste.start(allocator);
+                bracketed_paste.start();
                 if (stats) |*s| s.event_kind = .paste;
             },
             .paste_end => {
@@ -487,7 +486,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
         if (app_ctx.hasPendingForegroundCommands()) {
-            bracketed_paste.cancel(allocator);
+            bracketed_paste.cancel();
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
@@ -1173,7 +1172,7 @@ test "BracketedPasteAccumulator combines pasted key text" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = "hello" });
     try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.enter });
     try paste.appendKey(allocator, .{ .codepoint = '世', .text = "世界" });
@@ -1188,9 +1187,9 @@ test "BracketedPasteAccumulator restarts nested paste" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "old" });
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = 'n', .text = "new" });
 
     const text = paste.finish(allocator).?;
@@ -1203,7 +1202,7 @@ test "BracketedPasteAccumulator ignores non-text special keys" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.up });
     try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.left_shift });
 
@@ -1216,7 +1215,7 @@ test "BracketedPasteAccumulator drops invalid utf8" {
     defer paste.deinit(allocator);
 
     var invalid = [_]u8{0xff};
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = invalid[0..] });
 
     try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
@@ -1227,7 +1226,7 @@ test "BracketedPasteAccumulator failure swallows until paste end" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     paste.fail();
     try paste.appendKey(allocator, .{ .codepoint = 't', .text = "tail" });
 
@@ -1243,7 +1242,7 @@ test "BracketedPasteAccumulator maps ctrl-j paste key to newline" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
     try paste.appendKey(allocator, .{ .codepoint = 'j', .mods = .{ .ctrl = true } });
     try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
@@ -1258,7 +1257,7 @@ test "BracketedPasteAccumulator preserves direct line-feed codepoint" {
     var paste: BracketedPasteAccumulator = .{};
     defer paste.deinit(allocator);
 
-    paste.start(allocator);
+    paste.start();
     try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
     try paste.appendKey(allocator, .{ .codepoint = '\n' });
     try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
