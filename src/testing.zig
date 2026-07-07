@@ -140,7 +140,7 @@ pub const TestSurface = struct {
 /// ```
 /// var tc: chasen.testing.TestCtx(App.Msg) = .{};
 /// try app.update(.some_msg, &tc.ctx);
-/// try std.testing.expect(tc.ctx.should_quit);
+/// try std.testing.expect(tc.shouldQuit());
 /// ```
 pub fn TestCtx(comptime Msg: type) type {
     return struct {
@@ -149,14 +149,50 @@ pub fn TestCtx(comptime Msg: type) type {
         /// Reset per-update transient state so this wrapper can be
         /// reused across multiple `update` calls in one test.
         ///
-        /// Clears pending side effects and `redraw_suppressed`.
-        /// Preserves `should_quit` and allocator.
+        /// Clears pending side effects and redraw suppression.
+        /// Preserves the quit request and allocator.
         pub fn resetTransient(self: *@This()) void {
-            self.ctx.pending_tasks_len = 0;
-            self.ctx.pending_tasks_with_len = 0;
-            self.ctx.clearPendingEffectCopies();
-            self.ctx.redraw_suppressed = false;
-            self.ctx.frame_requested = false;
+            self.ctx.runtimeClearPendingEffectCopies();
+            _ = self.ctx.takePendingTasks();
+            _ = self.ctx.takePendingTasksWith();
+            self.ctx.resetRedrawSuppressed();
+            _ = self.ctx.takeFrameRequest();
+        }
+
+        pub fn shouldQuit(self: *const @This()) bool {
+            return self.ctx.shouldQuit();
+        }
+
+        pub fn pendingTaskCount(self: *const @This()) usize {
+            return self.ctx._pending_tasks_len;
+        }
+
+        pub fn pendingTaskWithCount(self: *const @This()) usize {
+            return self.ctx._pending_tasks_with_len;
+        }
+
+        pub fn pendingTickCount(self: *const @This()) usize {
+            return self.ctx._pending_ticks_len;
+        }
+
+        pub fn pendingEveryCount(self: *const @This()) usize {
+            return self.ctx._pending_everys_len;
+        }
+
+        pub fn pendingCancelCount(self: *const @This()) usize {
+            return self.ctx._pending_cancels_len;
+        }
+
+        pub fn hasPendingForegroundCommands(self: *const @This()) bool {
+            return self.ctx.hasPendingForegroundCommands();
+        }
+
+        pub fn frameRequested(self: *const @This()) bool {
+            return self.ctx._frame_requested;
+        }
+
+        pub fn redrawSuppressed(self: *const @This()) bool {
+            return self.ctx.redrawWasSuppressed();
         }
     };
 }
@@ -165,8 +201,8 @@ pub fn TestCtx(comptime Msg: type) type {
 
 test "TestCtx initialises with valid allocator and default state" {
     var tc: TestCtx(TestMsg) = .{};
-    try std.testing.expectEqual(false, tc.ctx.should_quit);
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_tasks_len);
+    try std.testing.expectEqual(false, tc.shouldQuit());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskCount());
 
     // _allocator is usable
     const ally = tc.ctx.allocator();
@@ -176,7 +212,7 @@ test "TestCtx initialises with valid allocator and default state" {
     try std.testing.expectEqual(@as(u32, 42), ptr.*);
 }
 
-test "resetTransient clears pending queues and redraw_suppressed" {
+test "resetTransient clears pending queues and redraw suppression" {
     var tc: TestCtx(TestMsg) = .{};
 
     // Accumulate some state
@@ -195,32 +231,32 @@ test "resetTransient clears pending queues and redraw_suppressed" {
     tc.ctx.redraw().skip();
     tc.ctx.frame().request();
 
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_tasks_len);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_ticks_len);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_everys_len);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx.pending_cancels_len);
-    try std.testing.expectEqual(true, tc.ctx.redraw_suppressed);
-    try std.testing.expectEqual(true, tc.ctx.frame_requested);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingTaskCount());
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingTickCount());
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
+    try std.testing.expectEqual(true, tc.redrawSuppressed());
+    try std.testing.expectEqual(true, tc.frameRequested());
 
     tc.resetTransient();
 
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_tasks_len);
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_tasks_with_len);
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_ticks_len);
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_everys_len);
-    try std.testing.expectEqual(@as(u8, 0), tc.ctx.pending_cancels_len);
-    try std.testing.expectEqual(false, tc.ctx.redraw_suppressed);
-    try std.testing.expectEqual(false, tc.ctx.frame_requested);
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskCount());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskWithCount());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingEveryCount());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingCancelCount());
+    try std.testing.expectEqual(false, tc.redrawSuppressed());
+    try std.testing.expectEqual(false, tc.frameRequested());
 }
 
-test "resetTransient preserves should_quit" {
+test "resetTransient preserves quit request" {
     var tc: TestCtx(TestMsg) = .{};
 
     tc.ctx.quit();
-    try std.testing.expectEqual(true, tc.ctx.should_quit);
+    try std.testing.expectEqual(true, tc.shouldQuit());
 
     tc.resetTransient();
-    try std.testing.expectEqual(true, tc.ctx.should_quit);
+    try std.testing.expectEqual(true, tc.shouldQuit());
 }
 
 test "update call pattern with a counter app" {
@@ -252,7 +288,7 @@ test "update call pattern with a counter app" {
     try std.testing.expectEqual(@as(i32, 1), app.count);
 
     try app.update(.quit_msg, &tc.ctx);
-    try std.testing.expectEqual(true, tc.ctx.should_quit);
+    try std.testing.expectEqual(true, tc.shouldQuit());
 }
 
 const TestMsg = union(enum) { inc, dec };

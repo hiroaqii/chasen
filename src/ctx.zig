@@ -84,27 +84,27 @@ pub fn Ctx(comptime Msg: type) type {
         // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
         _allocator: std.mem.Allocator = undefined,
-        should_quit: bool = false,
-        pending_tasks: [max_tasks]TaskEntry = undefined,
-        pending_tasks_len: u8 = 0,
-        pending_tasks_with: [max_tasks]TaskWithEntry = undefined,
-        pending_tasks_with_len: u8 = 0,
-        pending_ticks: [max_ticks]TickEntry = undefined,
-        pending_ticks_len: u8 = 0,
-        pending_everys: [max_everys]EveryEntry = undefined,
-        pending_everys_len: u8 = 0,
-        pending_cancels: [max_cancels][]const u8 = undefined,
-        pending_cancels_len: u8 = 0,
-        pending_terminal_image_loads: [max_terminal_image_loads]TerminalImageLoadEntry = undefined,
-        pending_terminal_image_loads_len: u8 = 0,
-        next_terminal_image_request_id: u64 = 1,
-        pending_terminal_image_unloads: [max_terminal_image_unloads]terminal_image.TerminalImageHandle = undefined,
-        pending_terminal_image_unloads_len: u8 = 0,
-        pending_foreground_commands: [max_foreground_commands]ForegroundCommandEntry = undefined,
-        pending_foreground_commands_len: u8 = 0,
-        next_foreground_command_request_id: u64 = 1,
-        redraw_suppressed: bool = false,
-        frame_requested: bool = false,
+        _should_quit: bool = false,
+        _pending_tasks: [max_tasks]TaskEntry = undefined,
+        _pending_tasks_len: u8 = 0,
+        _pending_tasks_with: [max_tasks]TaskWithEntry = undefined,
+        _pending_tasks_with_len: u8 = 0,
+        _pending_ticks: [max_ticks]TickEntry = undefined,
+        _pending_ticks_len: u8 = 0,
+        _pending_everys: [max_everys]EveryEntry = undefined,
+        _pending_everys_len: u8 = 0,
+        _pending_cancels: [max_cancels][]const u8 = undefined,
+        _pending_cancels_len: u8 = 0,
+        _pending_terminal_image_loads: [max_terminal_image_loads]TerminalImageLoadEntry = undefined,
+        _pending_terminal_image_loads_len: u8 = 0,
+        _next_terminal_image_request_id: u64 = 1,
+        _pending_terminal_image_unloads: [max_terminal_image_unloads]terminal_image.TerminalImageHandle = undefined,
+        _pending_terminal_image_unloads_len: u8 = 0,
+        _pending_foreground_commands: [max_foreground_commands]ForegroundCommandEntry = undefined,
+        _pending_foreground_commands_len: u8 = 0,
+        _next_foreground_command_request_id: u64 = 1,
+        _redraw_suppressed: bool = false,
+        _frame_requested: bool = false,
 
         pub const FrameEffects = struct {
             ctx: *Self,
@@ -114,7 +114,7 @@ pub fn Ctx(comptime Msg: type) type {
             /// The runtime coalesces repeated calls while a frame is already
             /// pending. Call this again from the frame update to keep animating.
             pub fn request(self: FrameEffects) void {
-                self.ctx.frame_requested = true;
+                self.ctx._frame_requested = true;
             }
         };
 
@@ -128,7 +128,7 @@ pub fn Ctx(comptime Msg: type) type {
             /// the visual state and a redraw would be wasteful. This is a
             /// one-shot request; the runtime clears it before the next update.
             pub fn skip(self: RedrawEffects) void {
-                self.ctx.redraw_suppressed = true;
+                self.ctx._redraw_suppressed = true;
             }
         };
 
@@ -144,12 +144,12 @@ pub fn Ctx(comptime Msg: type) type {
             /// Started task futures are awaited during terminal shutdown and
             /// should eventually return.
             pub fn spawn(self: TaskEffects, opts: SpawnOptions) error{TaskLimitExceeded}!void {
-                if (self.ctx.pending_tasks_len + self.ctx.pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
-                self.ctx.pending_tasks[self.ctx.pending_tasks_len] = .{
+                if (self.ctx._pending_tasks_len + self.ctx._pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
+                self.ctx._pending_tasks[self.ctx._pending_tasks_len] = .{
                     .run = opts.run,
                     .failed = opts.failed,
                 };
-                self.ctx.pending_tasks_len += 1;
+                self.ctx._pending_tasks_len += 1;
             }
 
             /// Spawn an async task with captured context.
@@ -161,14 +161,14 @@ pub fn Ctx(comptime Msg: type) type {
                 self: TaskEffects,
                 opts: SpawnWithOptions,
             ) error{TaskLimitExceeded}!void {
-                if (self.ctx.pending_tasks_len + self.ctx.pending_tasks_with_len >= max_tasks)
+                if (self.ctx._pending_tasks_len + self.ctx._pending_tasks_with_len >= max_tasks)
                     return error.TaskLimitExceeded;
-                self.ctx.pending_tasks_with[self.ctx.pending_tasks_with_len] = .{
+                self.ctx._pending_tasks_with[self.ctx._pending_tasks_with_len] = .{
                     .ctx = opts.ctx,
                     .run = opts.run,
                     .failed = opts.failed,
                 };
-                self.ctx.pending_tasks_with_len += 1;
+                self.ctx._pending_tasks_with_len += 1;
             }
         };
 
@@ -188,20 +188,20 @@ pub fn Ctx(comptime Msg: type) type {
             /// API currently has no failure callback and the timer message may
             /// never be delivered.
             pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.ctx.pending_ticks[0..self.ctx.pending_ticks_len]) |*entry| {
+                for (self.ctx._pending_ticks[0..self.ctx._pending_ticks_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
                         entry.after_ns = after_ns;
                         entry.msg = msg;
                         return;
                     }
                 }
-                if (self.ctx.pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
-                self.ctx.pending_ticks[self.ctx.pending_ticks_len] = .{
+                if (self.ctx._pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
+                self.ctx._pending_ticks[self.ctx._pending_ticks_len] = .{
                     .id = try self.ctx._allocator.dupe(u8, id),
                     .after_ns = after_ns,
                     .msg = msg,
                 };
-                self.ctx.pending_ticks_len += 1;
+                self.ctx._pending_ticks_len += 1;
             }
 
             /// Schedule a repeating timer.
@@ -217,20 +217,20 @@ pub fn Ctx(comptime Msg: type) type {
             /// API currently has no failure callback and the timer message may
             /// never be delivered.
             pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.ctx.pending_everys[0..self.ctx.pending_everys_len]) |*entry| {
+                for (self.ctx._pending_everys[0..self.ctx._pending_everys_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
                         entry.interval_ns = interval_ns;
                         entry.msg = msg;
                         return;
                     }
                 }
-                if (self.ctx.pending_everys_len >= max_everys) return error.TimerLimitExceeded;
-                self.ctx.pending_everys[self.ctx.pending_everys_len] = .{
+                if (self.ctx._pending_everys_len >= max_everys) return error.TimerLimitExceeded;
+                self.ctx._pending_everys[self.ctx._pending_everys_len] = .{
                     .id = try self.ctx._allocator.dupe(u8, id),
                     .interval_ns = interval_ns,
                     .msg = msg,
                 };
-                self.ctx.pending_everys_len += 1;
+                self.ctx._pending_everys_len += 1;
             }
 
             /// Cancel a timer by id.
@@ -271,28 +271,28 @@ pub fn Ctx(comptime Msg: type) type {
                 loaded_fn: TerminalImageLoadedFn,
                 failed_fn: TerminalImageFailedFn,
             ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!terminal_image.TerminalImageRequestId {
-                if (self.ctx.pending_terminal_image_loads_len >= max_terminal_image_loads)
+                if (self.ctx._pending_terminal_image_loads_len >= max_terminal_image_loads)
                     return error.TerminalImageLoadLimitExceeded;
 
                 const copied_path = try self.ctx._allocator.dupe(u8, path);
-                const request_id = terminal_image.TerminalImageRequestId{ .id = self.ctx.next_terminal_image_request_id };
-                self.ctx.next_terminal_image_request_id +%= 1;
-                self.ctx.pending_terminal_image_loads[self.ctx.pending_terminal_image_loads_len] = .{
+                const request_id = terminal_image.TerminalImageRequestId{ .id = self.ctx._next_terminal_image_request_id };
+                self.ctx._next_terminal_image_request_id +%= 1;
+                self.ctx._pending_terminal_image_loads[self.ctx._pending_terminal_image_loads_len] = .{
                     .request_id = request_id,
                     .path = copied_path,
                     .loaded = loaded_fn,
                     .failed = failed_fn,
                 };
-                self.ctx.pending_terminal_image_loads_len += 1;
+                self.ctx._pending_terminal_image_loads_len += 1;
                 return request_id;
             }
 
             /// Queue a terminal image handle for release by the runtime.
             pub fn unload(self: ImageEffects, handle: terminal_image.TerminalImageHandle) error{TerminalImageUnloadLimitExceeded}!void {
-                if (self.ctx.pending_terminal_image_unloads_len >= max_terminal_image_unloads)
+                if (self.ctx._pending_terminal_image_unloads_len >= max_terminal_image_unloads)
                     return error.TerminalImageUnloadLimitExceeded;
-                self.ctx.pending_terminal_image_unloads[self.ctx.pending_terminal_image_unloads_len] = handle;
-                self.ctx.pending_terminal_image_unloads_len += 1;
+                self.ctx._pending_terminal_image_unloads[self.ctx._pending_terminal_image_unloads_len] = handle;
+                self.ctx._pending_terminal_image_unloads_len += 1;
             }
         };
 
@@ -321,7 +321,7 @@ pub fn Ctx(comptime Msg: type) type {
                 opts: ForegroundCommandOptions,
             ) (error{ ForegroundCommandLimitExceeded, ForegroundCommandEmptyArgv } || std.mem.Allocator.Error)!foreground_command.ForegroundCommandRequestId {
                 if (opts.argv.len == 0) return error.ForegroundCommandEmptyArgv;
-                if (self.ctx.pending_foreground_commands_len >= max_foreground_commands)
+                if (self.ctx._pending_foreground_commands_len >= max_foreground_commands)
                     return error.ForegroundCommandLimitExceeded;
 
                 var copied_argv = try self.ctx._allocator.alloc([]const u8, opts.argv.len);
@@ -343,23 +343,28 @@ pub fn Ctx(comptime Msg: type) type {
                 errdefer if (copied_cwd) |cwd| self.ctx._allocator.free(cwd);
 
                 const request_id = foreground_command.ForegroundCommandRequestId{
-                    .id = self.ctx.next_foreground_command_request_id,
+                    .id = self.ctx._next_foreground_command_request_id,
                 };
-                self.ctx.next_foreground_command_request_id +%= 1;
-                self.ctx.pending_foreground_commands[self.ctx.pending_foreground_commands_len] = .{
+                self.ctx._next_foreground_command_request_id +%= 1;
+                self.ctx._pending_foreground_commands[self.ctx._pending_foreground_commands_len] = .{
                     .request_id = request_id,
                     .argv = copied_argv,
                     .cwd = copied_cwd,
                     .finished = opts.finished,
                 };
-                self.ctx.pending_foreground_commands_len += 1;
+                self.ctx._pending_foreground_commands_len += 1;
                 return request_id;
             }
         };
 
         /// Request the application to exit.
         pub fn quit(self: *@This()) void {
-            self.should_quit = true;
+            self._should_quit = true;
+        }
+
+        /// Return whether the application has requested runtime exit.
+        pub fn shouldQuit(self: *const @This()) bool {
+            return self._should_quit;
         }
 
         pub fn frame(self: *@This()) FrameEffects {
@@ -386,31 +391,71 @@ pub fn Ctx(comptime Msg: type) type {
             return .{ .ctx = self };
         }
 
-        /// Return a slice of pending tasks.
-        pub fn pendingSlice(self: *@This()) []const TaskEntry {
-            return self.pending_tasks[0..self.pending_tasks_len];
+        pub fn resetRedrawSuppressed(self: *@This()) void {
+            self._redraw_suppressed = false;
         }
 
-        /// Return a slice of pending task-with entries.
-        pub fn pendingTaskWithSlice(self: *@This()) []const TaskWithEntry {
-            return self.pending_tasks_with[0..self.pending_tasks_with_len];
+        pub fn redrawWasSuppressed(self: *const @This()) bool {
+            return self._redraw_suppressed;
         }
 
-        pub fn pendingTerminalImageLoadSlice(self: *@This()) []const TerminalImageLoadEntry {
-            return self.pending_terminal_image_loads[0..self.pending_terminal_image_loads_len];
+        pub fn takeFrameRequest(self: *@This()) bool {
+            const requested = self._frame_requested;
+            self._frame_requested = false;
+            return requested;
         }
 
-        pub fn pendingTerminalImageUnloadSlice(self: *@This()) []const terminal_image.TerminalImageHandle {
-            return self.pending_terminal_image_unloads[0..self.pending_terminal_image_unloads_len];
+        pub fn hasPendingForegroundCommands(self: *const @This()) bool {
+            return self._pending_foreground_commands_len > 0;
         }
 
-        pub fn pendingForegroundCommandSlice(self: *@This()) []const ForegroundCommandEntry {
-            return self.pending_foreground_commands[0..self.pending_foreground_commands_len];
+        pub fn takePendingTasks(self: *@This()) []const TaskEntry {
+            const pending = self._pending_tasks[0..self._pending_tasks_len];
+            self._pending_tasks_len = 0;
+            return pending;
         }
 
-        /// Return a slice of pending tick entries.
-        pub fn pendingTickSlice(self: *@This()) []const TickEntry {
-            return self.pending_ticks[0..self.pending_ticks_len];
+        pub fn takePendingTasksWith(self: *@This()) []const TaskWithEntry {
+            const pending = self._pending_tasks_with[0..self._pending_tasks_with_len];
+            self._pending_tasks_with_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingTicks(self: *@This()) []const TickEntry {
+            const pending = self._pending_ticks[0..self._pending_ticks_len];
+            self._pending_ticks_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingEverys(self: *@This()) []const EveryEntry {
+            const pending = self._pending_everys[0..self._pending_everys_len];
+            self._pending_everys_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingCancels(self: *@This()) []const []const u8 {
+            const pending = self._pending_cancels[0..self._pending_cancels_len];
+            self._pending_cancels_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingTerminalImageLoads(self: *@This()) []const TerminalImageLoadEntry {
+            const pending = self._pending_terminal_image_loads[0..self._pending_terminal_image_loads_len];
+            self._pending_terminal_image_loads_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingTerminalImageUnloads(self: *@This()) []const terminal_image.TerminalImageHandle {
+            const pending = self._pending_terminal_image_unloads[0..self._pending_terminal_image_unloads_len];
+            self._pending_terminal_image_unloads_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingForegroundCommands(self: *@This()) []const ForegroundCommandEntry {
+            comptime std.debug.assert(max_foreground_commands == 1);
+            const pending = self._pending_foreground_commands[0..self._pending_foreground_commands_len];
+            self._pending_foreground_commands_len = 0;
+            return pending;
         }
 
         /// Return the current monotonic timestamp.
@@ -428,25 +473,20 @@ pub fn Ctx(comptime Msg: type) type {
             return self._io;
         }
 
-        /// Return a slice of pending every entries.
-        pub fn pendingEverySlice(self: *@This()) []const EveryEntry {
-            return self.pending_everys[0..self.pending_everys_len];
-        }
-
         fn cancelTimerInternal(self: *@This(), id: []const u8) TimerCancelError!void {
-            if (self.pending_cancels_len >= max_cancels) return error.TimerCancelLimitExceeded;
+            if (self._pending_cancels_len >= max_cancels) return error.TimerCancelLimitExceeded;
             const copied_id = try self._allocator.dupe(u8, id);
             errdefer self._allocator.free(copied_id);
 
             // Remove from pending ticks (swap-remove).
             {
                 var i: u8 = 0;
-                while (i < self.pending_ticks_len) {
-                    if (std.mem.eql(u8, self.pending_ticks[i].id, id)) {
-                        self._allocator.free(self.pending_ticks[i].id);
-                        self.pending_ticks_len -= 1;
-                        if (i < self.pending_ticks_len) {
-                            self.pending_ticks[i] = self.pending_ticks[self.pending_ticks_len];
+                while (i < self._pending_ticks_len) {
+                    if (std.mem.eql(u8, self._pending_ticks[i].id, id)) {
+                        self._allocator.free(self._pending_ticks[i].id);
+                        self._pending_ticks_len -= 1;
+                        if (i < self._pending_ticks_len) {
+                            self._pending_ticks[i] = self._pending_ticks[self._pending_ticks_len];
                         }
                     } else {
                         i += 1;
@@ -456,12 +496,12 @@ pub fn Ctx(comptime Msg: type) type {
             // Remove from pending everys (swap-remove).
             {
                 var i: u8 = 0;
-                while (i < self.pending_everys_len) {
-                    if (std.mem.eql(u8, self.pending_everys[i].id, id)) {
-                        self._allocator.free(self.pending_everys[i].id);
-                        self.pending_everys_len -= 1;
-                        if (i < self.pending_everys_len) {
-                            self.pending_everys[i] = self.pending_everys[self.pending_everys_len];
+                while (i < self._pending_everys_len) {
+                    if (std.mem.eql(u8, self._pending_everys[i].id, id)) {
+                        self._allocator.free(self._pending_everys[i].id);
+                        self._pending_everys_len -= 1;
+                        if (i < self._pending_everys_len) {
+                            self._pending_everys[i] = self._pending_everys[self._pending_everys_len];
                         }
                     } else {
                         i += 1;
@@ -469,13 +509,8 @@ pub fn Ctx(comptime Msg: type) type {
                 }
             }
             // Queue for runtime to cancel running timers.
-            self.pending_cancels[self.pending_cancels_len] = copied_id;
-            self.pending_cancels_len += 1;
-        }
-
-        /// Return a slice of pending cancel ids.
-        pub fn pendingCancelSlice(self: *@This()) []const []const u8 {
-            return self.pending_cancels[0..self.pending_cancels_len];
+            self._pending_cancels[self._pending_cancels_len] = copied_id;
+            self._pending_cancels_len += 1;
         }
 
         /// Release copied data for queued effects that have not been handed to
@@ -484,37 +519,37 @@ pub fn Ctx(comptime Msg: type) type {
         /// App callbacks may queue effects and then return an error before the
         /// runtime drains them. This cleanup is for that unwind path; normally
         /// the runtime consumes and frees these copies while draining effects.
-        pub fn clearPendingEffectCopies(self: *@This()) void {
-            for (self.pending_ticks[0..self.pending_ticks_len]) |entry| {
+        pub fn runtimeClearPendingEffectCopies(self: *@This()) void {
+            for (self._pending_ticks[0..self._pending_ticks_len]) |entry| {
                 self._allocator.free(entry.id);
             }
-            self.pending_ticks_len = 0;
+            self._pending_ticks_len = 0;
 
-            for (self.pending_everys[0..self.pending_everys_len]) |entry| {
+            for (self._pending_everys[0..self._pending_everys_len]) |entry| {
                 self._allocator.free(entry.id);
             }
-            self.pending_everys_len = 0;
+            self._pending_everys_len = 0;
 
-            for (self.pending_cancels[0..self.pending_cancels_len]) |id| {
+            for (self._pending_cancels[0..self._pending_cancels_len]) |id| {
                 self._allocator.free(id);
             }
-            self.pending_cancels_len = 0;
+            self._pending_cancels_len = 0;
 
-            for (self.pending_terminal_image_loads[0..self.pending_terminal_image_loads_len]) |entry| {
+            for (self._pending_terminal_image_loads[0..self._pending_terminal_image_loads_len]) |entry| {
                 self._allocator.free(entry.path);
             }
-            self.pending_terminal_image_loads_len = 0;
+            self._pending_terminal_image_loads_len = 0;
 
-            self.pending_terminal_image_unloads_len = 0;
+            self._pending_terminal_image_unloads_len = 0;
 
-            for (self.pending_foreground_commands[0..self.pending_foreground_commands_len]) |entry| {
+            for (self._pending_foreground_commands[0..self._pending_foreground_commands_len]) |entry| {
                 for (entry.argv) |arg| {
                     self._allocator.free(arg);
                 }
                 self._allocator.free(entry.argv);
                 if (entry.cwd) |cwd| self._allocator.free(cwd);
             }
-            self.pending_foreground_commands_len = 0;
+            self._pending_foreground_commands_len = 0;
         }
     };
 }
@@ -533,12 +568,12 @@ test "Ctx spawn accumulates tasks" {
     };
 
     try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_tasks_len);
 
     try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_tasks_len);
 
-    const slice = ctx_val.pendingSlice();
+    const slice = ctx_val._pending_tasks[0..ctx_val._pending_tasks_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
     try std.testing.expectEqual(@as(*const fn (TaskFailure) TestMsg, task.failed), slice[0].failed);
 }
@@ -547,9 +582,9 @@ test "Ctx frame request marks a pending frame request" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
 
-    try std.testing.expectEqual(false, ctx_val.frame_requested);
+    try std.testing.expectEqual(false, ctx_val._frame_requested);
     ctx_val.frame().request();
-    try std.testing.expectEqual(true, ctx_val.frame_requested);
+    try std.testing.expectEqual(true, ctx_val._frame_requested);
 }
 
 test "Ctx spawn returns error when task queue is full" {
@@ -572,15 +607,15 @@ test "Ctx spawn returns error when task queue is full" {
 test "Ctx tick accumulates entries" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
     try ctx_val.timer().tick("t2", 500_000_000, .ping);
-    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_ticks_len);
 
-    const slice = ctx_val.pendingTickSlice();
+    const slice = ctx_val._pending_ticks[0..ctx_val._pending_ticks_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
     try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].after_ns);
     try std.testing.expect(slice[0].msg == .timeout);
@@ -591,7 +626,7 @@ test "Ctx tick accumulates entries" {
 test "Ctx tick returns error when timer queue is full" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -603,15 +638,15 @@ test "Ctx tick returns error when timer queue is full" {
 test "Ctx every accumulates entries" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     try ctx_val.timer().every("e2", 500_000_000, .heartbeat);
-    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_everys_len);
 
-    const slice = ctx_val.pendingEverySlice();
+    const slice = ctx_val._pending_everys[0..ctx_val._pending_everys_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
     try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].interval_ns);
     try std.testing.expect(slice[0].msg == .tick_msg);
@@ -622,7 +657,7 @@ test "Ctx every accumulates entries" {
 test "Ctx every returns error when timer queue is full" {
     const TestMsg = union(enum) { tick_msg };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -634,16 +669,16 @@ test "Ctx every returns error when timer queue is full" {
 test "Ctx tick same id overwrites existing entry" {
     const TestMsg = union(enum) { timeout, ping };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
     // Same id should overwrite, not grow the queue.
     try ctx_val.timer().tick("timer1", 2_000_000_000, .ping);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
-    const slice = ctx_val.pendingTickSlice();
+    const slice = ctx_val._pending_ticks[0..ctx_val._pending_ticks_len];
     try std.testing.expectEqual(@as(u64, 2_000_000_000), slice[0].after_ns);
     try std.testing.expect(slice[0].msg == .ping);
 }
@@ -651,16 +686,16 @@ test "Ctx tick same id overwrites existing entry" {
 test "Ctx every same id overwrites existing entry" {
     const TestMsg = union(enum) { tick_msg, heartbeat };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     // Same id should overwrite.
     try ctx_val.timer().every("refresh", 500_000_000, .heartbeat);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
-    const slice = ctx_val.pendingEverySlice();
+    const slice = ctx_val._pending_everys[0..ctx_val._pending_everys_len];
     try std.testing.expectEqual(@as(u64, 500_000_000), slice[0].interval_ns);
     try std.testing.expect(slice[0].msg == .heartbeat);
 }
@@ -668,30 +703,30 @@ test "Ctx every same id overwrites existing entry" {
 test "Ctx timer cancel removes from pending queues" {
     const TestMsg = union(enum) { timeout, tick_msg };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
     try ctx_val.timer().every("e1", 500_000_000, .tick_msg);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     try ctx_val.timer().cancel("t1");
-    try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_ticks_len);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     try ctx_val.timer().cancel("e1");
-    try std.testing.expectEqual(@as(u8, 0), ctx_val.pending_everys_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_everys_len);
 }
 
 test "Ctx timer cancel queues id for runtime cancellation" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().cancel("running_timer");
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_cancels_len);
 
-    const cancels = ctx_val.pendingCancelSlice();
+    const cancels = ctx_val._pending_cancels[0..ctx_val._pending_cancels_len];
     try std.testing.expectEqual(@as(usize, 1), cancels.len);
     try std.testing.expectEqualStrings("running_timer", cancels[0]);
 }
@@ -699,31 +734,31 @@ test "Ctx timer cancel queues id for runtime cancellation" {
 test "Ctx timer cancel then tick queues cancel and replacement" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     try ctx_val.timer().cancel("restart");
     try ctx_val.timer().tick("restart", 1_000_000_000, .timeout);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_cancels_len);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_cancels_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
-    try std.testing.expectEqualStrings("restart", ctx_val.pendingCancelSlice()[0]);
-    try std.testing.expectEqualStrings("restart", ctx_val.pendingTickSlice()[0].id);
-    try std.testing.expectEqual(@as(u64, 1_000_000_000), ctx_val.pendingTickSlice()[0].after_ns);
+    try std.testing.expectEqualStrings("restart", ctx_val._pending_cancels[0..ctx_val._pending_cancels_len][0]);
+    try std.testing.expectEqualStrings("restart", ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].id);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].after_ns);
 }
 
 test "Ctx timer cancel leaves pending timers unchanged when cancel queue is full" {
     const TestMsg = union(enum) { timeout };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     const cancel_ids = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7" };
     for (cancel_ids) |id| try ctx_val.timer().cancel(id);
     try ctx_val.timer().tick("pending", 1_000_000_000, .timeout);
 
     try std.testing.expectError(error.TimerCancelLimitExceeded, ctx_val.timer().cancel("pending"));
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_ticks_len);
-    try std.testing.expectEqualStrings("pending", ctx_val.pendingTickSlice()[0].id);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
+    try std.testing.expectEqualStrings("pending", ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].id);
 }
 
 test "Ctx spawnWith accumulates tasks" {
@@ -741,12 +776,12 @@ test "Ctx spawnWith accumulates tasks" {
     };
 
     try ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_tasks_with_len);
 
     try ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 2), ctx_val.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_tasks_with_len);
 
-    const slice = ctx_val.pendingTaskWithSlice();
+    const slice = ctx_val._pending_tasks_with[0..ctx_val._pending_tasks_with_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
     try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&dummy_ctx)), slice[0].ctx);
 }
@@ -754,7 +789,7 @@ test "Ctx spawnWith accumulates tasks" {
 test "Ctx image loadPath copies queued path" {
     const TestMsg = union(enum) { loaded, failed };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     var path_buf = [_]u8{ 'a', '.', 'p', 'n', 'g' };
     const request_id = try ctx_val.image().loadPath(&path_buf, &struct {
@@ -768,7 +803,7 @@ test "Ctx image loadPath copies queued path" {
     }.failed);
     path_buf[0] = 'b';
 
-    const pending = ctx_val.pendingTerminalImageLoadSlice();
+    const pending = ctx_val._pending_terminal_image_loads[0..ctx_val._pending_terminal_image_loads_len];
     try std.testing.expectEqual(@as(u64, 1), request_id.id);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqual(request_id, pending[0].request_id);
@@ -782,7 +817,7 @@ test "Ctx image unload queues handles" {
     const handle = terminal_image.TerminalImageHandle{ .id = 7, .generation = 2 };
     try ctx_val.image().unload(handle);
 
-    const pending = ctx_val.pendingTerminalImageUnloadSlice();
+    const pending = ctx_val._pending_terminal_image_unloads[0..ctx_val._pending_terminal_image_unloads_len];
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqual(handle, pending[0]);
 }
@@ -800,7 +835,7 @@ test "Ctx image unload returns error when queue is full" {
 test "Ctx terminal foreground command copies argv and cwd" {
     const TestMsg = union(enum) { finished };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     const finished = &struct {
         fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
@@ -818,13 +853,13 @@ test "Ctx terminal foreground command copies argv and cwd" {
     });
 
     try std.testing.expectEqual(@as(u64, 1), request_id.id);
-    try std.testing.expectEqual(@as(u8, 1), ctx_val.pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_foreground_commands_len);
 
     arg0[0] = 'X';
     arg1[0] = 'Y';
     cwd[1] = 'z';
 
-    const entry = ctx_val.pendingForegroundCommandSlice()[0];
+    const entry = ctx_val._pending_foreground_commands[0..ctx_val._pending_foreground_commands_len][0];
     try std.testing.expectEqual(@as(u64, 1), entry.request_id.id);
     try std.testing.expectEqualStrings("ed", entry.argv[0]);
     try std.testing.expectEqualStrings("file", entry.argv[1]);
@@ -834,7 +869,7 @@ test "Ctx terminal foreground command copies argv and cwd" {
 test "Ctx terminal foreground command rejects empty argv and overflow" {
     const TestMsg = union(enum) { finished };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer ctx_val.clearPendingEffectCopies();
+    defer ctx_val.runtimeClearPendingEffectCopies();
 
     const finished = &struct {
         fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
@@ -857,19 +892,19 @@ test "Ctx terminal foreground command rejects empty argv and overflow" {
     }));
 }
 
-test "Ctx redraw_suppressed defaults to false" {
+test "Ctx _redraw_suppressed defaults to false" {
     const TestMsg = union(enum) { hello };
     const ctx_val: Ctx(TestMsg) = .{};
 
-    try std.testing.expectEqual(false, ctx_val.redraw_suppressed);
+    try std.testing.expectEqual(false, ctx_val._redraw_suppressed);
 }
 
-test "Ctx redraw skip sets redraw_suppressed to true" {
+test "Ctx redraw skip sets _redraw_suppressed to true" {
     const TestMsg = union(enum) { hello };
     var ctx_val: Ctx(TestMsg) = .{};
 
     ctx_val.redraw().skip();
-    try std.testing.expectEqual(true, ctx_val.redraw_suppressed);
+    try std.testing.expectEqual(true, ctx_val._redraw_suppressed);
 }
 
 test "Ctx spawn and spawnWith share task limit" {
@@ -902,4 +937,111 @@ test "Ctx spawn and spawnWith share task limit" {
     // Both should fail now
     try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed }));
     try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task_with.run, .failed = task_with.failed }));
+}
+
+test "Ctx take pending queues returns empty slices initially" {
+    const TestMsg = union(enum) { done };
+    var ctx_val: Ctx(TestMsg) = .{};
+
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTicks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingEverys().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingCancels().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTerminalImageLoads().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTerminalImageUnloads().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingForegroundCommands().len);
+}
+
+test "Ctx take pending ticks clears queue and allows requeue" {
+    const TestMsg = union(enum) { timeout };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    try ctx_val.timer().tick("first", 1, .timeout);
+    const taken = ctx_val.takePendingTicks();
+
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("first", taken[0].id);
+    try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_ticks_len);
+    std.testing.allocator.free(taken[0].id);
+
+    ctx_val.runtimeClearPendingEffectCopies();
+    try ctx_val.timer().tick("second", 2, .timeout);
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
+    try std.testing.expectEqualStrings("second", ctx_val._pending_ticks[0].id);
+}
+
+test "Ctx taken effect copies are not cleared by runtime cleanup" {
+    const TestMsg = union(enum) { timeout, loaded, failed, finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    try ctx_val.timer().tick("taken-tick", 1, .timeout);
+    _ = try ctx_val.image().loadPath("image.png", &struct {
+        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) TestMsg {
+            return .loaded;
+        }
+    }.loaded, &struct {
+        fn failed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) TestMsg {
+            return .failed;
+        }
+    }.failed);
+    _ = try ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .cwd = "/tmp",
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
+
+    const ticks = ctx_val.takePendingTicks();
+    const loads = ctx_val.takePendingTerminalImageLoads();
+    const foreground = ctx_val.takePendingForegroundCommands();
+
+    ctx_val.runtimeClearPendingEffectCopies();
+
+    try std.testing.expectEqualStrings("taken-tick", ticks[0].id);
+    try std.testing.expectEqualStrings("image.png", loads[0].path);
+    try std.testing.expectEqualStrings("true", foreground[0].argv[0]);
+    try std.testing.expectEqualStrings("/tmp", foreground[0].cwd.?);
+
+    for (ticks) |entry| std.testing.allocator.free(entry.id);
+    for (loads) |entry| std.testing.allocator.free(entry.path);
+    for (foreground) |entry| {
+        for (entry.argv) |arg| std.testing.allocator.free(arg);
+        std.testing.allocator.free(entry.argv);
+        if (entry.cwd) |cwd| std.testing.allocator.free(cwd);
+    }
+}
+
+test "Ctx foreground pending helper transitions through take" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    try std.testing.expectEqual(false, ctx_val.hasPendingForegroundCommands());
+    _ = try ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
+    try std.testing.expectEqual(true, ctx_val.hasPendingForegroundCommands());
+
+    const foreground = ctx_val.takePendingForegroundCommands();
+    defer {
+        for (foreground) |entry| {
+            for (entry.argv) |arg| std.testing.allocator.free(arg);
+            std.testing.allocator.free(entry.argv);
+            if (entry.cwd) |cwd| std.testing.allocator.free(cwd);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), foreground.len);
+    try std.testing.expectEqual(false, ctx_val.hasPendingForegroundCommands());
 }

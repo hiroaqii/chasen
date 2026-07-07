@@ -325,7 +325,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // Ctx keeps Io privately so user code can call ctx.now() without receiving
     // direct access to the runtime Io handle.
     var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
-    defer app_ctx.clearPendingEffectCopies();
+    defer app_ctx.runtimeClearPendingEffectCopies();
     var frame_in_flight = false;
     var frame_future: ?std.Io.Future(void) = null;
     defer {
@@ -400,7 +400,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false, opts);
 
     // --- Main loop ---
-    while (!app_ctx.should_quit) {
+    while (!app_ctx.shouldQuit()) {
         const event = try loop.nextEvent();
         trace(opts, .event_received);
         event_count += 1;
@@ -478,7 +478,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
                     frame_future = null;
                 }
                 frame_in_flight = false;
-                app_ctx.frame_requested = true;
+                app_ctx.frame().request();
                 if (stats) |*s| s.event_kind = .frame;
             },
         }
@@ -486,7 +486,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during update
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
-        if (app_ctx.pending_foreground_commands_len > 0) {
+        if (app_ctx.hasPendingForegroundCommands()) {
             bracketed_paste.cancel(allocator);
         }
         // Drain effects even when the app already requested a redraw; using
@@ -594,7 +594,7 @@ fn applyMsg(
     opts: root.RunOptions,
 ) !bool {
     const measure = stats.* != null;
-    app_ctx.redraw_suppressed = false;
+    app_ctx.resetRedrawSuppressed();
 
     trace(opts, .update_start);
     const update_start = timingStart(measure, io);
@@ -606,7 +606,7 @@ fn applyMsg(
     }
     trace(opts, .update_end);
 
-    return !app_ctx.redraw_suppressed;
+    return !app_ctx.redrawWasSuppressed();
 }
 
 /// Drains effects queued in Ctx using the documented per-pass runtime order:
@@ -667,7 +667,7 @@ fn drainPendingEffects(
         try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
         startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
 
-        if (app_ctx.pending_foreground_commands_len == 0) break;
+        if (!app_ctx.hasPendingForegroundCommands()) break;
     }
 
     return result;
@@ -688,11 +688,10 @@ fn processPendingForegroundCommands(
     stats: *?root.RuntimeStats,
     opts: root.RunOptions,
 ) !bool {
-    // This iterates Ctx storage directly. That is safe while the foreground
-    // queue capacity is 1; if capacity grows, copy entries out before callbacks
-    // can queue new commands into the same backing array.
-    const pending_commands = app_ctx.pendingForegroundCommandSlice();
-    app_ctx.pending_foreground_commands_len = 0;
+    // The take API returns Ctx-backed storage. This is safe while the
+    // foreground queue capacity is 1; if capacity grows, copy entries out
+    // before callbacks can queue new commands into the same backing array.
+    const pending_commands = app_ctx.takePendingForegroundCommands();
     var needs_render = false;
 
     for (pending_commands) |entry| {
@@ -839,7 +838,7 @@ fn spawnPendingTasks(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
 ) !void {
-    for (app_ctx.pendingSlice()) |task| {
+    for (app_ctx.takePendingTasks()) |task| {
         pending_futures.ensureUnusedCapacity(allocator, 1) catch |err| {
             postInternalEvent(Msg, loop, .{ .user_msg = task.failed(.{ .start_failed = @errorName(err) }) });
             continue;
@@ -853,9 +852,7 @@ fn spawnPendingTasks(
         };
         pending_futures.appendAssumeCapacity(future);
     }
-    app_ctx.pending_tasks_len = 0;
-
-    for (app_ctx.pendingTaskWithSlice()) |entry| {
+    for (app_ctx.takePendingTasksWith()) |entry| {
         pending_futures.ensureUnusedCapacity(allocator, 1) catch |err| {
             postInternalEvent(Msg, loop, .{ .user_msg = entry.failed(entry.ctx, .{ .start_failed = @errorName(err) }, allocator) });
             continue;
@@ -869,7 +866,6 @@ fn spawnPendingTasks(
         };
         pending_futures.appendAssumeCapacity(future);
     }
-    app_ctx.pending_tasks_with_len = 0;
 }
 
 fn startPendingFrame(
@@ -883,8 +879,7 @@ fn startPendingFrame(
     last_frame_ns: u64,
     next_frame_index: u64,
 ) void {
-    if (!app_ctx.frame_requested) return;
-    app_ctx.frame_requested = false;
+    if (!app_ctx.takeFrameRequest()) return;
 
     if (frame_in_flight.*) return;
 
@@ -909,8 +904,7 @@ fn spawnPendingTicks(
     // Take ownership of queued copies before processing. Zeroing the queue
     // first keeps run()'s unwind cleanup from freeing ids after they have been
     // handed to running_timers.
-    const pending_ticks = app_ctx.pendingTickSlice();
-    app_ctx.pending_ticks_len = 0;
+    const pending_ticks = app_ctx.takePendingTicks();
 
     for (pending_ticks) |entry| {
         var owned_id: ?[]const u8 = entry.id;
@@ -945,8 +939,7 @@ fn spawnPendingEvery(
     // Take ownership of queued copies before processing. Zeroing the queue
     // first keeps run()'s unwind cleanup from freeing ids after they have been
     // handed to running_timers.
-    const pending_everys = app_ctx.pendingEverySlice();
-    app_ctx.pending_everys_len = 0;
+    const pending_everys = app_ctx.takePendingEverys();
 
     for (pending_everys) |entry| {
         var owned_id: ?[]const u8 = entry.id;
@@ -991,8 +984,7 @@ fn processPendingCancels(
 ) void {
     // Take ownership of queued cancel ids before processing so unwind cleanup
     // only sees entries that have not reached the drain step.
-    const pending_cancels = app_ctx.pendingCancelSlice();
-    app_ctx.pending_cancels_len = 0;
+    const pending_cancels = app_ctx.takePendingCancels();
 
     for (pending_cancels) |id| {
         defer allocator.free(id);
@@ -1012,15 +1004,13 @@ fn processPendingTerminalImages(
 ) !void {
     // Take ownership of queued image effects before processing so unwind
     // cleanup only sees entries that have not reached the drain step.
-    const pending_unloads = app_ctx.pendingTerminalImageUnloadSlice();
-    app_ctx.pending_terminal_image_unloads_len = 0;
+    const pending_unloads = app_ctx.takePendingTerminalImageUnloads();
 
     for (pending_unloads) |handle| {
         _ = registry.unload(vx.*, tty, handle);
     }
 
-    const pending_loads = app_ctx.pendingTerminalImageLoadSlice();
-    app_ctx.pending_terminal_image_loads_len = 0;
+    const pending_loads = app_ctx.takePendingTerminalImageLoads();
 
     for (pending_loads) |entry| {
         defer allocator.free(entry.path);
