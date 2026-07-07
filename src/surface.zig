@@ -190,11 +190,6 @@ pub const Surface = struct {
         return self.vaxisWindowConst().gwidth(str);
     }
 
-    /// Alias for `displayWidth`.
-    pub fn gwidth(self: *const Surface, str: []const u8) u16 {
-        return self.displayWidth(str);
-    }
-
     /// Fill `rect` with `cell`.
     pub fn fill(self: *Surface, rect: Rect, cell: Cell) void {
         self.windowForRect(rect).fill(vaxis_convert.cellToVaxis(cell));
@@ -481,13 +476,12 @@ test "Surface.readCell reads through from the window" {
     try std.testing.expect(ts.surface.readCell(3, 1) == null);
 }
 
-test "Surface.displayWidth and gwidth use terminal width rules" {
+test "Surface.displayWidth uses terminal width rules" {
     var ts = try testSurface(10, 2);
     ts.bind();
     defer ts.deinit();
 
     try std.testing.expectEqual(@as(u16, 3), ts.surface.displayWidth("abc"));
-    try std.testing.expectEqual(ts.surface.displayWidth("abc"), ts.surface.gwidth("abc"));
 }
 
 test "Surface.displayWidth handles wide characters" {
