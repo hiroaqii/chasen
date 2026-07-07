@@ -76,7 +76,7 @@ pub fn clipToWidthWithMarker(str: []const u8, max_width: u16, marker: []const u8
 /// The returned slice always points into `str` and starts on a Unicode
 /// grapheme boundary. If `width` lands in the middle of a wide grapheme, that
 /// whole grapheme is skipped and the result snaps to the next boundary.
-pub fn dropToWidth(str: []const u8, width: usize) []const u8 {
+pub fn dropToWidth(str: []const u8, width: u16) []const u8 {
     if (width == 0 or str.len == 0) return str;
 
     var skipped_width: usize = 0;
@@ -172,6 +172,18 @@ test "dropToWidth does not split grapheme clusters" {
     try std.testing.expectEqualStrings("B", dropToWidth("AあB", 3));
     try std.testing.expectEqualStrings("", dropToWidth("AあB", 4));
     try std.testing.expectEqualStrings("x", dropToWidth("e\u{301}x", 1));
+}
+
+test "dropToWidth keeps maxInt width within bounds" {
+    const ascii_width = @as(usize, std.math.maxInt(u16)) - 1;
+    const text = try std.testing.allocator.alloc(u8, ascii_width + "あ".len);
+    defer std.testing.allocator.free(text);
+
+    @memset(text[0..ascii_width], 'a');
+    @memcpy(text[ascii_width..], "あ");
+
+    const dropped = dropToWidth(text, std.math.maxInt(u16));
+    try std.testing.expectEqualStrings("", dropped);
 }
 
 test {
