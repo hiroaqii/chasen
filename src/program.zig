@@ -1103,6 +1103,7 @@ fn trace(opts: root.RunOptions, event: root.TraceEvent) void {
 }
 
 fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
+    // Keep the runtime surface width policy aligned with chasen.text.displayWidth.
     vx.caps.unicode = .unicode;
     vx.screen.width_method = .unicode;
 }
