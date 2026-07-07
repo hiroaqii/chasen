@@ -245,6 +245,12 @@ const request_id = try ctx.image().loadPath(path, loaded, failed);
 
 // Release an app-owned terminal image handle when it is no longer displayed.
 try ctx.image().unload(handle);
+
+// Send text to the terminal clipboard with a best-effort OSC 52 write.
+try ctx.terminal().copyToClipboard(.{
+    .text = text,
+    .finished = App.clipboardCopyFinished,
+});
 ```
 
 Effects are not executed immediately. They are stored in `Ctx` and drained by
@@ -275,6 +281,11 @@ code should use `Frame.delta_ns` or `Frame.now_ns` for time-based movement
 instead of assuming an exact frame rate. If an app has been idle without
 frames, or if a foreground command interrupts a scheduled frame, the next
 delivered frame can include a large elapsed delta.
+
+Terminal clipboard writes use OSC 52 and are best-effort. A `.sent` result means
+Chasen emitted the clipboard sequence to the tty; it does not prove that the
+terminal or tmux accepted the payload. Detectable local write failures are
+reported through the `finished` callback.
 
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct

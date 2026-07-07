@@ -611,21 +611,23 @@ fn applyMsg(
 /// Drains effects queued in Ctx using the documented per-pass runtime order:
 ///
 /// 1. foreground commands
-/// 2. async tasks
-/// 3. pending timer cancels
-/// 4. pending ticks
-/// 5. pending everys
-/// 6. terminal images
-/// 7. frame request
+/// 2. terminal clipboard copies
+/// 3. async tasks
+/// 4. pending timer cancels
+/// 5. pending ticks
+/// 6. pending everys
+/// 7. terminal images
+/// 8. frame request
 ///
 /// Timer cancels must run after foreground callbacks have had a chance to
 /// queue effects, but before tick/every spawn. That makes `cancel(id)` apply
 /// to timers that were already running before this drain pass, while allowing
 /// a same-update `cancel(id); tick(id, ...)` restart to keep the replacement.
 ///
-/// Foreground command completions may queue follow-up foreground commands.
-/// Drain a bounded number of full passes so those follow-ups do not wait for
-/// unrelated input/timer/frame events, while preserving the same per-pass order.
+/// Foreground command and clipboard completions may queue follow-up synchronous
+/// terminal effects. Drain a bounded number of full passes so those follow-ups
+/// do not wait for unrelated input/timer/frame events, while preserving the
+/// same per-pass order.
 ///
 /// Trace and stats boundaries stay at the call sites because init, initial
 /// winsize, and main-loop updates account for effect drain differently.
@@ -659,6 +661,8 @@ fn drainPendingEffects(
     for (0..max_foreground_drain_rounds) |_| {
         const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
         result.needs_render = result.needs_render or foreground_needs_render;
+        const clipboard_needs_render = try processPendingClipboardCopies(App, app, app_ctx, vx, tty, allocator, io, stats, opts);
+        result.needs_render = result.needs_render or clipboard_needs_render;
         try spawnPendingTasks(Msg, app_ctx, pending_futures, allocator, io, loop);
         processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
         try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop);
@@ -666,7 +670,7 @@ fn drainPendingEffects(
         try processPendingTerminalImages(Msg, app_ctx, terminal_images, vx, tty.writer(), allocator, loop, opts);
         startPendingFrame(Msg, app_ctx, io, loop, suspended, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
 
-        if (!app_ctx.hasPendingForegroundCommands()) break;
+        if (!app_ctx.hasPendingForegroundCommands() and !app_ctx.hasPendingClipboardCopies()) break;
     }
 
     return result;
@@ -716,6 +720,41 @@ fn freeForegroundCommandEntry(
     }
     allocator.free(entry.argv);
     if (entry.cwd) |cwd| allocator.free(cwd);
+}
+
+fn processPendingClipboardCopies(
+    comptime App: type,
+    app: *App,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stats: *?root.RuntimeStats,
+    opts: root.RunOptions,
+) !bool {
+    const ClipboardEntry = ctx_mod.Ctx(App.Msg).ClipboardCopyEntry;
+    const pending_copies = app_ctx.takePendingClipboardCopies();
+    if (pending_copies.len == 0) return false;
+
+    const entries = allocator.alloc(ClipboardEntry, pending_copies.len) catch |err| {
+        for (pending_copies) |entry| allocator.free(entry.text);
+        return err;
+    };
+    defer {
+        for (entries) |entry| allocator.free(entry.text);
+        allocator.free(entries);
+    }
+
+    @memcpy(entries, pending_copies);
+
+    var needs_render = false;
+    for (entries) |entry| {
+        const outcome: ctx_mod.Ctx(App.Msg).ClipboardCopyOutcome = if (vx.*.copyToSystemClipboard(tty.writer(), entry.text, allocator)) |_| .sent else |err| .{ .write_failed = @errorName(err) };
+        needs_render = try applyMsg(App, app, entry.finished(.{ .outcome = outcome }), app_ctx, io, stats, opts) or needs_render;
+    }
+
+    return needs_render;
 }
 
 fn runForegroundCommand(

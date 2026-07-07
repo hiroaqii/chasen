@@ -17,6 +17,7 @@ pub const RuntimeEffectKind = enum {
     terminal_image_load_path,
     terminal_image_unload,
     terminal_foreground_command,
+    terminal_clipboard_copy,
 };
 
 pub const EffectSupport = enum {
@@ -49,6 +50,7 @@ pub const BrowserInitialEffects = struct {
             .terminal_image_load_path,
             .terminal_image_unload,
             .terminal_foreground_command,
+            .terminal_clipboard_copy,
             => .unsupported,
         };
     }
@@ -74,4 +76,5 @@ test "browser initial effects reject deferred effects" {
     try std.testing.expect(!BrowserInitialEffects.isSupported(.terminal_image_load_path));
     try std.testing.expect(!BrowserInitialEffects.isSupported(.terminal_image_unload));
     try std.testing.expect(!BrowserInitialEffects.isSupported(.terminal_foreground_command));
+    try std.testing.expect(!BrowserInitialEffects.isSupported(.terminal_clipboard_copy));
 }

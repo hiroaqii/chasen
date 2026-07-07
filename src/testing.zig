@@ -183,6 +183,10 @@ pub fn TestCtx(comptime Msg: type) type {
             return self.ctx._pending_cancels_len;
         }
 
+        pub fn pendingClipboardCopyCount(self: *const @This()) usize {
+            return self.ctx._pending_clipboard_copies_len;
+        }
+
         pub fn hasPendingForegroundCommands(self: *const @This()) bool {
             return self.ctx.hasPendingForegroundCommands();
         }
@@ -228,6 +232,14 @@ test "resetTransient clears pending queues and redraw suppression" {
     try tc.ctx.timer().tick("t1", 1_000, .inc);
     try tc.ctx.timer().every("e1", 2_000, .dec);
     try tc.ctx.timer().cancel("x");
+    try tc.ctx.terminal().copyToClipboard(.{
+        .text = "clip",
+        .finished = &struct {
+            fn done(_: ctx_mod.Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+                return .inc;
+            }
+        }.done,
+    });
     tc.ctx.redraw().skip();
     tc.ctx.frame().request();
 
@@ -235,6 +247,7 @@ test "resetTransient clears pending queues and redraw suppression" {
     try std.testing.expectEqual(@as(usize, 1), tc.pendingTickCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingClipboardCopyCount());
     try std.testing.expectEqual(true, tc.redrawSuppressed());
     try std.testing.expectEqual(true, tc.frameRequested());
 
@@ -245,6 +258,7 @@ test "resetTransient clears pending queues and redraw suppression" {
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount());
     try std.testing.expectEqual(@as(usize, 0), tc.pendingEveryCount());
     try std.testing.expectEqual(@as(usize, 0), tc.pendingCancelCount());
+    try std.testing.expectEqual(@as(usize, 0), tc.pendingClipboardCopyCount());
     try std.testing.expectEqual(false, tc.redrawSuppressed());
     try std.testing.expectEqual(false, tc.frameRequested());
 }

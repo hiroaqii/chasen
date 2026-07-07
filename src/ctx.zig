@@ -21,6 +21,7 @@ pub fn Ctx(comptime Msg: type) type {
     const max_terminal_image_loads = 8;
     const max_terminal_image_unloads = 8;
     const max_foreground_commands = 1;
+    const max_clipboard_copies = 4;
 
     const max_cancels = 8;
 
@@ -32,6 +33,7 @@ pub fn Ctx(comptime Msg: type) type {
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
         pub const ForegroundCommandFinishedFn = *const fn (foreground_command.ForegroundCommandResult) Msg;
+        pub const ClipboardCopyFinishedFn = *const fn (ClipboardCopyResult) Msg;
 
         pub const TickEntry = struct {
             id: []const u8,
@@ -81,6 +83,28 @@ pub fn Ctx(comptime Msg: type) type {
             finished: ForegroundCommandFinishedFn,
         };
 
+        pub const ClipboardCopyOutcome = union(enum) {
+            /// The runtime emitted the OSC 52 sequence to the tty.
+            ///
+            /// OSC 52 write has no ACK, so this does not prove the terminal
+            /// accepted the clipboard payload. If multiple clipboard copies
+            /// are emitted in one drain, terminals normally keep the last one.
+            sent,
+            /// The current runtime cannot perform terminal clipboard writes.
+            unsupported_runtime,
+            /// The local tty write failed before the OSC 52 sequence was emitted.
+            write_failed: []const u8,
+        };
+
+        pub const ClipboardCopyResult = struct {
+            outcome: ClipboardCopyOutcome,
+        };
+
+        pub const ClipboardCopyEntry = struct {
+            text: []const u8,
+            finished: ClipboardCopyFinishedFn,
+        };
+
         // Private runtime handles. Set by Program before passing to app code.
         _io: std.Io = undefined,
         _allocator: std.mem.Allocator = undefined,
@@ -103,6 +127,8 @@ pub fn Ctx(comptime Msg: type) type {
         _pending_foreground_commands: [max_foreground_commands]ForegroundCommandEntry = undefined,
         _pending_foreground_commands_len: u8 = 0,
         _next_foreground_command_request_id: u64 = 1,
+        _pending_clipboard_copies: [max_clipboard_copies]ClipboardCopyEntry = undefined,
+        _pending_clipboard_copies_len: u8 = 0,
         _redraw_suppressed: bool = false,
         _frame_requested: bool = false,
 
@@ -305,6 +331,11 @@ pub fn Ctx(comptime Msg: type) type {
                 finished: ForegroundCommandFinishedFn,
             };
 
+            pub const ClipboardCopyOptions = struct {
+                text: []const u8,
+                finished: ClipboardCopyFinishedFn,
+            };
+
             /// Queue an interactive terminal foreground command.
             ///
             /// The runtime temporarily restores the terminal, runs the child
@@ -354,6 +385,32 @@ pub fn Ctx(comptime Msg: type) type {
                 };
                 self.ctx._pending_foreground_commands_len += 1;
                 return request_id;
+            }
+
+            /// Queue a best-effort OSC 52 clipboard write.
+            ///
+            /// `text` is copied while queueing because effects are drained
+            /// after `update` returns. The `finished` callback reports whether
+            /// the runtime emitted the sequence or hit a detectable local
+            /// failure; terminal-side clipboard acceptance cannot be proven.
+            ///
+            /// If multiple copies are emitted in one drain, terminals normally
+            /// keep the last payload.
+            pub fn copyToClipboard(
+                self: TerminalEffects,
+                opts: ClipboardCopyOptions,
+            ) (error{ClipboardCopyLimitExceeded} || std.mem.Allocator.Error)!void {
+                if (self.ctx._pending_clipboard_copies_len >= max_clipboard_copies)
+                    return error.ClipboardCopyLimitExceeded;
+
+                const copied_text = try self.ctx._allocator.dupe(u8, opts.text);
+                errdefer self.ctx._allocator.free(copied_text);
+
+                self.ctx._pending_clipboard_copies[self.ctx._pending_clipboard_copies_len] = .{
+                    .text = copied_text,
+                    .finished = opts.finished,
+                };
+                self.ctx._pending_clipboard_copies_len += 1;
             }
         };
 
@@ -409,6 +466,10 @@ pub fn Ctx(comptime Msg: type) type {
             return self._pending_foreground_commands_len > 0;
         }
 
+        pub fn hasPendingClipboardCopies(self: *const @This()) bool {
+            return self._pending_clipboard_copies_len > 0;
+        }
+
         pub fn takePendingTasks(self: *@This()) []const TaskEntry {
             const pending = self._pending_tasks[0..self._pending_tasks_len];
             self._pending_tasks_len = 0;
@@ -455,6 +516,12 @@ pub fn Ctx(comptime Msg: type) type {
             comptime std.debug.assert(max_foreground_commands == 1);
             const pending = self._pending_foreground_commands[0..self._pending_foreground_commands_len];
             self._pending_foreground_commands_len = 0;
+            return pending;
+        }
+
+        pub fn takePendingClipboardCopies(self: *@This()) []const ClipboardCopyEntry {
+            const pending = self._pending_clipboard_copies[0..self._pending_clipboard_copies_len];
+            self._pending_clipboard_copies_len = 0;
             return pending;
         }
 
@@ -550,6 +617,11 @@ pub fn Ctx(comptime Msg: type) type {
                 if (entry.cwd) |cwd| self._allocator.free(cwd);
             }
             self._pending_foreground_commands_len = 0;
+
+            for (self._pending_clipboard_copies[0..self._pending_clipboard_copies_len]) |entry| {
+                self._allocator.free(entry.text);
+            }
+            self._pending_clipboard_copies_len = 0;
         }
     };
 }
@@ -892,6 +964,54 @@ test "Ctx terminal foreground command rejects empty argv and overflow" {
     }));
 }
 
+test "Ctx terminal clipboard copy queues owned text" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    const finished = &struct {
+        fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+
+    var text = [_]u8{ 'c', 'l', 'i', 'p' };
+    try ctx_val.terminal().copyToClipboard(.{
+        .text = text[0..],
+        .finished = finished,
+    });
+
+    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_clipboard_copies_len);
+    text[0] = 'X';
+
+    const entry = ctx_val._pending_clipboard_copies[0..ctx_val._pending_clipboard_copies_len][0];
+    try std.testing.expectEqualStrings("clip", entry.text);
+    try std.testing.expectEqual(@as(Ctx(TestMsg).ClipboardCopyFinishedFn, finished), entry.finished);
+}
+
+test "Ctx terminal clipboard copy rejects overflow" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    const finished = &struct {
+        fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+
+    for (0..4) |_| {
+        try ctx_val.terminal().copyToClipboard(.{
+            .text = "clip",
+            .finished = finished,
+        });
+    }
+    try std.testing.expectError(error.ClipboardCopyLimitExceeded, ctx_val.terminal().copyToClipboard(.{
+        .text = "overflow",
+        .finished = finished,
+    }));
+}
+
 test "Ctx _redraw_suppressed defaults to false" {
     const TestMsg = union(enum) { hello };
     const ctx_val: Ctx(TestMsg) = .{};
@@ -951,6 +1071,7 @@ test "Ctx take pending queues returns empty slices initially" {
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTerminalImageLoads().len);
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTerminalImageUnloads().len);
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingForegroundCommands().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingClipboardCopies().len);
 }
 
 test "Ctx take pending ticks clears queue and allows requeue" {
@@ -996,10 +1117,19 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
             }
         }.done,
     });
+    try ctx_val.terminal().copyToClipboard(.{
+        .text = "clipboard",
+        .finished = &struct {
+            fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
 
     const ticks = ctx_val.takePendingTicks();
     const loads = ctx_val.takePendingTerminalImageLoads();
     const foreground = ctx_val.takePendingForegroundCommands();
+    const clipboard = ctx_val.takePendingClipboardCopies();
 
     ctx_val.runtimeClearPendingEffectCopies();
 
@@ -1007,6 +1137,7 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
     try std.testing.expectEqualStrings("image.png", loads[0].path);
     try std.testing.expectEqualStrings("true", foreground[0].argv[0]);
     try std.testing.expectEqualStrings("/tmp", foreground[0].cwd.?);
+    try std.testing.expectEqualStrings("clipboard", clipboard[0].text);
 
     for (ticks) |entry| std.testing.allocator.free(entry.id);
     for (loads) |entry| std.testing.allocator.free(entry.path);
@@ -1015,6 +1146,7 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
         std.testing.allocator.free(entry.argv);
         if (entry.cwd) |cwd| std.testing.allocator.free(cwd);
     }
+    for (clipboard) |entry| std.testing.allocator.free(entry.text);
 }
 
 test "Ctx foreground pending helper transitions through take" {
@@ -1044,4 +1176,30 @@ test "Ctx foreground pending helper transitions through take" {
 
     try std.testing.expectEqual(@as(usize, 1), foreground.len);
     try std.testing.expectEqual(false, ctx_val.hasPendingForegroundCommands());
+}
+
+test "Ctx clipboard pending helper transitions through take" {
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    try std.testing.expectEqual(false, ctx_val.hasPendingClipboardCopies());
+    try ctx_val.terminal().copyToClipboard(.{
+        .text = "clip",
+        .finished = &struct {
+            fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
+    try std.testing.expectEqual(true, ctx_val.hasPendingClipboardCopies());
+
+    const clipboard = ctx_val.takePendingClipboardCopies();
+    defer {
+        for (clipboard) |entry| std.testing.allocator.free(entry.text);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), clipboard.len);
+    try std.testing.expectEqualStrings("clip", clipboard[0].text);
+    try std.testing.expectEqual(false, ctx_val.hasPendingClipboardCopies());
 }
