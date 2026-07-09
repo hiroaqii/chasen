@@ -17,7 +17,12 @@ pub fn graphemeIterator(str: []const u8) GraphemeIterator {
 /// This is useful for component logic that needs width calculations without a
 /// live `Surface`.
 pub fn displayWidth(str: []const u8) u16 {
-    return vaxis.gwidth.gwidth(str, .unicode);
+    var width: u16 = 0;
+    var iter = graphemeIterator(str);
+    while (iter.next()) |grapheme| {
+        width +|= vaxis.gwidth.gwidth(grapheme.bytes(str), .unicode);
+    }
+    return width;
 }
 
 /// Return the longest prefix that fits in `max_width` terminal cells.
@@ -100,6 +105,14 @@ test "displayWidth handles grapheme clusters" {
     try std.testing.expectEqual(@as(u16, 1), displayWidth("e\u{301}"));
     try std.testing.expectEqual(@as(u16, 2), displayWidth("👩‍🚀"));
     try std.testing.expectEqual(@as(u16, 2), displayWidth("🇯🇵"));
+}
+
+test "displayWidth saturates long text" {
+    const text = try std.testing.allocator.alloc(u8, @as(usize, std.math.maxInt(u16)) + 1);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'a');
+
+    try std.testing.expectEqual(std.math.maxInt(u16), displayWidth(text));
 }
 
 test "graphemeIterator yields cluster byte ranges" {

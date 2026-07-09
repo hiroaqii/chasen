@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const cell_mod = @import("cell.zig");
 const style = @import("style.zig");
 const terminal_image = @import("terminal_image.zig");
+const text = @import("text.zig");
 const vaxis_convert = @import("vaxis_convert.zig");
 const TextStyle = style.TextStyle;
 
@@ -187,7 +188,8 @@ pub const Surface = struct {
 
     /// Return the terminal display width of `str`.
     pub fn displayWidth(self: *const Surface, str: []const u8) u16 {
-        return self.vaxisWindowConst().gwidth(str);
+        _ = self;
+        return text.displayWidth(str);
     }
 
     /// Fill `rect` with `cell`.
@@ -497,9 +499,20 @@ test "Surface.displayWidth matches chasen text unicode width" {
     ts.bind();
     defer ts.deinit();
 
-    const text = @import("text.zig");
     try std.testing.expectEqual(text.displayWidth("👩‍🚀"), ts.surface.displayWidth("👩‍🚀"));
     try std.testing.expectEqual(text.displayWidth("🇯🇵"), ts.surface.displayWidth("🇯🇵"));
+}
+
+test "Surface.displayWidth saturates long text" {
+    var ts = try testSurface(10, 2);
+    ts.bind();
+    defer ts.deinit();
+
+    const long_text = try std.testing.allocator.alloc(u8, @as(usize, std.math.maxInt(u16)) + 1);
+    defer std.testing.allocator.free(long_text);
+    @memset(long_text, 'a');
+
+    try std.testing.expectEqual(std.math.maxInt(u16), ts.surface.displayWidth(long_text));
 }
 
 test "Surface.borrowTextAt prints unwrapped styled text at coordinates" {
