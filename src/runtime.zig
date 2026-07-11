@@ -18,6 +18,54 @@ pub const RuntimeEffectKind = runtime_effect.RuntimeEffectKind;
 pub const EffectSupport = runtime_effect.EffectSupport;
 pub const BrowserInitialEffects = runtime_effect.BrowserInitialEffects;
 
+/// Declares how an app root message is disposed when the runtime can no longer
+/// deliver it to `App.update`.
+///
+/// Chasen requires every root `Msg` type to choose explicitly. This prevents an
+/// allocator-owning result from silently inheriting plain-value drop semantics.
+pub const UndeliveredPolicy = enum {
+    /// Every message variant is safe to discard by value. Timer templates must
+    /// use this kind of non-owning/copy-safe message.
+    plain,
+    /// `Msg` provides `deinitUndelivered(*Msg, allocator)`.
+    deinit,
+};
+
+/// Validate the root message ownership contract used by all runtime producers.
+pub fn validateUndeliveredPolicy(comptime Msg: type) void {
+    if (!@hasDecl(Msg, "undelivered_policy")) {
+        @compileError("App.Msg must declare `pub const undelivered_policy = .plain` or `.deinit`");
+    }
+
+    const policy: UndeliveredPolicy = Msg.undelivered_policy;
+    switch (policy) {
+        .plain => {
+            if (@hasDecl(Msg, "deinitUndelivered")) {
+                @compileError("App.Msg with `.plain` undelivered_policy must not declare deinitUndelivered");
+            }
+        },
+        .deinit => {
+            if (!@hasDecl(Msg, "deinitUndelivered")) {
+                @compileError("App.Msg with `.deinit` undelivered_policy must declare `deinitUndelivered(*Msg, allocator) void`");
+            }
+            const expected: *const fn (*Msg, std.mem.Allocator) void = Msg.deinitUndelivered;
+            _ = expected;
+        },
+    }
+}
+
+/// Dispose one message that will not enter `App.update`.
+///
+/// This runs on the runtime thread before `App.deinit`. Once a message has been
+/// passed to `App.update`, the app owns it even when update returns an error.
+pub fn deinitUndeliveredMessage(comptime Msg: type, msg: *Msg, allocator: std.mem.Allocator) void {
+    const policy: UndeliveredPolicy = Msg.undelivered_policy;
+    switch (policy) {
+        .plain => {},
+        .deinit => msg.deinitUndelivered(allocator),
+    }
+}
+
 /// Cleanup context passed to optional app `deinit`.
 ///
 /// This context is intentionally smaller than `Ctx`: shutdown cleanup cannot

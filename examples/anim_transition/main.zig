@@ -16,6 +16,8 @@ const AnimTransition = struct {
     completed_count: u64 = 0,
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         frame: chasen.Frame,
         restart,
         quit,

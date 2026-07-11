@@ -15,6 +15,8 @@ const TickDemo = struct {
     last_event: []const u8 = "Press s to schedule a one-shot tick.",
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         schedule,
         fired,
         cancel,

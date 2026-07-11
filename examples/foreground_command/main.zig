@@ -10,6 +10,8 @@ const ForegroundCommandDemo = struct {
     last_request_id: u64 = 0,
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         run_true,
         run_false,
         run_editor,

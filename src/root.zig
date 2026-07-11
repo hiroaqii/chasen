@@ -37,6 +37,7 @@ pub const ForegroundCommandResult = foreground_command.ForegroundCommandResult;
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;
 pub const TaskFailure = runtime.TaskFailure;
+pub const UndeliveredPolicy = runtime.UndeliveredPolicy;
 
 pub const testing = @import("testing.zig");
 
@@ -81,7 +82,8 @@ pub const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
-    /// Clipboard paste content. Only valid during the current event dispatch.
+    /// Bracketed-paste content. Only valid during the current event dispatch.
+    /// OSC 52 clipboard-read responses are not exposed as application events.
     paste: []const u8,
     focus_in,
     focus_out,
@@ -170,11 +172,16 @@ fn validateApp(comptime App: type) void {
     if (!@hasDecl(App, "view")) {
         @compileError("App must declare `pub fn view`");
     }
+    runtime.validateUndeliveredPolicy(App.Msg);
 }
 
 test "validateApp accepts apps without handleEvent" {
     const App = struct {
-        pub const Msg = enum { noop };
+        pub const Msg = enum {
+            noop,
+
+            pub const undelivered_policy = .plain;
+        };
 
         pub fn update(_: *@This(), _: Msg, _: *Ctx(Msg)) !void {}
 

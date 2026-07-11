@@ -6,6 +6,8 @@ const Counter = struct {
     count: i32 = 0,
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         increment,
         decrement,
         quit,

@@ -18,6 +18,8 @@ const Stopwatch = struct {
     display_ns: Nanoseconds = 0,
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         tick,
         toggle,
         reset,

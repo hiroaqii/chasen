@@ -131,6 +131,8 @@ const HttpDemo = struct {
     };
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         fetch,
         got_response: BoundedStr,
         got_error: BoundedStr,
@@ -281,7 +283,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn fetchFailed(failure: chasen.TaskFailure) HttpDemo.Msg {
-    return .{ .got_error = switch (failure) {
-        .start_failed => |message| BoundedStr.from(message),
-    } };
+    return .{
+        .got_error = switch (failure) {
+            .start_failed => |message| BoundedStr.from(message),
+            // Shutdown-owned callbacks are deinitialized without reaching update;
+            // this branch keeps the callback exhaustive if it is reused elsewhere.
+            .runtime_abandoned => BoundedStr.from("runtime shutting down"),
+        },
+    };
 }

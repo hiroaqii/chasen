@@ -19,6 +19,8 @@ changes through `Msg` and `update`.
 const Self = @This();
 
 pub const Msg = union(enum) {
+    pub const undelivered_policy = .plain;
+
     quit,
     toggle,
     frame: chasen.Frame,
@@ -357,6 +359,8 @@ animation is still active.
 
 ```zig
 pub const Msg = union(enum) {
+    pub const undelivered_policy = .plain;
+
     start,
     frame: chasen.Frame,
 };
@@ -436,19 +440,24 @@ the screen buffer matched to the new terminal size.
 
 Effect drain currently processes pending work in this order:
 
-1. `ctx.task().spawn` / `ctx.task().spawnWith`
-2. `ctx.timer().tick`
-3. `ctx.timer().every`
-4. `ctx.image().unload` / `ctx.image().loadPath`
+1. runtime-thread callback completions
+2. foreground commands
+3. terminal clipboard copies
+4. `ctx.task().spawn` / `ctx.task().spawnWith`
 5. `ctx.timer().cancel`
-6. `ctx.frame().request`
+6. `ctx.timer().tick`
+7. `ctx.timer().every`
+8. `ctx.image().unload` / `ctx.image().loadPath`
+9. `ctx.frame().request`
 
 `ctx.timer().tick(id, after_ns, msg)` schedules one future message.
 `ctx.timer().every(id, interval_ns, msg)` schedules repeated messages until
 cancelled. Scheduling a new `tick` or `every` with the same id replaces the
 existing running timer with that id. Timer ids are copied into runtime-owned
 memory while queueing, so callers may pass temporary or dynamically formatted
-ids.
+ids. Timer message templates themselves must be non-owning/copy-safe: the
+runtime may copy, reuse, replace, or drop them without calling the root Msg
+cleanup hook.
 
 The `tick` example shows a one-shot timer, same-id replacement, and
 `ctx.timer().cancel` in a runnable app:
@@ -487,6 +496,10 @@ effects are still drained, but the redraw for that message is skipped.
 ## Msg Ownership
 
 `Msg` values cross the runtime boundary by value. Be explicit about ownership.
+Every root message type must declare `undelivered_policy = .plain` or `.deinit`.
+Use `.deinit` when an asynchronous result can own memory, and implement the
+exact `deinitUndelivered(*Msg, allocator)` hook so shutdown can clean a result
+that never reaches `update`.
 
 Rules:
 
@@ -535,7 +548,19 @@ const SearchResult = struct {
 };
 
 pub const Msg = union(enum) {
+    pub const undelivered_policy = .deinit;
+
     got_search: SearchResult,
+
+    pub fn deinitUndelivered(self: *@This(), _: std.mem.Allocator) void {
+        switch (self.*) {
+            .got_search => |result| {
+                var owned = result;
+                owned.deinit();
+            },
+        }
+        self.* = undefined;
+    }
 };
 
 pub fn update(self: *Self, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -557,6 +582,12 @@ pub fn update(self: *Self, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
 
 This pattern is important for HTTP, media metadata, BGG XML payloads, terminal
 buffers, and other large data.
+
+Once Chasen calls `update`, the app owns the message even if `update` returns an
+error. `deinitUndelivered` is only for messages the runtime cannot pass to
+`update`; it does not replace normal update-path and model cleanup. See
+[`RUNTIME_MESSAGE_OWNERSHIP.md`](RUNTIME_MESSAGE_OWNERSHIP.md) for the complete
+queue, future, shutdown, timer, and terminal-image rules.
 
 ## Component Effects
 

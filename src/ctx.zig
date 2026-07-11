@@ -1,9 +1,15 @@
 const std = @import("std");
 const terminal_image = @import("terminal_image_types.zig");
 const foreground_command = @import("foreground_command.zig");
+const runtime_limits = @import("runtime_limits.zig");
 
 pub const TaskFailure = union(enum) {
     start_failed: []const u8,
+    /// The app queued the task, but runtime error unwind happened before the
+    /// task was transferred to a future. The existing failure callback still
+    /// consumes captured `spawnWith` context; its returned message is disposed
+    /// as undelivered instead of being posted.
+    runtime_abandoned,
 };
 
 /// Context object passed to `init` and `update`.
@@ -15,10 +21,10 @@ pub const TaskFailure = union(enum) {
 pub fn Ctx(comptime Msg: type) type {
     const TaskFn = *const fn (std.mem.Allocator, std.Io) Msg;
     const TaskFailedFn = *const fn (TaskFailure) Msg;
-    const max_tasks = 16;
+    const max_tasks = runtime_limits.max_tasks;
     const max_ticks = 8;
     const max_everys = 8;
-    const max_terminal_image_loads = 8;
+    const max_terminal_image_loads = runtime_limits.max_terminal_image_loads;
     const max_terminal_image_unloads = 8;
     const max_foreground_commands = 1;
     const max_clipboard_copies = 4;
@@ -213,6 +219,11 @@ pub fn Ctx(comptime Msg: type) type {
             /// If the runtime cannot start or track the timer helper, this
             /// API currently has no failure callback and the timer message may
             /// never be delivered.
+            ///
+            /// The runtime may copy this template and drop pending copies
+            /// during replacement or shutdown without calling
+            /// `Msg.deinitUndelivered`. Use only a non-owning/copy-safe message
+            /// variant; heap-owning results belong in task callbacks.
             pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx._pending_ticks[0..self.ctx._pending_ticks_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
@@ -242,6 +253,10 @@ pub fn Ctx(comptime Msg: type) type {
             /// If the runtime cannot start or track the timer helper, this
             /// API currently has no failure callback and the timer message may
             /// never be delivered.
+            ///
+            /// The runtime reuses this template for every firing and may drop
+            /// it without calling `Msg.deinitUndelivered`. Use only a
+            /// non-owning/copy-safe message variant.
             pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
                 for (self.ctx._pending_everys[0..self.ctx._pending_everys_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {

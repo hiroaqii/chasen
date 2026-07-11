@@ -13,6 +13,8 @@ const Selection = struct {
     };
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         move_up,
         move_down,
         quit,

@@ -76,6 +76,10 @@ const App = struct {
     // Input events, timers, tasks, and frame events are converted into these
     // messages before they reach `update`.
     pub const Msg = union(enum) {
+        // This app's messages carry no heap ownership. Every Chasen app must
+        // choose an undelivered-message policy explicitly.
+        pub const undelivered_policy = .plain;
+
         inc,
         dec,
         quit,
@@ -131,6 +135,41 @@ pub fn main(init: std.process.Init) !void {
 The runtime owns terminal setup, the event loop, effect draining, redraw policy,
 and terminal cleanup. The app owns its state and decides how events become
 messages.
+
+### Undelivered Message Ownership
+
+Every root `App.Msg` must declare an explicit shutdown ownership policy:
+
+```zig
+pub const undelivered_policy = .plain;
+```
+
+Use `.plain` only when every asynchronously produced message is safe to discard
+by value. If a task result can own heap memory, choose `.deinit` and implement:
+
+```zig
+pub const undelivered_policy = .deinit;
+
+pub fn deinitUndelivered(msg: *Msg, allocator: std.mem.Allocator) void {
+    switch (msg.*) {
+        .loaded => |payload| allocator.free(payload),
+        else => {},
+    }
+    msg.* = undefined;
+}
+```
+
+Chasen calls this hook on the runtime thread when a message can no longer enter
+`App.update`, including task results completed during shutdown. A message passed
+to `update` is already app-owned, even if `update` returns an error. Timer
+templates passed to `tick` and `every` must remain non-owning/copy-safe; the
+hook is for produced results, not for cleaning timer templates. See
+[`docs/RUNTIME_MESSAGE_OWNERSHIP.md`](docs/RUNTIME_MESSAGE_OWNERSHIP.md) for the
+complete delivery and shutdown contract. For a runnable implementation, see
+[`examples/owned_task_result/main.zig`](examples/owned_task_result/main.zig),
+which demonstrates normal `update` adoption, app-state cleanup, task failure,
+and undelivered-result cleanup. Run it with
+`zig build run-owned_task_result`.
 
 ## Runtime Flow
 
@@ -258,18 +297,23 @@ the runtime after `init` or `update` returns. This keeps state changes and
 runtime work in a clear order.
 
 Task effects are delivered as either the task's success message or the required
-`failed(.start_failed)` message when the runtime cannot start the task. If a
+`failed(.start_failed)` message when the runtime cannot start the task. A task
+left queued during runtime error unwind receives `.runtime_abandoned`; its
+failure callback must consume any `spawnWith` context, but the returned message
+is deinitialized without entering `update`. If a
 terminal foreground command is running, completed task results are queued by the
 event loop and delivered after Chasen resumes. Apps must still use request ids,
 generations, or other identity checks for stale results; foreground completion
 ordering is not a correctness contract. Started task futures are awaited during
-terminal shutdown, so task functions should eventually return; a task that never
-returns can block shutdown.
+terminal shutdown. Results that can no longer be delivered use the root Msg
+policy above, so task functions should eventually return; a task that never
+returns can still block shutdown.
 
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
 waits for the interval again. Timer intervals do not compensate for app
-update/render time.
+update/render time. Timer message templates are copied/reused and must not own
+heap allocations.
 If the runtime cannot start or track a `tick` / `every` helper, there is no
 timer failure callback and the timer message may never be delivered. Timers are
 canceled during shutdown, but completed one-shot timer handles can remain
@@ -457,6 +501,7 @@ zig build run-counter        # minimal state/update/view loop
 zig build run-selection      # selectable menu with Event -> Msg -> update
 zig build run-stopwatch      # repeating timer with ctx.timer().every
 zig build run-tick           # one-shot timer and timer cancellation
+zig build run-owned_task_result # allocator-owned task result cleanup
 zig build run-animation      # frame request loop
 zig build run-surface_layout # Rect-based regions and child surfaces
 zig build run-runtime_stats  # runtime timing stats callback

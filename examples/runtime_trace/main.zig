@@ -35,6 +35,8 @@ const RuntimeTraceDemo = struct {
     frame_index: u64 = 0,
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         frame: chasen.Frame,
         toggle,
         quit,

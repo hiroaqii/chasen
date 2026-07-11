@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         "stopwatch",
         "tick",
         "http",
+        "owned_task_result",
         "animation",
         "runtime_stats",
         "runtime_trace",

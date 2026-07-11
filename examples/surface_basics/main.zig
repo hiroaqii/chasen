@@ -6,6 +6,8 @@ const chasen = @import("chasen");
 // and cursor coordinates inside a child surface.
 const SurfaceBasics = struct {
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .plain;
+
         quit,
     };
 
