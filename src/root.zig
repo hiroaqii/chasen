@@ -33,6 +33,10 @@ pub const foreground_command = @import("foreground_command.zig");
 pub const ForegroundCommandRequestId = foreground_command.ForegroundCommandRequestId;
 pub const ForegroundCommandOutcome = foreground_command.ForegroundCommandOutcome;
 pub const ForegroundCommandResult = foreground_command.ForegroundCommandResult;
+pub const clipboard = @import("clipboard.zig");
+pub const ClipboardCopyRequestId = clipboard.ClipboardCopyRequestId;
+pub const ClipboardCopyOutcome = clipboard.ClipboardCopyOutcome;
+pub const ClipboardCopyResult = clipboard.ClipboardCopyResult;
 
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;

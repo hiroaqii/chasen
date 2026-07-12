@@ -286,10 +286,13 @@ const request_id = try ctx.image().loadPath(path, loaded, failed);
 try ctx.image().unload(handle);
 
 // Send text to the terminal clipboard with a best-effort OSC 52 write.
-try ctx.terminal().copyToClipboard(.{
+const clipboard_request_id = try ctx.terminal().copyToClipboard(.{
     .text = text,
     .finished = App.clipboardCopyFinished,
 });
+
+// `ClipboardCopyResult.request_id` is the same opaque id. Keep any semantic
+// page/surface metadata in app state under this id and take it on completion.
 ```
 
 Effects are not executed immediately. They are stored in `Ctx` and drained by
@@ -329,7 +332,11 @@ delivered frame can include a large elapsed delta.
 Terminal clipboard writes use OSC 52 and are best-effort. A `.sent` result means
 Chasen emitted the clipboard sequence to the tty; it does not prove that the
 terminal or tmux accepted the payload. Detectable local write failures are
-reported through the `finished` callback.
+reported through the `finished` callback. `copyToClipboard` returns a
+`ClipboardCopyRequestId`, and the callback receives the same id in
+`ClipboardCopyResult`. Chasen owns the physical write only; apps should correlate
+that id with request-time page or operation-surface metadata when completion
+presentation depends on semantic origin.
 
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct

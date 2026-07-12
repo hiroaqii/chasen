@@ -1195,7 +1195,10 @@ fn processPendingClipboardCopies(
     var needs_render = false;
     for (entries) |entry| {
         const outcome: ctx_mod.Ctx(App.Msg).ClipboardCopyOutcome = if (vx.*.copyToSystemClipboard(tty.writer(), entry.text, allocator)) |_| .sent else |err| .{ .write_failed = @errorName(err) };
-        needs_render = try applyMsg(App, app, entry.finished(.{ .outcome = outcome }), app_ctx, io, stats, opts) or needs_render;
+        needs_render = try applyMsg(App, app, entry.finished(.{
+            .request_id = entry.request_id,
+            .outcome = outcome,
+        }), app_ctx, io, stats, opts) or needs_render;
     }
 
     return needs_render;

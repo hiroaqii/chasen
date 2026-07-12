@@ -1,6 +1,7 @@
 const std = @import("std");
 const terminal_image = @import("terminal_image_types.zig");
 const foreground_command = @import("foreground_command.zig");
+const clipboard_types = @import("clipboard.zig");
 const runtime_limits = @import("runtime_limits.zig");
 
 pub const TaskFailure = union(enum) {
@@ -39,7 +40,7 @@ pub fn Ctx(comptime Msg: type) type {
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
         pub const ForegroundCommandFinishedFn = *const fn (foreground_command.ForegroundCommandResult) Msg;
-        pub const ClipboardCopyFinishedFn = *const fn (ClipboardCopyResult) Msg;
+        pub const ClipboardCopyFinishedFn = *const fn (clipboard_types.ClipboardCopyResult) Msg;
 
         pub const TickEntry = struct {
             id: []const u8,
@@ -89,24 +90,12 @@ pub fn Ctx(comptime Msg: type) type {
             finished: ForegroundCommandFinishedFn,
         };
 
-        pub const ClipboardCopyOutcome = union(enum) {
-            /// The runtime emitted the OSC 52 sequence to the tty.
-            ///
-            /// OSC 52 write has no ACK, so this does not prove the terminal
-            /// accepted the clipboard payload. If multiple clipboard copies
-            /// are emitted in one drain, terminals normally keep the last one.
-            sent,
-            /// The current runtime cannot perform terminal clipboard writes.
-            unsupported_runtime,
-            /// The local tty write failed before the OSC 52 sequence was emitted.
-            write_failed: []const u8,
-        };
-
-        pub const ClipboardCopyResult = struct {
-            outcome: ClipboardCopyOutcome,
-        };
+        pub const ClipboardCopyOutcome = clipboard_types.ClipboardCopyOutcome;
+        pub const ClipboardCopyResult = clipboard_types.ClipboardCopyResult;
+        pub const ClipboardCopyRequestId = clipboard_types.ClipboardCopyRequestId;
 
         pub const ClipboardCopyEntry = struct {
+            request_id: clipboard_types.ClipboardCopyRequestId,
             text: []const u8,
             finished: ClipboardCopyFinishedFn,
         };
@@ -135,6 +124,7 @@ pub fn Ctx(comptime Msg: type) type {
         _next_foreground_command_request_id: u64 = 1,
         _pending_clipboard_copies: [max_clipboard_copies]ClipboardCopyEntry = undefined,
         _pending_clipboard_copies_len: u8 = 0,
+        _next_clipboard_copy_request_id: u64 = 1,
         _redraw_suppressed: bool = false,
         _frame_requested: bool = false,
 
@@ -408,24 +398,33 @@ pub fn Ctx(comptime Msg: type) type {
             /// after `update` returns. The `finished` callback reports whether
             /// the runtime emitted the sequence or hit a detectable local
             /// failure; terminal-side clipboard acceptance cannot be proven.
+            /// The returned request id is repeated in `ClipboardCopyResult` so
+            /// apps can route presentation through metadata captured when the
+            /// copy was queued instead of reconstructing origin in a callback.
             ///
             /// If multiple copies are emitted in one drain, terminals normally
             /// keep the last payload.
             pub fn copyToClipboard(
                 self: TerminalEffects,
                 opts: ClipboardCopyOptions,
-            ) (error{ClipboardCopyLimitExceeded} || std.mem.Allocator.Error)!void {
+            ) (error{ClipboardCopyLimitExceeded} || std.mem.Allocator.Error)!clipboard_types.ClipboardCopyRequestId {
                 if (self.ctx._pending_clipboard_copies_len >= max_clipboard_copies)
                     return error.ClipboardCopyLimitExceeded;
 
                 const copied_text = try self.ctx._allocator.dupe(u8, opts.text);
                 errdefer self.ctx._allocator.free(copied_text);
 
+                const request_id: clipboard_types.ClipboardCopyRequestId = .{
+                    .id = self.ctx._next_clipboard_copy_request_id,
+                };
+                self.ctx._next_clipboard_copy_request_id +%= 1;
                 self.ctx._pending_clipboard_copies[self.ctx._pending_clipboard_copies_len] = .{
+                    .request_id = request_id,
                     .text = copied_text,
                     .finished = opts.finished,
                 };
                 self.ctx._pending_clipboard_copies_len += 1;
+                return request_id;
             }
         };
 
@@ -980,18 +979,18 @@ test "Ctx terminal foreground command rejects empty argv and overflow" {
 }
 
 test "Ctx terminal clipboard copy queues owned text" {
-    const TestMsg = union(enum) { finished };
+    const TestMsg = union(enum) { finished: u64 };
     var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
     defer ctx_val.runtimeClearPendingEffectCopies();
 
     const finished = &struct {
-        fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
-            return .finished;
+        fn done(result: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
+            return .{ .finished = result.request_id.id };
         }
     }.done;
 
     var text = [_]u8{ 'c', 'l', 'i', 'p' };
-    try ctx_val.terminal().copyToClipboard(.{
+    const request_id = try ctx_val.terminal().copyToClipboard(.{
         .text = text[0..],
         .finished = finished,
     });
@@ -1000,8 +999,11 @@ test "Ctx terminal clipboard copy queues owned text" {
     text[0] = 'X';
 
     const entry = ctx_val._pending_clipboard_copies[0..ctx_val._pending_clipboard_copies_len][0];
+    try std.testing.expectEqual(request_id.id, entry.request_id.id);
     try std.testing.expectEqualStrings("clip", entry.text);
     try std.testing.expectEqual(@as(Ctx(TestMsg).ClipboardCopyFinishedFn, finished), entry.finished);
+    const completion = entry.finished(.{ .request_id = entry.request_id, .outcome = .sent });
+    try std.testing.expectEqual(request_id.id, completion.finished);
 }
 
 test "Ctx terminal clipboard copy rejects overflow" {
@@ -1016,7 +1018,7 @@ test "Ctx terminal clipboard copy rejects overflow" {
     }.done;
 
     for (0..4) |_| {
-        try ctx_val.terminal().copyToClipboard(.{
+        _ = try ctx_val.terminal().copyToClipboard(.{
             .text = "clip",
             .finished = finished,
         });
@@ -1132,7 +1134,7 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
             }
         }.done,
     });
-    try ctx_val.terminal().copyToClipboard(.{
+    _ = try ctx_val.terminal().copyToClipboard(.{
         .text = "clipboard",
         .finished = &struct {
             fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {
@@ -1199,7 +1201,7 @@ test "Ctx clipboard pending helper transitions through take" {
     defer ctx_val.runtimeClearPendingEffectCopies();
 
     try std.testing.expectEqual(false, ctx_val.hasPendingClipboardCopies());
-    try ctx_val.terminal().copyToClipboard(.{
+    _ = try ctx_val.terminal().copyToClipboard(.{
         .text = "clip",
         .finished = &struct {
             fn done(_: Ctx(TestMsg).ClipboardCopyResult) TestMsg {

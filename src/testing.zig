@@ -232,7 +232,7 @@ test "resetTransient clears pending queues and redraw suppression" {
     try tc.ctx.timer().tick("t1", 1_000, .inc);
     try tc.ctx.timer().every("e1", 2_000, .dec);
     try tc.ctx.timer().cancel("x");
-    try tc.ctx.terminal().copyToClipboard(.{
+    _ = try tc.ctx.terminal().copyToClipboard(.{
         .text = "clip",
         .finished = &struct {
             fn done(_: ctx_mod.Ctx(TestMsg).ClipboardCopyResult) TestMsg {

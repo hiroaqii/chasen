@@ -98,6 +98,14 @@ markers and owns the temporary buffer for that one dispatch. Chasen pins a
 libvaxis revision whose parser also frees the decode buffer when malformed
 base64 fails before an event can be constructed.
 
+Clipboard writes have a separate correlation contract. `copyToClipboard`
+returns an opaque `ClipboardCopyRequestId`, and its completion repeats that id.
+The runtime copies and owns queued text until the OSC 52 write is drained, but it
+does not own application page/surface metadata. Apps retain that semantic
+metadata under the request id and consume it on matching completion; unknown or
+superseded ids can therefore be discarded without reconstructing origin in a
+static callback.
+
 Started tasks are awaited rather than force-cancelled because the task API
 returns an application message, not a cancellation-aware result. A task that
 never returns can therefore block shutdown. Keep task bodies finite and use
