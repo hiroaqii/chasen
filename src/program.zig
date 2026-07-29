@@ -6,6 +6,7 @@ const Surface = surface_mod.Surface;
 const ctx_mod = @import("ctx.zig");
 const root = @import("root.zig");
 const terminal_image = @import("terminal_image.zig");
+const terminal_mouse = @import("terminal_mouse.zig");
 const foreground_command = @import("foreground_command.zig");
 const runtime_limits = @import("runtime_limits.zig");
 
@@ -501,6 +502,11 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // Start the loop before querying the terminal. queryTerminal waits for
     // terminal capability responses, which are read and processed by the loop.
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
+    var mouse_reader = loopReader(&loop, io);
+    const mouse_policy: terminal_mouse.Policy = .{
+        .enabled = opts.terminal.mouse,
+        .coordinate_protocol = opts.terminal.mouse_coordinate_protocol,
+    };
     try loop.start();
     // Setup unwind uses the same cancellation-based reader stop as normal
     // shutdown. It must not depend on allocating an additional worker after
@@ -517,13 +523,13 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         _ = vx.setBracketedPaste(tty.writer(), false) catch {};
     }
 
-    if (opts.terminal.mouse) {
-        try vx.setMouseMode(tty.writer(), true);
-    }
     defer {
-        if (opts.terminal.mouse) {
-            _ = vx.setMouseMode(tty.writer(), false) catch {};
-        }
+        // This also covers setup errors before shutdownRuntime owns the loop.
+        // The reader must be stopped before every best-effort reset.
+        _ = mouse_policy.leaveWithReader(&vx, tty.writer(), &mouse_reader) catch {};
+    }
+    if (mouse_policy.enabled) {
+        try mouse_policy.enterWithReader(&vx, tty.writer(), &mouse_reader);
     }
 
     // --- Frame arena ---
@@ -610,7 +616,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
         var init_stats: ?root.RuntimeStats = null;
-        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -627,7 +633,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -738,7 +744,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -825,6 +831,28 @@ fn stopLoopAndDrain(
 ) void {
     stopLoopReader(loop, io);
     drainInternalEventsForShutdown(Msg, loop, allocator);
+}
+
+fn LoopReader(comptime Loop: type) type {
+    return struct {
+        loop: *Loop,
+        io: std.Io,
+
+        pub fn stop(self: *@This()) void {
+            stopLoopReader(self.loop, self.io);
+        }
+
+        pub fn start(self: *@This()) !void {
+            try self.loop.start();
+        }
+    };
+}
+
+fn loopReader(loop: anytype, io: std.Io) LoopReader(@TypeOf(loop.*)) {
+    return .{
+        .loop = loop,
+        .io = io,
+    };
 }
 
 /// Cancel the already-started vaxis reader future in place.
@@ -1089,6 +1117,7 @@ fn drainPendingEffects(
     last_frame_ns: u64,
     next_frame_index: u64,
     stats: *?root.RuntimeStats,
+    mouse_policy: terminal_mouse.Policy,
     opts: root.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
@@ -1097,7 +1126,7 @@ fn drainPendingEffects(
     for (0..max_effect_drain_rounds) |round| {
         const completion_result = try applyRuntimeCompletions(App, app, app_ctx, runtime_completions, allocator, io, stats, opts);
         result.needs_render = result.needs_render or completion_result.needs_render;
-        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, opts.terminal.mouse, opts.terminal.keyboard_protocol, stats, opts);
+        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, mouse_policy, opts.terminal.keyboard_protocol, stats, opts);
         result.needs_render = result.needs_render or foreground_needs_render;
         const clipboard_needs_render = try processPendingClipboardCopies(App, app, app_ctx, vx, tty, allocator, io, stats, opts);
         result.needs_render = result.needs_render or clipboard_needs_render;
@@ -1130,7 +1159,7 @@ fn processPendingForegroundCommands(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(App.Msg)),
     suspended: *std.atomic.Value(bool),
-    mouse_enabled: bool,
+    mouse_policy: terminal_mouse.Policy,
     keyboard_protocol: root.KeyboardProtocol,
     stats: *?root.RuntimeStats,
     opts: root.RunOptions,
@@ -1144,7 +1173,7 @@ fn processPendingForegroundCommands(
     for (pending_commands) |entry| {
         defer freeForegroundCommandEntry(allocator, entry);
 
-        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, mouse_enabled, keyboard_protocol, entry);
+        const outcome = try runForegroundCommand(vx, tty, allocator, io, loop, suspended, mouse_policy, keyboard_protocol, entry);
         const result: foreground_command.ForegroundCommandResult = .{
             .request_id = entry.request_id,
             .outcome = outcome,
@@ -1211,7 +1240,7 @@ fn runForegroundCommand(
     io: std.Io,
     loop: anytype,
     suspended: *std.atomic.Value(bool),
-    mouse_enabled: bool,
+    mouse_policy: terminal_mouse.Policy,
     keyboard_protocol: root.KeyboardProtocol,
     entry: anytype,
 ) !foreground_command.ForegroundCommandOutcome {
@@ -1222,14 +1251,12 @@ fn runForegroundCommand(
     suspended.store(true, .seq_cst);
     defer suspended.store(false, .seq_cst);
 
-    // Mouse reporting is part of Chasen's terminal ownership. Disable it
-    // before handing /dev/tty to an interactive child process.
-    if (mouse_enabled) {
-        _ = vx.setMouseMode(tty.writer(), false) catch {};
-    }
+    // Mouse reporting is part of Chasen's terminal ownership. Recover reader
+    // ownership before resetting it; a reset failure prevents child admission.
+    var mouse_reader = loopReader(loop, io);
+    try mouse_policy.leaveWithReader(vx, tty.writer(), &mouse_reader);
     // Do not leak Chasen's paste mode into the foreground child process.
     _ = vx.setBracketedPaste(tty.writer(), false) catch {};
-    stopLoopReader(loop, io);
     _ = vx.exitAltScreen(tty.writer()) catch {};
 
     // Keep the parent /dev/tty fd open. Closing and reopening it would leave
@@ -1237,7 +1264,7 @@ fn runForegroundCommand(
     try leaveRawMode(tty);
 
     const outcome = runChildOnControllingTty(io, entry.argv, entry.cwd);
-    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_enabled, keyboard_protocol);
+    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_policy, keyboard_protocol);
 
     return outcome;
 }
@@ -1281,7 +1308,7 @@ fn restoreTerminalAfterForeground(
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: anytype,
-    mouse_enabled: bool,
+    mouse_policy: terminal_mouse.Policy,
     keyboard_protocol: root.KeyboardProtocol,
 ) !void {
     try enterRawMode(tty);
@@ -1291,8 +1318,9 @@ fn restoreTerminalAfterForeground(
     // Capability and size refresh are useful after returning from an editor,
     // but failure here should not leave the runtime stopped.
     queryTerminal(vx, tty.writer(), io, .fromSeconds(1), keyboard_protocol) catch {};
-    if (mouse_enabled) {
-        _ = vx.setMouseMode(tty.writer(), true) catch {};
+    if (mouse_policy.enabled) {
+        var mouse_reader = loopReader(loop, io);
+        try mouse_policy.enterWithReader(vx, tty.writer(), &mouse_reader);
     }
     _ = vx.setBracketedPaste(tty.writer(), true) catch {};
 
@@ -2157,6 +2185,10 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         0,
         0,
         &stats,
+        .{
+            .enabled = false,
+            .coordinate_protocol = .cell_sgr,
+        },
         .{ .runtime = .{
             .allocator = std.testing.allocator,
             .io = std.testing.io,

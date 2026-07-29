@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const terminal_mouse = @import("terminal_mouse.zig");
 
 pub const runtime = @import("runtime.zig");
 
@@ -111,6 +112,9 @@ pub const KeyboardProtocol = enum {
     kitty,
 };
 
+/// Coordinate protocol used for terminal mouse reports.
+pub const MouseCoordinateProtocol = terminal_mouse.CoordinateProtocol;
+
 /// Terminal-backend options for `runWith`.
 pub const TerminalOptions = struct {
     env_map: *std.process.Environ.Map,
@@ -127,6 +131,11 @@ pub const TerminalOptions = struct {
     /// This is opt-in because terminal mouse reporting can interfere with
     /// normal text selection/copy in many terminal emulators.
     mouse: bool = false,
+    /// Coordinate protocol used when mouse reporting is enabled.
+    ///
+    /// Cell SGR is the portable default across terminals and multiplexers.
+    /// Use `.auto` only when the complete terminal path preserves pixel SGR.
+    mouse_coordinate_protocol: MouseCoordinateProtocol = .cell_sgr,
     /// Keyboard protocol used by the terminal backend.
     keyboard_protocol: KeyboardProtocol = .legacy,
 };
@@ -195,12 +204,13 @@ test "validateApp accepts apps without handleEvent" {
     comptime validateApp(App);
 }
 
-test "TerminalOptions mouse defaults to disabled" {
+test "TerminalOptions mouse coordinate protocol defaults to portable cell sgr" {
     const opts: TerminalOptions = .{
         .env_map = undefined,
     };
 
     try std.testing.expectEqual(false, opts.mouse);
+    try std.testing.expectEqual(MouseCoordinateProtocol.cell_sgr, opts.mouse_coordinate_protocol);
     try std.testing.expectEqual(KeyboardProtocol.legacy, opts.keyboard_protocol);
 }
 

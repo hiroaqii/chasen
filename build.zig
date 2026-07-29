@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Filter tests by name");
+    const test_filters = if (test_filter) |filter|
+        b.allocator.dupe([]const u8, &.{filter}) catch @panic("OOM")
+    else
+        &.{};
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -155,9 +160,11 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = test_filters,
     });
     const runtime_mod_tests = b.addTest(.{
         .root_module = runtime_mod,
+        .filters = test_filters,
     });
 
     // A run step that will run the test executable.
