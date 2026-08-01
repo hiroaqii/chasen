@@ -152,17 +152,6 @@ pub fn Ctx(comptime Msg: type) type {
             pub fn skip(self: RedrawEffects) void {
                 self.ctx._redraw_suppressed = true;
             }
-
-            /// Restore the default redraw for the current update cycle.
-            ///
-            /// An update tail may publish visual state after the message
-            /// handler already called `skip()`. Call this from such tail
-            /// code so the cycle still renders one frame. Like `skip`, this
-            /// is scoped to the current cycle; the runtime resets the flag
-            /// before the next update.
-            pub fn force(self: RedrawEffects) void {
-                self.ctx._redraw_suppressed = false;
-            }
         };
 
         pub const TaskEffects = struct {
@@ -1053,16 +1042,6 @@ test "Ctx redraw skip sets _redraw_suppressed to true" {
 
     ctx_val.redraw().skip();
     try std.testing.expectEqual(true, ctx_val._redraw_suppressed);
-}
-
-test "Ctx redraw force overrides an earlier skip within the cycle" {
-    const TestMsg = union(enum) { hello };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    ctx_val.redraw().skip();
-    ctx_val.redraw().force();
-    try std.testing.expectEqual(false, ctx_val._redraw_suppressed);
-    try std.testing.expectEqual(false, ctx_val.redrawWasSuppressed());
 }
 
 test "Ctx spawn and spawnWith share task limit" {

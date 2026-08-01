@@ -491,11 +491,9 @@ delivered at an exact fixed-rate cadence.
 
 `ctx.redraw().skip()` is message-scoped. The runtime resets that flag
 immediately before each `update`; if the update suppresses redraw, pending
-effects are still drained, but the redraw for that message is skipped.
-`ctx.redraw().force()` restores the redraw. The flag is last-writer-wins:
-whichever of `skip`/`force` runs later in the cycle decides. By convention
-`force()` is reserved for tail code that publishes visual state after the
-handler already made its redraw decision.
+effects are still drained, but the redraw for that message is skipped. An
+app that decides redraw in several places should compose its own disposition
+and call `skip()` at most once at the end of its update.
 
 ## Msg Ownership
 
