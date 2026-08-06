@@ -1,8 +1,110 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const terminal_image = @import("terminal_image_types.zig");
 const foreground_command = @import("foreground_command.zig");
 const clipboard_types = @import("clipboard.zig");
 const runtime_limits = @import("runtime_limits.zig");
+
+const foreground_command_duplicate_min_fd: c_int = 3;
+
+const DuplicateForegroundCommandDirResult = union(enum) {
+    success: std.Io.Dir,
+    interrupted,
+    invalid,
+    process_fd_quota,
+    system_fd_quota,
+    failed,
+};
+
+const NativeForegroundCommandCwdOps = struct {
+    fn duplicate(
+        _: @This(),
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        return switch (builtin.os.tag) {
+            .linux => duplicateLinux(dir, minimum_fd),
+            .macos => duplicateMacos(dir, minimum_fd),
+            else => unreachable,
+        };
+    }
+
+    fn duplicateLinux(
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        const rc = std.os.linux.fcntl(
+            dir.handle,
+            std.os.linux.F.DUPFD_CLOEXEC,
+            @intCast(minimum_fd),
+        );
+        return switch (std.os.linux.errno(rc)) {
+            .SUCCESS => .{ .success = .{ .handle = @intCast(rc) } },
+            .INTR => .interrupted,
+            .BADF => .invalid,
+            .MFILE => .process_fd_quota,
+            .NFILE => .system_fd_quota,
+            else => .failed,
+        };
+    }
+
+    fn duplicateMacos(
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, minimum_fd);
+        return switch (std.c.errno(rc)) {
+            .SUCCESS => .{ .success = .{ .handle = rc } },
+            .INTR => .interrupted,
+            .BADF => .invalid,
+            .MFILE => .process_fd_quota,
+            .NFILE => .system_fd_quota,
+            else => .failed,
+        };
+    }
+};
+
+fn targetSupportsForegroundCommandDir(comptime os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .linux or os_tag == .macos;
+}
+
+fn validateForegroundCommandCwdTarget(
+    cwd: foreground_command.ForegroundCommandCwd,
+) foreground_command.ForegroundCommandQueueError!void {
+    switch (cwd) {
+        .inherit, .path => {},
+        .dir => if (!targetSupportsForegroundCommandDir(builtin.os.tag))
+            return error.ForegroundCommandCwdUnsupported,
+    }
+}
+
+fn duplicateForegroundCommandDirWith(
+    dir: std.Io.Dir,
+    ops: anytype,
+) foreground_command.ForegroundCommandQueueError!std.Io.Dir {
+    while (true) switch (ops.duplicate(dir, foreground_command_duplicate_min_fd)) {
+        .success => |duplicate| return duplicate,
+        .interrupted => continue,
+        .invalid => return error.ForegroundCommandInvalidCwd,
+        .process_fd_quota => return error.ForegroundCommandProcessFdQuotaExceeded,
+        .system_fd_quota => return error.ForegroundCommandSystemFdQuotaExceeded,
+        .failed => return error.ForegroundCommandDuplicateCwdFailed,
+    };
+}
+
+fn closeForegroundCommandDir(dir: std.Io.Dir) void {
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.close(dir.handle),
+        .macos => _ = std.c.close(dir.handle),
+        else => unreachable,
+    }
+}
+
+const NativeForegroundCommandCwdCloseOps = struct {
+    fn close(_: @This(), dir: std.Io.Dir) void {
+        closeForegroundCommandDir(dir);
+    }
+};
 
 pub const TaskFailure = union(enum) {
     start_failed: []const u8,
@@ -83,11 +185,54 @@ pub fn Ctx(comptime Msg: type) type {
             failed: TerminalImageFailedFn,
         };
 
+        const OwnedForegroundCommandCwd = union(enum) {
+            inherit,
+            path: []const u8,
+            dir: std.Io.Dir,
+
+            fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+                self.deinitWith(gpa, NativeForegroundCommandCwdCloseOps{});
+            }
+
+            fn deinitWith(self: @This(), gpa: std.mem.Allocator, close_ops: anytype) void {
+                switch (self) {
+                    .inherit => {},
+                    .path => |path| gpa.free(path),
+                    .dir => |dir| close_ops.close(dir),
+                }
+            }
+
+            fn childCwd(self: @This()) std.process.Child.Cwd {
+                return switch (self) {
+                    .inherit => .inherit,
+                    .path => |path| .{ .path = path },
+                    .dir => |dir| .{ .dir = dir },
+                };
+            }
+        };
+
         pub const ForegroundCommandEntry = struct {
             request_id: foreground_command.ForegroundCommandRequestId,
             argv: []const []const u8,
-            cwd: ?[]const u8,
+            cwd: OwnedForegroundCommandCwd,
             finished: ForegroundCommandFinishedFn,
+
+            /// Runtime bridge for the sole owned-entry cleanup implementation.
+            pub fn runtimeDeinit(self: *@This(), gpa: std.mem.Allocator) void {
+                self.runtimeDeinitWith(gpa, NativeForegroundCommandCwdCloseOps{});
+            }
+
+            fn runtimeDeinitWith(self: *@This(), gpa: std.mem.Allocator, close_ops: anytype) void {
+                for (self.argv) |arg| gpa.free(arg);
+                gpa.free(self.argv);
+                self.cwd.deinitWith(gpa, close_ops);
+                self.* = undefined;
+            }
+
+            /// Runtime bridge from the owned queue form to child spawn input.
+            pub fn runtimeChildCwd(self: *const @This()) std.process.Child.Cwd {
+                return self.cwd.childCwd();
+            }
         };
 
         pub const ClipboardCopyOutcome = clipboard_types.ClipboardCopyOutcome;
@@ -332,7 +477,7 @@ pub fn Ctx(comptime Msg: type) type {
 
             pub const ForegroundCommandOptions = struct {
                 argv: []const []const u8,
-                cwd: ?[]const u8 = null,
+                cwd: foreground_command.ForegroundCommandCwd = .inherit,
                 finished: ForegroundCommandFinishedFn,
             };
 
@@ -345,8 +490,12 @@ pub fn Ctx(comptime Msg: type) type {
             ///
             /// The runtime temporarily restores the terminal, runs the child
             /// connected to `/dev/tty`, then re-enters Chasen's terminal mode.
-            /// argv and cwd are copied while queueing because effects are
-            /// drained after `update` returns.
+            /// argv and `.path` cwd bytes are copied while queueing because
+            /// effects are drained after `update` returns. A `.dir` cwd is
+            /// duplicated with close-on-exec; the caller keeps ownership of
+            /// the original descriptor. `.inherit` and `.path` are available
+            /// on every supported target, while `.dir` is accepted on Linux
+            /// and macOS.
             ///
             /// A follow-up foreground command queued from `finished` is
             /// processed by bounded drain rounds without waiting for unrelated
@@ -355,12 +504,21 @@ pub fn Ctx(comptime Msg: type) type {
             pub fn runForegroundCommand(
                 self: TerminalEffects,
                 opts: ForegroundCommandOptions,
-            ) (error{ ForegroundCommandLimitExceeded, ForegroundCommandEmptyArgv } || std.mem.Allocator.Error)!foreground_command.ForegroundCommandRequestId {
+            ) foreground_command.ForegroundCommandQueueError!foreground_command.ForegroundCommandRequestId {
+                return self.runForegroundCommandWithCwdOps(opts, NativeForegroundCommandCwdOps{});
+            }
+
+            fn runForegroundCommandWithCwdOps(
+                self: TerminalEffects,
+                opts: ForegroundCommandOptions,
+                cwd_ops: anytype,
+            ) foreground_command.ForegroundCommandQueueError!foreground_command.ForegroundCommandRequestId {
                 if (opts.argv.len == 0) return error.ForegroundCommandEmptyArgv;
                 if (self.ctx._pending_foreground_commands_len >= max_foreground_commands)
                     return error.ForegroundCommandLimitExceeded;
+                try validateForegroundCommandCwdTarget(opts.cwd);
 
-                var copied_argv = try self.ctx._allocator.alloc([]const u8, opts.argv.len);
+                const copied_argv = try self.ctx._allocator.alloc([]const u8, opts.argv.len);
                 errdefer self.ctx._allocator.free(copied_argv);
 
                 var copied_count: usize = 0;
@@ -375,8 +533,12 @@ pub fn Ctx(comptime Msg: type) type {
                     copied_count += 1;
                 }
 
-                const copied_cwd = if (opts.cwd) |cwd| try self.ctx._allocator.dupe(u8, cwd) else null;
-                errdefer if (copied_cwd) |cwd| self.ctx._allocator.free(cwd);
+                const owned_cwd: OwnedForegroundCommandCwd = switch (opts.cwd) {
+                    .inherit => .inherit,
+                    .path => |path| .{ .path = try self.ctx._allocator.dupe(u8, path) },
+                    .dir => |dir| .{ .dir = try duplicateForegroundCommandDirWith(dir, cwd_ops) },
+                };
+                errdefer owned_cwd.deinit(self.ctx._allocator);
 
                 const request_id = foreground_command.ForegroundCommandRequestId{
                     .id = self.ctx._next_foreground_command_request_id,
@@ -385,7 +547,7 @@ pub fn Ctx(comptime Msg: type) type {
                 self.ctx._pending_foreground_commands[self.ctx._pending_foreground_commands_len] = .{
                     .request_id = request_id,
                     .argv = copied_argv,
-                    .cwd = copied_cwd,
+                    .cwd = owned_cwd,
                     .finished = opts.finished,
                 };
                 self.ctx._pending_foreground_commands_len += 1;
@@ -624,11 +786,8 @@ pub fn Ctx(comptime Msg: type) type {
             self._pending_terminal_image_unloads_len = 0;
 
             for (self._pending_foreground_commands[0..self._pending_foreground_commands_len]) |entry| {
-                for (entry.argv) |arg| {
-                    self._allocator.free(arg);
-                }
-                self._allocator.free(entry.argv);
-                if (entry.cwd) |cwd| self._allocator.free(cwd);
+                var owned_entry = entry;
+                owned_entry.runtimeDeinit(self._allocator);
             }
             self._pending_foreground_commands_len = 0;
 
@@ -637,6 +796,63 @@ pub fn Ctx(comptime Msg: type) type {
             }
             self._pending_clipboard_copies_len = 0;
         }
+    };
+}
+
+const InjectedForegroundCommandCwdOps = struct {
+    result: DuplicateForegroundCommandDirResult,
+    interrupt_once: bool = false,
+    call_count: usize = 0,
+    minimum_fd: ?c_int = null,
+
+    fn duplicate(
+        self: *@This(),
+        _: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        self.call_count += 1;
+        self.minimum_fd = minimum_fd;
+        if (self.interrupt_once) {
+            self.interrupt_once = false;
+            return .interrupted;
+        }
+        return self.result;
+    }
+};
+
+const CountingForegroundCommandCwdCloseOps = struct {
+    close_count: *usize,
+
+    fn close(self: @This(), _: std.Io.Dir) void {
+        self.close_count.* += 1;
+    }
+};
+
+fn foregroundCommandTestFdFlags(fd: std.Io.Dir.Handle) ?u32 {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            const rc = std.os.linux.fcntl(fd, std.os.linux.F.GETFD, 0);
+            break :blk switch (std.os.linux.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                else => null,
+            };
+        },
+        .macos => blk: {
+            const rc = std.c.fcntl(fd, std.c.F.GETFD);
+            break :blk switch (std.c.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                else => null,
+            };
+        },
+        else => null,
+    };
+}
+
+fn foregroundCommandTestCloexecFlag() u32 {
+    return switch (builtin.os.tag) {
+        .linux => std.os.linux.FD_CLOEXEC,
+        .macos => std.c.FD_CLOEXEC,
+        else => 0,
     };
 }
 
@@ -934,7 +1150,7 @@ test "Ctx terminal foreground command copies argv and cwd" {
     var cwd = [_]u8{ '/', 't', 'm', 'p' };
     const request_id = try ctx_val.terminal().runForegroundCommand(.{
         .argv = &.{ arg0[0..], arg1[0..] },
-        .cwd = cwd[0..],
+        .cwd = .{ .path = cwd[0..] },
         .finished = finished,
     });
 
@@ -949,7 +1165,10 @@ test "Ctx terminal foreground command copies argv and cwd" {
     try std.testing.expectEqual(@as(u64, 1), entry.request_id.id);
     try std.testing.expectEqualStrings("ed", entry.argv[0]);
     try std.testing.expectEqualStrings("file", entry.argv[1]);
-    try std.testing.expectEqualStrings("/tmp", entry.cwd.?);
+    switch (entry.cwd) {
+        .path => |path| try std.testing.expectEqualStrings("/tmp", path),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "Ctx terminal foreground command rejects empty argv and overflow" {
@@ -972,10 +1191,226 @@ test "Ctx terminal foreground command rejects empty argv and overflow" {
         .argv = &.{"true"},
         .finished = finished,
     });
-    try std.testing.expectError(error.ForegroundCommandLimitExceeded, ctx_val.terminal().runForegroundCommand(.{
-        .argv = &.{"false"},
+    const next_request_id = ctx_val._next_foreground_command_request_id;
+    try std.testing.expectError(error.ForegroundCommandEmptyArgv, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{},
+        .cwd = .{ .dir = std.Io.Dir.cwd() },
         .finished = finished,
     }));
+    try std.testing.expectError(error.ForegroundCommandLimitExceeded, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"false"},
+        .cwd = .{ .dir = std.Io.Dir.cwd() },
+        .finished = finished,
+    }));
+    try std.testing.expectEqual(next_request_id, ctx_val._next_foreground_command_request_id);
+}
+
+test "foreground command cwd target policy accepts descriptors only on Linux and macOS" {
+    try std.testing.expect(targetSupportsForegroundCommandDir(.linux));
+    try std.testing.expect(targetSupportsForegroundCommandDir(.macos));
+    try std.testing.expect(!targetSupportsForegroundCommandDir(.windows));
+    try std.testing.expect(!targetSupportsForegroundCommandDir(.wasi));
+}
+
+test "Ctx terminal foreground command maps descriptor duplication failures" {
+    if (!targetSupportsForegroundCommandDir(builtin.os.tag)) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    const finished = &struct {
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+    const cases = [_]struct {
+        injected: DuplicateForegroundCommandDirResult,
+        expected: anyerror,
+    }{
+        .{ .injected = .invalid, .expected = error.ForegroundCommandInvalidCwd },
+        .{ .injected = .process_fd_quota, .expected = error.ForegroundCommandProcessFdQuotaExceeded },
+        .{ .injected = .system_fd_quota, .expected = error.ForegroundCommandSystemFdQuotaExceeded },
+        .{ .injected = .failed, .expected = error.ForegroundCommandDuplicateCwdFailed },
+    };
+
+    for (cases) |case| {
+        var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+        defer ctx_val.runtimeClearPendingEffectCopies();
+        var ops: InjectedForegroundCommandCwdOps = .{ .result = case.injected };
+
+        try std.testing.expectError(case.expected, ctx_val.terminal().runForegroundCommandWithCwdOps(.{
+            .argv = &.{ "tool", "arg" },
+            .cwd = .{ .dir = std.Io.Dir.cwd() },
+            .finished = finished,
+        }, &ops));
+
+        try std.testing.expectEqual(@as(usize, 1), ops.call_count);
+        try std.testing.expectEqual(@as(?c_int, foreground_command_duplicate_min_fd), ops.minimum_fd);
+        try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_foreground_commands_len);
+        try std.testing.expectEqual(@as(u64, 1), ctx_val._next_foreground_command_request_id);
+    }
+}
+
+test "Ctx terminal foreground command retries interrupted descriptor duplication" {
+    if (!targetSupportsForegroundCommandDir(builtin.os.tag)) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "caller", .default_dir);
+    const caller_dir = try tmp.dir.openDir(std.testing.io, "caller", .{});
+    defer caller_dir.close(std.testing.io);
+
+    const real_duplicate = try duplicateForegroundCommandDirWith(caller_dir, NativeForegroundCommandCwdOps{});
+    var ops: InjectedForegroundCommandCwdOps = .{
+        .result = .{ .success = real_duplicate },
+        .interrupt_once = true,
+    };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    _ = try ctx_val.terminal().runForegroundCommandWithCwdOps(.{
+        .argv = &.{"true"},
+        .cwd = .{ .dir = caller_dir },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    }, &ops);
+
+    try std.testing.expectEqual(@as(usize, 2), ops.call_count);
+    try std.testing.expectEqual(@as(?c_int, foreground_command_duplicate_min_fd), ops.minimum_fd);
+}
+
+test "Ctx terminal foreground command rejects cwd pseudo descriptor" {
+    if (!targetSupportsForegroundCommandDir(builtin.os.tag)) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+
+    try std.testing.expectError(error.ForegroundCommandInvalidCwd, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .cwd = .{ .dir = std.Io.Dir.cwd() },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    }));
+}
+
+test "Ctx terminal foreground command rejects an already closed cwd descriptor" {
+    if (!targetSupportsForegroundCommandDir(builtin.os.tag)) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "closed", .default_dir);
+    const closed_dir = try tmp.dir.openDir(std.testing.io, "closed", .{});
+    closed_dir.close(std.testing.io);
+
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer ctx_val.runtimeClearPendingEffectCopies();
+    try std.testing.expectError(error.ForegroundCommandInvalidCwd, ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .cwd = .{ .dir = closed_dir },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    }));
+    try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u64, 1), ctx_val._next_foreground_command_request_id);
+}
+
+test "Ctx pending cleanup closes only the owned cwd duplicate" {
+    if (!targetSupportsForegroundCommandDir(builtin.os.tag)) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "caller", .default_dir);
+    const caller_dir = try tmp.dir.openDir(std.testing.io, "caller", .{});
+    defer caller_dir.close(std.testing.io);
+
+    var ctx_val: Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    _ = try ctx_val.terminal().runForegroundCommand(.{
+        .argv = &.{"true"},
+        .cwd = .{ .dir = caller_dir },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
+
+    const duplicate_fd = switch (ctx_val._pending_foreground_commands[0].cwd) {
+        .dir => |dir| dir.handle,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(duplicate_fd >= foreground_command_duplicate_min_fd);
+    try std.testing.expect(duplicate_fd != caller_dir.handle);
+    const duplicate_flags = foregroundCommandTestFdFlags(duplicate_fd) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(duplicate_flags & foregroundCommandTestCloexecFlag() != 0);
+    try std.testing.expect(foregroundCommandTestFdFlags(caller_dir.handle) != null);
+
+    ctx_val.runtimeClearPendingEffectCopies();
+    ctx_val.runtimeClearPendingEffectCopies();
+
+    try std.testing.expect(foregroundCommandTestFdFlags(duplicate_fd) == null);
+    try std.testing.expect(foregroundCommandTestFdFlags(caller_dir.handle) != null);
+}
+
+test "foreground command common entry cleanup invokes descriptor close once" {
+    const TestMsg = union(enum) { finished };
+    const argv = try std.testing.allocator.alloc([]const u8, 1);
+    errdefer std.testing.allocator.free(argv);
+    argv[0] = try std.testing.allocator.dupe(u8, "true");
+
+    var entry: Ctx(TestMsg).ForegroundCommandEntry = .{
+        .request_id = .{ .id = 1 },
+        .argv = argv,
+        .cwd = .{ .dir = std.Io.Dir.cwd() },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    };
+    var close_count: usize = 0;
+    entry.runtimeDeinitWith(
+        std.testing.allocator,
+        CountingForegroundCommandCwdCloseOps{ .close_count = &close_count },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), close_count);
+}
+
+test "Ctx terminal foreground command construction is leak free at every allocation" {
+    const Harness = struct {
+        const TestMsg = union(enum) { finished };
+
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            return .finished;
+        }
+
+        fn run(gpa: std.mem.Allocator) !void {
+            var ctx_val: Ctx(TestMsg) = .{ ._allocator = gpa };
+            defer ctx_val.runtimeClearPendingEffectCopies();
+            _ = ctx_val.terminal().runForegroundCommand(.{
+                .argv = &.{ "command", "first", "second" },
+                .cwd = .{ .path = "/tmp/foreground-command" },
+                .finished = done,
+            }) catch |err| {
+                try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_foreground_commands_len);
+                try std.testing.expectEqual(@as(u64, 1), ctx_val._next_foreground_command_request_id);
+                return err;
+            };
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "Ctx terminal clipboard copy queues owned text" {
@@ -1127,7 +1562,7 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
     }.failed);
     _ = try ctx_val.terminal().runForegroundCommand(.{
         .argv = &.{"true"},
-        .cwd = "/tmp",
+        .cwd = .{ .path = "/tmp" },
         .finished = &struct {
             fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
                 return .finished;
@@ -1153,15 +1588,17 @@ test "Ctx taken effect copies are not cleared by runtime cleanup" {
     try std.testing.expectEqualStrings("taken-tick", ticks[0].id);
     try std.testing.expectEqualStrings("image.png", loads[0].path);
     try std.testing.expectEqualStrings("true", foreground[0].argv[0]);
-    try std.testing.expectEqualStrings("/tmp", foreground[0].cwd.?);
+    switch (foreground[0].cwd) {
+        .path => |path| try std.testing.expectEqualStrings("/tmp", path),
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqualStrings("clipboard", clipboard[0].text);
 
     for (ticks) |entry| std.testing.allocator.free(entry.id);
     for (loads) |entry| std.testing.allocator.free(entry.path);
-    for (foreground) |entry| {
-        for (entry.argv) |arg| std.testing.allocator.free(arg);
-        std.testing.allocator.free(entry.argv);
-        if (entry.cwd) |cwd| std.testing.allocator.free(cwd);
+    for (foreground) |queued_entry| {
+        var entry = queued_entry;
+        entry.runtimeDeinit(std.testing.allocator);
     }
     for (clipboard) |entry| std.testing.allocator.free(entry.text);
 }
@@ -1184,10 +1621,9 @@ test "Ctx foreground pending helper transitions through take" {
 
     const foreground = ctx_val.takePendingForegroundCommands();
     defer {
-        for (foreground) |entry| {
-            for (entry.argv) |arg| std.testing.allocator.free(arg);
-            std.testing.allocator.free(entry.argv);
-            if (entry.cwd) |cwd| std.testing.allocator.free(cwd);
+        for (foreground) |queued_entry| {
+            var entry = queued_entry;
+            entry.runtimeDeinit(std.testing.allocator);
         }
     }
 
