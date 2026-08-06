@@ -32,6 +32,7 @@ pub const TerminalImageLoaderImage = terminal_image.LoaderImage;
 
 pub const foreground_command = @import("foreground_command.zig");
 pub const ForegroundCommandCwd = foreground_command.ForegroundCommandCwd;
+pub const ForegroundCommandEnvironment = foreground_command.ForegroundCommandEnvironment;
 pub const ForegroundCommandQueueError = foreground_command.ForegroundCommandQueueError;
 pub const ForegroundCommandRequestId = foreground_command.ForegroundCommandRequestId;
 pub const ForegroundCommandOutcome = foreground_command.ForegroundCommandOutcome;

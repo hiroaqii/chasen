@@ -1312,7 +1312,12 @@ fn runForegroundCommand(
     // run()'s deferred cleanup with a deinitialized tty if re-init failed.
     try leaveRawMode(tty);
 
-    const outcome = runChildOnControllingTty(io, entry.argv, entry.runtimeChildCwd());
+    const outcome = runChildOnControllingTty(
+        io,
+        entry.argv,
+        entry.runtimeChildCwd(),
+        entry.runtimeChildEnvironment(),
+    );
     try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_policy, keyboard_protocol);
 
     return outcome;
@@ -1322,6 +1327,7 @@ fn runChildOnControllingTty(
     io: std.Io,
     argv: []const []const u8,
     cwd: std.process.Child.Cwd,
+    environ_map: ?*const std.process.Environ.Map,
 ) foreground_command.ForegroundCommandOutcome {
     var child_tty = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch |err| {
         return .{ .spawn_failed = @errorName(err) };
@@ -1332,6 +1338,7 @@ fn runChildOnControllingTty(
         io,
         argv,
         cwd,
+        environ_map,
         .{ .file = child_tty },
         .{ .file = child_tty },
         .{ .file = child_tty },
@@ -1342,13 +1349,59 @@ fn spawnAndWaitForegroundCommand(
     io: std.Io,
     argv: []const []const u8,
     cwd: std.process.Child.Cwd,
+    environ_map: ?*const std.process.Environ.Map,
     stdin: std.process.SpawnOptions.StdIo,
     stdout: std.process.SpawnOptions.StdIo,
     stderr: std.process.SpawnOptions.StdIo,
 ) foreground_command.ForegroundCommandOutcome {
-    var child = std.process.spawn(io, .{
+    return spawnAndWaitForegroundCommandWithOps(
+        io,
+        argv,
+        cwd,
+        environ_map,
+        stdin,
+        stdout,
+        stderr,
+        NativeForegroundCommandProcessOps{},
+    );
+}
+
+const NativeForegroundCommandProcessOps = struct {
+    fn spawn(
+        _: @This(),
+        io: std.Io,
+        options: std.process.SpawnOptions,
+    ) std.process.SpawnError!std.process.Child {
+        return std.process.spawn(io, options);
+    }
+
+    fn wait(
+        _: @This(),
+        child: *std.process.Child,
+        io: std.Io,
+    ) std.process.Child.WaitError!std.process.Child.Term {
+        return child.wait(io);
+    }
+
+    fn kill(_: @This(), child: *std.process.Child, io: std.Io) void {
+        child.kill(io);
+    }
+};
+
+fn spawnAndWaitForegroundCommandWithOps(
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
+    environ_map: ?*const std.process.Environ.Map,
+    stdin: std.process.SpawnOptions.StdIo,
+    stdout: std.process.SpawnOptions.StdIo,
+    stderr: std.process.SpawnOptions.StdIo,
+    process_ops: anytype,
+) foreground_command.ForegroundCommandOutcome {
+    var child = process_ops.spawn(io, .{
         .argv = argv,
         .cwd = cwd,
+        .environ_map = environ_map,
         .stdin = stdin,
         .stdout = stdout,
         .stderr = stderr,
@@ -1356,8 +1409,8 @@ fn spawnAndWaitForegroundCommand(
         return .{ .spawn_failed = @errorName(err) };
     };
 
-    const term = child.wait(io) catch |err| {
-        child.kill(io);
+    const term = process_ops.wait(&child, io) catch |err| {
+        process_ops.kill(&child, io);
         return .{ .wait_failed = @errorName(err) };
     };
 
@@ -2670,6 +2723,74 @@ fn foregroundCommandTestTruePath() ![]const u8 {
     return error.SkipZigTest;
 }
 
+fn foregroundCommandTestPrintenvPath() ![]const u8 {
+    if (std.Io.Dir.accessAbsolute(std.testing.io, "/usr/bin/printenv", .{})) |_| {
+        return "/usr/bin/printenv";
+    } else |_| {}
+    if (std.Io.Dir.accessAbsolute(std.testing.io, "/bin/printenv", .{})) |_| {
+        return "/bin/printenv";
+    } else |_| {}
+    return error.SkipZigTest;
+}
+
+fn foregroundCommandTestShellPath() ![]const u8 {
+    if (std.Io.Dir.accessAbsolute(std.testing.io, "/bin/sh", .{})) |_| {
+        return "/bin/sh";
+    } else |_| {}
+    if (std.Io.Dir.accessAbsolute(std.testing.io, "/usr/bin/sh", .{})) |_| {
+        return "/usr/bin/sh";
+    } else |_| {}
+    return error.SkipZigTest;
+}
+
+fn foregroundCommandParentCanary(map: *const std.process.Environ.Map) ![]const u8 {
+    const non_secret_keys = [_][]const u8{
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "SHELL",
+        "XDG_RUNTIME_DIR",
+    };
+    for (non_secret_keys) |key| {
+        if (map.contains(key)) return key;
+    }
+    return error.SkipZigTest;
+}
+
+const InjectedForegroundCommandProcessOps = struct {
+    mode: enum { spawn_failure, wait_failure },
+    seen_environment: *?*const std.process.Environ.Map,
+    kill_count: *usize,
+
+    const ChildState = struct {};
+
+    fn spawn(
+        self: @This(),
+        _: std.Io,
+        options: std.process.SpawnOptions,
+    ) error{InjectedSpawn}!ChildState {
+        self.seen_environment.* = options.environ_map;
+        if (self.mode == .spawn_failure) return error.InjectedSpawn;
+        return .{};
+    }
+
+    fn wait(
+        self: @This(),
+        _: *ChildState,
+        _: std.Io,
+    ) error{InjectedWait}!std.process.Child.Term {
+        if (self.mode == .wait_failure) return error.InjectedWait;
+        return .{ .exited = 0 };
+    }
+
+    fn kill(self: @This(), _: *ChildState, _: std.Io) void {
+        self.kill_count.* += 1;
+    }
+};
+
 test "foreground command inherit cwd reaches child spawn" {
     const TestMsg = union(enum) { finished };
     var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
@@ -2694,6 +2815,7 @@ test "foreground command inherit cwd reaches child spawn" {
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
+        entry.runtimeChildEnvironment(),
         .ignore,
         .ignore,
         .ignore,
@@ -2702,6 +2824,204 @@ test "foreground command inherit cwd reaches child spawn" {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "foreground environment replacement snapshot reaches child without parent leakage" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "original", .default_dir);
+    var caller_dir = try tmp.dir.openDir(std.testing.io, "original", .{});
+    var caller_dir_live = true;
+    defer if (caller_dir_live) caller_dir.close(std.testing.io);
+    var caller_map: std.process.Environ.Map = .init(std.testing.allocator);
+    var caller_map_live = true;
+    defer if (caller_map_live) caller_map.deinit();
+    try caller_map.put("ISSUE55_VALUE", "queued-value");
+    try caller_map.put("ISSUE55_SECOND", "queued-second");
+    var parent_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer parent_map.deinit();
+    const parent_canary = try foregroundCommandParentCanary(&parent_map);
+
+    const printenv_path = try foregroundCommandTestPrintenvPath();
+    const shell_path = try foregroundCommandTestShellPath();
+    const caller_argv0 = try std.testing.allocator.dupe(u8, shell_path);
+    defer std.testing.allocator.free(caller_argv0);
+    // Test-only: the production path preserves caller argv and never inserts a
+    // shell. This fixture verifies only fixed test values and an allowlisted
+    // parent key, discards command output, then creates an empty cwd-relative
+    // marker. It never persists ambient environment values.
+    const caller_command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "test \"$ISSUE55_VALUE\" = queued-value && test \"$ISSUE55_SECOND\" = queued-second && ! {s} {s} >/dev/null 2>&1 && : > environment-marker",
+        .{ printenv_path, parent_canary },
+    );
+    defer std.testing.allocator.free(caller_command);
+    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer app_ctx.runtimeClearPendingEffectCopies();
+    _ = try app_ctx.terminal().runForegroundCommand(.{
+        .argv = &.{ caller_argv0, "-c", caller_command },
+        .cwd = .{ .dir = caller_dir },
+        .environment = .{ .replace = &caller_map },
+        .finished = &struct {
+            fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                return .finished;
+            }
+        }.done,
+    });
+
+    @memset(caller_argv0, 'x');
+    @memset(caller_command, 'x');
+    try caller_map.put("ISSUE55_VALUE", "caller-mutated");
+    try std.testing.expect(caller_map.orderedRemove("ISSUE55_SECOND"));
+    caller_map.deinit();
+    caller_map_live = false;
+    caller_dir.close(std.testing.io);
+    caller_dir_live = false;
+    try tmp.dir.rename("original", tmp.dir, "renamed", std.testing.io);
+    try tmp.dir.createDir(std.testing.io, "original", .default_dir);
+
+    const pending = app_ctx.takePendingForegroundCommands();
+    var entry = pending[0];
+    defer entry.runtimeDeinit(std.testing.allocator);
+    switch (entry.runtimeChildCwd()) {
+        .dir => {},
+        else => return error.TestUnexpectedResult,
+    }
+    const queued_environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+    const outcome = spawnAndWaitForegroundCommand(
+        std.testing.io,
+        entry.argv,
+        entry.runtimeChildCwd(),
+        queued_environment,
+        .ignore,
+        .ignore,
+        .ignore,
+    );
+    switch (outcome) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try tmp.dir.access(std.testing.io, "renamed/environment-marker", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "original/environment-marker", .{}));
+}
+
+test "foreground environment inherit and empty replacement remain distinct in child" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const TestMsg = union(enum) { finished };
+    const finished = &struct {
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            return .finished;
+        }
+    }.done;
+    var parent_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer parent_map.deinit();
+    const parent_canary = try foregroundCommandParentCanary(&parent_map);
+    const printenv_path = try foregroundCommandTestPrintenvPath();
+    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
+    defer app_ctx.runtimeClearPendingEffectCopies();
+
+    _ = try app_ctx.terminal().runForegroundCommand(.{
+        .argv = &.{ printenv_path, parent_canary },
+        .environment = .inherit,
+        .finished = finished,
+    });
+    {
+        const pending = app_ctx.takePendingForegroundCommands();
+        var entry = pending[0];
+        defer entry.runtimeDeinit(std.testing.allocator);
+        try std.testing.expect(entry.runtimeChildEnvironment() == null);
+        const outcome = spawnAndWaitForegroundCommand(
+            std.testing.io,
+            entry.argv,
+            entry.runtimeChildCwd(),
+            entry.runtimeChildEnvironment(),
+            .ignore,
+            .ignore,
+            .ignore,
+        );
+        switch (outcome) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var empty_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer empty_map.deinit();
+    _ = try app_ctx.terminal().runForegroundCommand(.{
+        .argv = &.{ printenv_path, parent_canary },
+        .environment = .{ .replace = &empty_map },
+        .finished = finished,
+    });
+    {
+        const pending = app_ctx.takePendingForegroundCommands();
+        var entry = pending[0];
+        defer entry.runtimeDeinit(std.testing.allocator);
+        const queued_empty = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), queued_empty.count());
+        const outcome = spawnAndWaitForegroundCommand(
+            std.testing.io,
+            entry.argv,
+            entry.runtimeChildCwd(),
+            queued_empty,
+            .ignore,
+            .ignore,
+            .ignore,
+        );
+        switch (outcome) {
+            .exited => |code| try std.testing.expect(code != 0),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "foreground environment spawn and wait seams preserve replacement pointer and failures" {
+    var replacement: std.process.Environ.Map = .init(std.testing.allocator);
+    defer replacement.deinit();
+    try replacement.put("ISSUE55_SEAM", "value");
+
+    var seen_environment: ?*const std.process.Environ.Map = null;
+    var kill_count: usize = 0;
+    const spawn_failure = spawnAndWaitForegroundCommandWithOps(
+        std.testing.io,
+        &.{"command"},
+        .inherit,
+        &replacement,
+        .ignore,
+        .ignore,
+        .ignore,
+        InjectedForegroundCommandProcessOps{
+            .mode = .spawn_failure,
+            .seen_environment = &seen_environment,
+            .kill_count = &kill_count,
+        },
+    );
+    try std.testing.expectEqualStrings("InjectedSpawn", spawn_failure.spawn_failed);
+    try std.testing.expect(seen_environment.? == &replacement);
+    try std.testing.expectEqual(@as(usize, 0), kill_count);
+
+    seen_environment = null;
+    const wait_failure = spawnAndWaitForegroundCommandWithOps(
+        std.testing.io,
+        &.{"command"},
+        .inherit,
+        &replacement,
+        .ignore,
+        .ignore,
+        .ignore,
+        InjectedForegroundCommandProcessOps{
+            .mode = .wait_failure,
+            .seen_environment = &seen_environment,
+            .kill_count = &kill_count,
+        },
+    );
+    try std.testing.expectEqualStrings("InjectedWait", wait_failure.wait_failed);
+    try std.testing.expect(seen_environment.? == &replacement);
+    try std.testing.expectEqual(@as(usize, 1), kill_count);
 }
 
 test "foreground command directory cwd keeps identity across rename and caller close" {
@@ -2744,6 +3064,7 @@ test "foreground command directory cwd keeps identity across rename and caller c
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
+        entry.runtimeChildEnvironment(),
         .ignore,
         .ignore,
         .ignore,
@@ -2801,6 +3122,7 @@ test "foreground command path cwd copies bytes and resolves at spawn time" {
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
+        entry.runtimeChildEnvironment(),
         .ignore,
         .ignore,
         .ignore,
@@ -2841,6 +3163,7 @@ test "foreground command accepts a duplicable non-directory and reports spawn fa
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
+        entry.runtimeChildEnvironment(),
         .ignore,
         .ignore,
         .ignore,
@@ -2871,6 +3194,7 @@ test "foreground command processing copies the taken owner before callback reque
     };
     const TestApp = struct {
         follow_up_dir: std.Io.Dir,
+        follow_up_environment: *const std.process.Environ.Map,
         update_count: usize = 0,
 
         pub const Msg = TestMsg;
@@ -2881,6 +3205,7 @@ test "foreground command processing copies the taken owner before callback reque
                 .first_finished => _ = try app_ctx.terminal().runForegroundCommand(.{
                     .argv = &.{"second"},
                     .cwd = .{ .dir = self.follow_up_dir },
+                    .environment = .{ .replace = self.follow_up_environment },
                     .finished = Callbacks.second,
                 }),
                 .second_finished => {},
@@ -2889,6 +3214,7 @@ test "foreground command processing copies the taken owner before callback reque
     };
     const Runner = struct {
         first_duplicate: *?std.Io.Dir.Handle,
+        first_environment_observed: *bool,
 
         fn run(
             self: @This(),
@@ -2898,6 +3224,9 @@ test "foreground command processing copies the taken owner before callback reque
                 .dir => |dir| dir.handle,
                 else => return error.TestUnexpectedResult,
             };
+            const environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("first", environment.get("ISSUE55_OWNER").?);
+            self.first_environment_observed.* = true;
             return .{ .exited = 0 };
         }
     };
@@ -2910,6 +3239,12 @@ test "foreground command processing copies the taken owner before callback reque
     defer first_dir.close(std.testing.io);
     const second_dir = try tmp.dir.openDir(std.testing.io, "second", .{});
     defer second_dir.close(std.testing.io);
+    var first_environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer first_environment.deinit();
+    try first_environment.put("ISSUE55_OWNER", "first");
+    var second_environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer second_environment.deinit();
+    try second_environment.put("ISSUE55_OWNER", "second");
 
     var app_ctx: ctx_mod.Ctx(TestMsg) = .{
         ._allocator = std.testing.allocator,
@@ -2919,11 +3254,16 @@ test "foreground command processing copies the taken owner before callback reque
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{"first"},
         .cwd = .{ .dir = first_dir },
+        .environment = .{ .replace = &first_environment },
         .finished = Callbacks.first,
     });
 
-    var app: TestApp = .{ .follow_up_dir = second_dir };
+    var app: TestApp = .{
+        .follow_up_dir = second_dir,
+        .follow_up_environment = &second_environment,
+    };
     var first_duplicate: ?std.Io.Dir.Handle = null;
+    var first_environment_observed = false;
     var stats: ?root.RuntimeStats = null;
     _ = try processPendingForegroundCommandsWithRunner(
         TestApp,
@@ -2939,10 +3279,14 @@ test "foreground command processing copies the taken owner before callback reque
             },
             .terminal = undefined,
         },
-        Runner{ .first_duplicate = &first_duplicate },
+        Runner{
+            .first_duplicate = &first_duplicate,
+            .first_environment_observed = &first_environment_observed,
+        },
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.update_count);
+    try std.testing.expect(first_environment_observed);
     const first_fd = first_duplicate orelse return error.TestUnexpectedResult;
     try std.testing.expect(!foregroundCommandProgramTestFdOpen(first_fd));
     try std.testing.expectEqual(@as(u8, 1), app_ctx._pending_foreground_commands_len);
@@ -2953,8 +3297,132 @@ test "foreground command processing copies the taken owner before callback reque
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(foregroundCommandProgramTestFdOpen(second_fd));
+    const follow_up_environment = app_ctx._pending_foreground_commands[0].runtimeChildEnvironment() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("second", follow_up_environment.get("ISSUE55_OWNER").?);
     app_ctx.runtimeClearPendingEffectCopies();
     try std.testing.expect(!foregroundCommandProgramTestFdOpen(second_fd));
+}
+
+test "foreground cleanup covers runner outcome and delivery terminals with replacement environment" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const Mode = enum {
+        terminal_leave_error,
+        terminal_restore_error,
+        spawn_failure,
+        wait_failure,
+        exited,
+        signaled,
+        app_update_error,
+    };
+    const TestMsg = union(enum) {
+        finished,
+
+        pub const undelivered_policy = .plain;
+    };
+    const TestApp = struct {
+        fail_update: bool,
+
+        pub const Msg = TestMsg;
+
+        pub fn update(self: *@This(), _: Msg, _: *ctx_mod.Ctx(Msg)) !void {
+            if (self.fail_update) return error.InjectedAppUpdate;
+        }
+    };
+    const Runner = struct {
+        mode: Mode,
+        duplicate_fd: *?std.Io.Dir.Handle,
+
+        fn run(
+            self: @This(),
+            entry: *const ctx_mod.Ctx(TestMsg).ForegroundCommandEntry,
+        ) !foreground_command.ForegroundCommandOutcome {
+            self.duplicate_fd.* = switch (entry.runtimeChildCwd()) {
+                .dir => |dir| dir.handle,
+                else => return error.TestUnexpectedResult,
+            };
+            const environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("owned", environment.get("ISSUE55_TERMINAL").?);
+            return switch (self.mode) {
+                .terminal_leave_error => error.InjectedTerminalLeave,
+                .terminal_restore_error => error.InjectedTerminalRestore,
+                .spawn_failure => .{ .spawn_failed = "InjectedSpawn" },
+                .wait_failure => .{ .wait_failed = "InjectedWait" },
+                .exited, .app_update_error => .{ .exited = 0 },
+                .signaled => .{ .signaled = 15 },
+            };
+        }
+    };
+    const Harness = struct {
+        fn run(mode: Mode, expected_error: ?anyerror) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try tmp.dir.createDir(std.testing.io, "caller", .default_dir);
+            const caller_dir = try tmp.dir.openDir(std.testing.io, "caller", .{});
+            defer caller_dir.close(std.testing.io);
+            var caller_environment: std.process.Environ.Map = .init(std.testing.allocator);
+            defer caller_environment.deinit();
+            try caller_environment.put("ISSUE55_TERMINAL", "owned");
+
+            var app_ctx: ctx_mod.Ctx(TestMsg) = .{
+                ._allocator = std.testing.allocator,
+                ._io = std.testing.io,
+            };
+            defer app_ctx.runtimeClearPendingEffectCopies();
+            _ = try app_ctx.terminal().runForegroundCommand(.{
+                .argv = &.{"command"},
+                .cwd = .{ .dir = caller_dir },
+                .environment = .{ .replace = &caller_environment },
+                .finished = &struct {
+                    fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+                        return .finished;
+                    }
+                }.done,
+            });
+
+            var duplicate_fd: ?std.Io.Dir.Handle = null;
+            var app: TestApp = .{ .fail_update = mode == .app_update_error };
+            var stats: ?root.RuntimeStats = null;
+            const result = processPendingForegroundCommandsWithRunner(
+                TestApp,
+                &app,
+                &app_ctx,
+                std.testing.allocator,
+                std.testing.io,
+                &stats,
+                .{
+                    .runtime = .{
+                        .allocator = std.testing.allocator,
+                        .io = std.testing.io,
+                    },
+                    .terminal = undefined,
+                },
+                Runner{ .mode = mode, .duplicate_fd = &duplicate_fd },
+            );
+            if (result) |_| {
+                try std.testing.expect(expected_error == null);
+            } else |err| {
+                try std.testing.expectEqual(expected_error orelse return err, err);
+            }
+
+            const owned_fd = duplicate_fd orelse return error.TestUnexpectedResult;
+            try std.testing.expect(!foregroundCommandProgramTestFdOpen(owned_fd));
+            try std.testing.expect(foregroundCommandProgramTestFdOpen(caller_dir.handle));
+            try std.testing.expectEqual(@as(u8, 0), app_ctx._pending_foreground_commands_len);
+        }
+    };
+
+    const cases = [_]struct { mode: Mode, expected_error: ?anyerror }{
+        .{ .mode = .terminal_leave_error, .expected_error = error.InjectedTerminalLeave },
+        .{ .mode = .terminal_restore_error, .expected_error = error.InjectedTerminalRestore },
+        .{ .mode = .spawn_failure, .expected_error = null },
+        .{ .mode = .wait_failure, .expected_error = null },
+        .{ .mode = .exited, .expected_error = null },
+        .{ .mode = .signaled, .expected_error = null },
+        .{ .mode = .app_update_error, .expected_error = error.InjectedAppUpdate },
+    };
+    for (cases) |case| try Harness.run(case.mode, case.expected_error);
 }
 
 test "foreground command termination mapping preserves exit signal and wait outcomes" {

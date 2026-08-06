@@ -83,6 +83,7 @@ const ForegroundCommandDemo = struct {
         const id = ctx.terminal().runForegroundCommand(.{
             .argv = argv,
             .cwd = .inherit,
+            .environment = .inherit,
             .finished = done,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
