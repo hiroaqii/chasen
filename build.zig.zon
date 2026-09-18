@@ -33,16 +33,17 @@
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            // Includes upstream's OSC 52 decode cleanup plus subsequent
-            // resize-handler and allocation-error lifecycle fixes.
-            .url = "git+https://github.com/rockorager/libvaxis.git#ca781b3c01f44a92e5331652823b5a9ce445be96",
-            .hash = "vaxis-0.6.0-BWNV_Gz5CQBTx7g34RYMPTL-bJhsFCU3ECHQ-CZlBVsn",
+            // Includes the POSIX input-loop fixes that preserve escape
+            // sequences split across terminal reads without delaying a lone Esc.
+            .url = "git+https://github.com/rockorager/libvaxis.git#6cab03f8a3faeb58bddf334343889a7f685ba7a7",
+            .hash = "vaxis-0.6.0-BWNV_FcoCgB3Q_LTiQet_GeS23Bd7e224eHloS8PanKZ",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "test",
         "LICENSE",
         "README.md",
     },

@@ -2073,14 +2073,13 @@ test "libvaxis frees OSC 52 responses without queueing owned paste" {
         );
     }
 
-    // The pinned libvaxis revision has an errdefer immediately after its
-    // decode-buffer allocation. A correctly sized but invalid base64 payload
-    // therefore returns an error without leaking producer-local memory before
-    // an event exists for handleEventGeneric to dispose.
-    try std.testing.expectError(
-        error.InvalidCharacter,
-        parser.parse("\x1b]52;c;!!!!\x1b\\", std.testing.allocator),
-    );
+    // Invalid OSC 52 payloads are consumed without an event. libvaxis frees
+    // the temporary decode buffer before returning, so the testing allocator
+    // still verifies that the producer-local allocation does not leak.
+    const invalid_input = "\x1b]52;c;!!!!\x1b\\";
+    const invalid_result = try parser.parse(invalid_input, std.testing.allocator);
+    try std.testing.expectEqual(invalid_input.len, invalid_result.n);
+    try std.testing.expectEqual(@as(?vaxis.Event, null), invalid_result.event);
 
     drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
 }

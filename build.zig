@@ -178,6 +178,35 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_runtime_mod_tests.step);
 
+    const terminal_input_step = b.step(
+        "test-terminal-input",
+        "Run the Linux PTY terminal-input integration test",
+    );
+    if (target.result.os.tag == .linux) {
+        const terminal_input_integration = b.addExecutable(.{
+            .name = "terminal-input-integration",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/terminal_input_integration.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                },
+            }),
+            .use_llvm = true,
+            .use_lld = true,
+        });
+        const run_terminal_input_integration = b.addRunArtifact(terminal_input_integration);
+        terminal_input_step.dependOn(&run_terminal_input_integration.step);
+        if (test_filter == null) {
+            test_step.dependOn(&run_terminal_input_integration.step);
+        }
+    } else {
+        const unsupported = b.addFail("test-terminal-input requires a Linux target with PTY support");
+        terminal_input_step.dependOn(&unsupported.step);
+    }
+
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
