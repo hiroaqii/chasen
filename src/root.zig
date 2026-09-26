@@ -35,6 +35,7 @@ pub const ForegroundCommandCwd = foreground_command.ForegroundCommandCwd;
 pub const ForegroundCommandEnvironment = foreground_command.ForegroundCommandEnvironment;
 pub const ForegroundCommandQueueError = foreground_command.ForegroundCommandQueueError;
 pub const ForegroundCommandRequestId = foreground_command.ForegroundCommandRequestId;
+pub const ForegroundCommandFailure = foreground_command.ForegroundCommandFailure;
 pub const ForegroundCommandOutcome = foreground_command.ForegroundCommandOutcome;
 pub const ForegroundCommandResult = foreground_command.ForegroundCommandResult;
 pub const clipboard = @import("clipboard.zig");

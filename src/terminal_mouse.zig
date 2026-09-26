@@ -45,6 +45,11 @@ pub const Policy = struct {
         const pixel_coordinates = self.coordinate_protocol == .auto and
             vx.caps.sgr_pixels;
 
+        try self.enterCoordinates(vx, writer, pixel_coordinates);
+    }
+
+    pub fn enterCoordinates(self: Policy, vx: *vaxis.Vaxis, writer: *std.Io.Writer, pixel_coordinates: bool) !void {
+        if (!self.enabled) return;
         // Publish the matching interpretation before the terminal can accept
         // the enable sequence. A failed write retains this desired state so a
         // reader is never restarted with an ambiguous coordinate unit.
@@ -55,7 +60,7 @@ pub const Policy = struct {
         try writer.flush();
     }
 
-    fn leave(self: Policy, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
+    pub fn leave(self: Policy, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
         if (!self.enabled) return;
 
         // Retain the prior interpretation until reset has been written and

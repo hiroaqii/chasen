@@ -31,13 +31,13 @@ pub const ForegroundCommandCwd = union(enum) {
 /// empty child environment and is never treated as `.inherit`.
 ///
 /// `.inherit` resolves the process environment when the child is spawned.
-/// Zig resolves a bare `argv[0]` using the parent `PATH` even for `.replace`;
+/// Chasen resolves a bare `argv[0]` using the parent `PATH` even for `.replace`;
 /// use an absolute executable when replacement-environment authority matters.
 /// Chasen transports the supplied map without adding secret-specific handling.
 /// Replacement maps are cloned, owned, and cleaned up on every compiled target;
 /// they do not expand foreground-command execution support. In particular,
 /// Windows keeps the existing accepted-request result
-/// `spawn_failed = "Unsupported"`.
+/// `failed = .{ .stage = .unsupported, .error_name = "Unsupported" }`.
 pub const ForegroundCommandEnvironment = union(enum) {
     inherit,
     replace: *const std.process.Environ.Map,
@@ -49,6 +49,7 @@ pub const ForegroundCommandEnvironment = union(enum) {
 /// a request id.
 pub const ForegroundCommandQueueError = error{
     ForegroundCommandLimitExceeded,
+    ForegroundCommandRuntimeStopped,
     ForegroundCommandEmptyArgv,
     ForegroundCommandCwdUnsupported,
     ForegroundCommandInvalidCwd,
@@ -65,28 +66,36 @@ pub const ForegroundCommandRequestId = struct {
     id: u64,
 };
 
-/// Result of a terminal foreground command.
-///
-/// Spawn/wait failures are distinct from child exit status so apps can show a
-/// useful status message without treating every failure as a non-zero command.
+/// A final runtime failure, separate from the child's exit status.
+pub const ForegroundCommandFailure = struct {
+    pub const Stage = enum { unsupported, admission, prepare, spawn, handoff, wait, cleanup, restore_tty, restore_tui };
+    stage: Stage,
+    /// Static diagnostic, never owned or borrowed temporary storage.
+    error_name: []const u8,
+};
+
+/// Completion after job cleanup and terminal recovery. A stopped job is
+/// terminated and reaped; it cannot be resumed. Cleanup/restore failures are
+/// fatal to the runtime and their callback message is disposed as undelivered.
 pub const ForegroundCommandOutcome = union(enum) {
     exited: u8,
     signaled: u32,
-    spawn_failed: []const u8,
-    wait_failed: []const u8,
+    stopped: u32,
+    failed: ForegroundCommandFailure,
+    runtime_abandoned,
+
+    pub fn isFatal(self: @This()) bool {
+        return switch (self) {
+            .failed => |f| switch (f.stage) {
+                .cleanup, .restore_tty, .restore_tui => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
 };
 
 pub const ForegroundCommandResult = struct {
     request_id: ForegroundCommandRequestId,
     outcome: ForegroundCommandOutcome,
 };
-
-test "foreground command result can represent spawn failure" {
-    const result = ForegroundCommandResult{
-        .request_id = .{ .id = 1 },
-        .outcome = .{ .spawn_failed = "FileNotFound" },
-    };
-
-    try std.testing.expectEqual(@as(u64, 1), result.request_id.id);
-    try std.testing.expectEqualStrings("FileNotFound", result.outcome.spawn_failed);
-}

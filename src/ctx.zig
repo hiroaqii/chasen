@@ -212,7 +212,7 @@ pub fn Ctx(comptime Msg: type) type {
                 }
             }
 
-            fn childCwd(self: @This()) std.process.Child.Cwd {
+            fn childCwd(self: @This()) foreground_command.ForegroundCommandCwd {
                 return switch (self) {
                     .inherit => .inherit,
                     .path => |path| .{ .path = path },
@@ -262,7 +262,7 @@ pub fn Ctx(comptime Msg: type) type {
             }
 
             /// Runtime bridge from the owned queue form to child spawn input.
-            pub fn runtimeChildCwd(self: *const @This()) std.process.Child.Cwd {
+            pub fn runtimeChildCwd(self: *const @This()) foreground_command.ForegroundCommandCwd {
                 return self.cwd.childCwd();
             }
 
@@ -541,7 +541,8 @@ pub fn Ctx(comptime Msg: type) type {
             /// on Linux and macOS. Replacement maps are cloned, owned, and
             /// cleaned up on every compiled target, but do not expand execution
             /// support; Windows still completes accepted requests with
-            /// `spawn_failed = "Unsupported"`. Chasen transports replacement
+            /// `failed = .{ .stage = .unsupported, .error_name = "Unsupported" }`.
+            /// Chasen transports replacement
             /// maps without adding secret-specific handling.
             ///
             /// A follow-up foreground command queued from `finished` is
@@ -577,6 +578,7 @@ pub fn Ctx(comptime Msg: type) type {
                 cwd_ops: anytype,
                 environment_ops: anytype,
             ) foreground_command.ForegroundCommandQueueError!foreground_command.ForegroundCommandRequestId {
+                if (self.ctx._should_quit) return error.ForegroundCommandRuntimeStopped;
                 if (opts.argv.len == 0) return error.ForegroundCommandEmptyArgv;
                 if (self.ctx._pending_foreground_commands_len >= max_foreground_commands)
                     return error.ForegroundCommandLimitExceeded;

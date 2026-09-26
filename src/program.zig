@@ -7,6 +7,7 @@ const ctx_mod = @import("ctx.zig");
 const root = @import("root.zig");
 const terminal_image = @import("terminal_image.zig");
 const terminal_mouse = @import("terminal_mouse.zig");
+const foreground_job = @import("foreground_job.zig");
 const foreground_command = @import("foreground_command.zig");
 const runtime_limits = @import("runtime_limits.zig");
 
@@ -518,10 +519,28 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const allocator = opts.runtime.allocator;
     const io = opts.runtime.io;
 
+    // A fatal TTY restore may leave this thread in a background group. Keep
+    // final output/termios cleanup under one scoped SIGTTOU mask, including
+    // terminals whose original settings enable TOSTOP.
+    var teardown_mask = if (comptime foreground_job.supported) @as(?foreground_job.TtouMask, null) else {};
+    defer if (comptime foreground_job.supported) {
+        if (teardown_mask) |*mask| mask.restore() catch {};
+    };
+
     // --- Terminal setup ---
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
-    defer tty.deinit();
+    defer {
+        // Fatal handoff/restore can leave us in a background group. Final
+        // termios cleanup must not suspend the parent with SIGTTOU.
+        if (comptime foreground_job.supported) {
+            if (foreground_job.TtouMask.init()) |value| {
+                var mask = value;
+                tty.deinit();
+                mask.restore() catch {};
+            } else |_| tty.fd.close(io);
+        } else tty.deinit();
+    }
 
     var vx = try vaxis.Vaxis.init(io, allocator, opts.terminal.env_map, .{
         // libvaxis requires an allocator to decode OSC 52 responses. The
@@ -530,7 +549,11 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         .system_clipboard_allocator = allocator,
     });
     useUnicodeWidth(&vx);
-    defer vx.deinit(allocator, tty.writer());
+    var terminal_modes: TerminalModes = .{};
+    defer {
+        terminal_modes.cleanup(&vx, tty.writer());
+        vx.deinit(allocator, tty.writer());
+    }
 
     var terminal_images: terminal_image.Registry = .{};
     defer {
@@ -554,7 +577,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     errdefer stopLoopAndDrain(Msg, &loop, allocator, io);
 
     try vx.enterAltScreen(tty.writer());
-    try queryTerminal(&vx, tty.writer(), io, .fromSeconds(1), opts.terminal.keyboard_protocol);
+    try queryTerminal(&vx, tty.writer(), io, .fromSeconds(1), opts.terminal.keyboard_protocol, &terminal_modes, &loop);
 
     // Bracketed paste belongs to Chasen's terminal ownership. It is enabled
     // by default so apps can receive Event.paste instead of raw paste markers.
@@ -647,6 +670,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         resize_thread = null;
     };
 
+    defer if (comptime foreground_job.supported) {
+        teardown_mask = foreground_job.TtouMask.init() catch null;
+    };
+
     trace(opts, .startup);
 
     if (@hasDecl(App, "init")) {
@@ -654,7 +681,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
         var init_stats: ?root.RuntimeStats = null;
-        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -671,7 +698,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -782,7 +809,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &pending_futures, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, &terminal_modes, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -823,6 +850,7 @@ fn shutdownRuntime(
     shutting_down: *std.atomic.Value(bool),
 ) void {
     shutting_down.store(true, .seq_cst);
+    app_ctx.quit();
 
     // Do not call Loop.stop here: its DSR wake + await can block behind a full
     // queue or a terminal that does not answer the query. Canceling the
@@ -851,6 +879,7 @@ fn shutdownRuntime(
     drainInternalEventsForShutdown(App.Msg, loop, allocator);
     runtime_completions.deinitUndelivered(allocator);
     discardQueuedTasks(App.Msg, app_ctx, allocator);
+    discardQueuedForegroundCommands(App.Msg, app_ctx, allocator);
 }
 
 /// Stop the input producer without allocating another concurrent task, then
@@ -939,6 +968,15 @@ fn discardQueuedTasks(
     }
 }
 
+fn discardQueuedForegroundCommands(comptime Msg: type, app_ctx: *ctx_mod.Ctx(Msg), allocator: std.mem.Allocator) void {
+    for (app_ctx.takePendingForegroundCommands()) |queued| {
+        var entry = queued;
+        var msg = entry.finished(.{ .request_id = entry.request_id, .outcome = .runtime_abandoned });
+        root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
+        entry.runtimeDeinit(allocator);
+    }
+}
+
 /// Apply one terminal-size snapshot and notify the application.
 ///
 /// Both in-band resize events and coalesced polling state enter through this
@@ -967,9 +1005,13 @@ fn queryTerminal(
     io: std.Io,
     timeout: std.Io.Duration,
     keyboard_protocol: root.KeyboardProtocol,
+    modes: *TerminalModes,
+    loop: anytype,
 ) !void {
     // Split vaxis' query/wait/enable flow so Chasen can keep enhanced
     // keyboard reporting opt-in while still using the other detected features.
+    modes.in_band_resize = true; // query emits 2048 even without a response
+    errdefer modes.poison(vx, writer);
     try vx.queryTerminalSend(writer);
     try std.Io.futexWaitTimeout(
         io,
@@ -988,7 +1030,16 @@ fn queryTerminal(
     if (keyboard_protocol == .legacy) {
         vx.caps.kitty_keyboard = false;
     }
+    stopLoopReader(loop, io);
+    const kitty = vx.caps.kitty_keyboard and vx.env_map.get("VHS_RECORD") == null;
+    vx.caps.kitty_keyboard = false; // Own the non-idempotent push separately.
+    modes.unicode = true; // Conservative cleanup ownership if enable fails.
     try vx.enableDetectedFeatures(writer);
+    modes.unicode = vx.caps.unicode == .unicode and !vx.caps.explicit_width;
+    vx.caps.kitty_keyboard = kitty;
+    modes.kitty_flags = @bitCast(vx.opts.kitty_keyboard_flags);
+    if (kitty) try modes.setKitty(vx, writer, true);
+    try loop.start();
 }
 
 /// Route an app-facing event through optional `handleEvent`, then apply the
@@ -1150,6 +1201,7 @@ fn drainPendingEffects(
     next_frame_index: u64,
     stats: *?root.RuntimeStats,
     mouse_policy: terminal_mouse.Policy,
+    terminal_modes: *TerminalModes,
     opts: root.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
@@ -1158,7 +1210,7 @@ fn drainPendingEffects(
     for (0..max_effect_drain_rounds) |round| {
         const completion_result = try applyRuntimeCompletions(App, app, app_ctx, runtime_completions, allocator, io, stats, opts);
         result.needs_render = result.needs_render or completion_result.needs_render;
-        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, mouse_policy, opts.terminal.keyboard_protocol, stats, opts);
+        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, mouse_policy, terminal_modes, stats, opts);
         result.needs_render = result.needs_render or foreground_needs_render;
         const clipboard_needs_render = try processPendingClipboardCopies(App, app, app_ctx, vx, tty, allocator, io, stats, opts);
         result.needs_render = result.needs_render or clipboard_needs_render;
@@ -1192,7 +1244,7 @@ fn processPendingForegroundCommands(
     loop: *vaxis.Loop(InternalEvent(App.Msg)),
     suspended: *std.atomic.Value(bool),
     mouse_policy: terminal_mouse.Policy,
-    keyboard_protocol: root.KeyboardProtocol,
+    modes: *TerminalModes,
     stats: *?root.RuntimeStats,
     opts: root.RunOptions,
 ) !bool {
@@ -1204,7 +1256,7 @@ fn processPendingForegroundCommands(
         loop: *vaxis.Loop(InternalEvent(App.Msg)),
         suspended: *std.atomic.Value(bool),
         mouse_policy: terminal_mouse.Policy,
-        keyboard_protocol: root.KeyboardProtocol,
+        modes: *TerminalModes,
 
         fn run(
             self: @This(),
@@ -1218,7 +1270,7 @@ fn processPendingForegroundCommands(
                 self.loop,
                 self.suspended,
                 self.mouse_policy,
-                self.keyboard_protocol,
+                self.modes,
                 entry,
             );
         }
@@ -1240,7 +1292,7 @@ fn processPendingForegroundCommands(
             .loop = loop,
             .suspended = suspended,
             .mouse_policy = mouse_policy,
-            .keyboard_protocol = keyboard_protocol,
+            .modes = modes,
         },
     );
 }
@@ -1265,12 +1317,18 @@ fn processPendingForegroundCommandsWithRunner(
         var entry = queued_entry;
         defer entry.runtimeDeinit(allocator);
 
-        const outcome = try runner.run(&entry);
+        const outcome = if (app_ctx.shouldQuit()) foreground_command.ForegroundCommandOutcome.runtime_abandoned else runner.run(&entry) catch |err| foreground_job.failure(.restore_tui, @errorName(err));
         const result: foreground_command.ForegroundCommandResult = .{
             .request_id = entry.request_id,
             .outcome = outcome,
         };
-        needs_render = try applyMsg(App, app, entry.finished(result), app_ctx, io, stats, opts) or needs_render;
+        var msg = entry.finished(result);
+        if (outcome.isFatal() or outcome == .runtime_abandoned) {
+            root.runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
+            if (outcome.isFatal()) return error.ForegroundRecoveryFailed;
+        } else {
+            needs_render = try applyMsg(App, app, msg, app_ctx, io, stats, opts) or needs_render;
+        }
     }
 
     return needs_render;
@@ -1322,183 +1380,28 @@ fn runForegroundCommand(
     loop: anytype,
     suspended: *std.atomic.Value(bool),
     mouse_policy: terminal_mouse.Policy,
-    keyboard_protocol: root.KeyboardProtocol,
+    modes: *TerminalModes,
     entry: anytype,
-) !foreground_command.ForegroundCommandOutcome {
-    if (builtin.os.tag == .windows) {
-        return .{ .spawn_failed = "Unsupported" };
-    }
-
+) foreground_command.ForegroundCommandOutcome {
+    if (!foreground_job.supported or builtin.is_test) return foreground_job.failure(.unsupported, "Unsupported");
+    const terminal = foreground_job.Terminal.capture(tty.fd.handle) catch |err| return foreground_job.failure(.admission, @errorName(err));
+    var prepared = foreground_job.Prepared.init(allocator, entry.argv, entry.runtimeChildCwd(), entry.runtimeChildEnvironment()) catch |err| return foreground_job.failure(.prepare, @errorName(err));
+    defer prepared.deinit();
+    prepared.prepareLaunch(terminal.fd) catch |err| return foreground_job.failure(if (err == error.Unsupported) .unsupported else .prepare, @errorName(err));
     suspended.store(true, .seq_cst);
     defer suspended.store(false, .seq_cst);
-
-    // Mouse reporting is part of Chasen's terminal ownership. Recover reader
-    // ownership before resetting it; a reset failure prevents child admission.
-    var mouse_reader = loopReader(loop, io);
-    try mouse_policy.leaveWithReader(vx, tty.writer(), &mouse_reader);
-    // Do not leak Chasen's paste mode into the foreground child process.
-    _ = vx.setBracketedPaste(tty.writer(), false) catch {};
-    _ = vx.exitAltScreen(tty.writer()) catch {};
-
-    // Keep the parent /dev/tty fd open. Closing and reopening it would leave
-    // run()'s deferred cleanup with a deinitialized tty if re-init failed.
-    try leaveRawMode(tty);
-
-    const outcome = runChildOnControllingTty(
-        io,
-        entry.argv,
-        entry.runtimeChildCwd(),
-        entry.runtimeChildEnvironment(),
-    );
-    try restoreTerminalAfterForeground(vx, tty, allocator, io, loop, mouse_policy, keyboard_protocol);
-
+    stopLoopReader(loop, io);
+    const saved = modes.snapshot(vx);
+    modes.leave(vx, tty.writer(), mouse_policy) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+    const outcome = foreground_job.run(&prepared, terminal, &tty.termios);
+    if (outcome.isFatal()) return outcome;
+    modes.restore(saved, vx, tty.writer(), mouse_policy) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+    const size = tty.getWinsize() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+    vx.resize(allocator, tty.writer(), size) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+    useUnicodeWidth(vx);
+    loop.start() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+    vx.queueRefresh();
     return outcome;
-}
-
-fn runChildOnControllingTty(
-    io: std.Io,
-    argv: []const []const u8,
-    cwd: std.process.Child.Cwd,
-    environ_map: ?*const std.process.Environ.Map,
-) foreground_command.ForegroundCommandOutcome {
-    var child_tty = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch |err| {
-        return .{ .spawn_failed = @errorName(err) };
-    };
-    defer child_tty.close(io);
-
-    return spawnAndWaitForegroundCommand(
-        io,
-        argv,
-        cwd,
-        environ_map,
-        .{ .file = child_tty },
-        .{ .file = child_tty },
-        .{ .file = child_tty },
-    );
-}
-
-fn spawnAndWaitForegroundCommand(
-    io: std.Io,
-    argv: []const []const u8,
-    cwd: std.process.Child.Cwd,
-    environ_map: ?*const std.process.Environ.Map,
-    stdin: std.process.SpawnOptions.StdIo,
-    stdout: std.process.SpawnOptions.StdIo,
-    stderr: std.process.SpawnOptions.StdIo,
-) foreground_command.ForegroundCommandOutcome {
-    return spawnAndWaitForegroundCommandWithOps(
-        io,
-        argv,
-        cwd,
-        environ_map,
-        stdin,
-        stdout,
-        stderr,
-        NativeForegroundCommandProcessOps{},
-    );
-}
-
-const NativeForegroundCommandProcessOps = struct {
-    fn spawn(
-        _: @This(),
-        io: std.Io,
-        options: std.process.SpawnOptions,
-    ) std.process.SpawnError!std.process.Child {
-        return std.process.spawn(io, options);
-    }
-
-    fn wait(
-        _: @This(),
-        child: *std.process.Child,
-        io: std.Io,
-    ) std.process.Child.WaitError!std.process.Child.Term {
-        return child.wait(io);
-    }
-
-    fn kill(_: @This(), child: *std.process.Child, io: std.Io) void {
-        child.kill(io);
-    }
-};
-
-fn spawnAndWaitForegroundCommandWithOps(
-    io: std.Io,
-    argv: []const []const u8,
-    cwd: std.process.Child.Cwd,
-    environ_map: ?*const std.process.Environ.Map,
-    stdin: std.process.SpawnOptions.StdIo,
-    stdout: std.process.SpawnOptions.StdIo,
-    stderr: std.process.SpawnOptions.StdIo,
-    process_ops: anytype,
-) foreground_command.ForegroundCommandOutcome {
-    var child = process_ops.spawn(io, .{
-        .argv = argv,
-        .cwd = cwd,
-        .environ_map = environ_map,
-        .stdin = stdin,
-        .stdout = stdout,
-        .stderr = stderr,
-    }) catch |err| {
-        return .{ .spawn_failed = @errorName(err) };
-    };
-
-    const term = process_ops.wait(&child, io) catch |err| {
-        process_ops.kill(&child, io);
-        return .{ .wait_failed = @errorName(err) };
-    };
-
-    return foregroundCommandOutcomeFromTerm(term);
-}
-
-fn foregroundCommandOutcomeFromTerm(term: std.process.Child.Term) foreground_command.ForegroundCommandOutcome {
-    return switch (term) {
-        .exited => |code| .{ .exited = code },
-        .signal => |sig| .{ .signaled = @intCast(@intFromEnum(sig)) },
-        .stopped => |sig| .{ .signaled = @intCast(@intFromEnum(sig)) },
-        .unknown => .{ .wait_failed = "UnknownTermination" },
-    };
-}
-
-fn restoreTerminalAfterForeground(
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    loop: anytype,
-    mouse_policy: terminal_mouse.Policy,
-    keyboard_protocol: root.KeyboardProtocol,
-) !void {
-    try enterRawMode(tty);
-    try loop.start();
-    try vx.enterAltScreen(tty.writer());
-
-    // Capability and size refresh are useful after returning from an editor,
-    // but failure here should not leave the runtime stopped.
-    queryTerminal(vx, tty.writer(), io, .fromSeconds(1), keyboard_protocol) catch {};
-    if (mouse_policy.enabled) {
-        var mouse_reader = loopReader(loop, io);
-        try mouse_policy.enterWithReader(vx, tty.writer(), &mouse_reader);
-    }
-    _ = vx.setBracketedPaste(tty.writer(), true) catch {};
-
-    if (tty.getWinsize()) |ws| {
-        vx.resize(allocator, tty.writer(), ws) catch {};
-        useUnicodeWidth(vx);
-    } else |_| {}
-}
-
-fn leaveRawMode(tty: *vaxis.Tty) !void {
-    // libvaxis intentionally uses a lightweight Tty stub under `zig test`.
-    // Foreground-command terminal handoff is integration-only, while allowing
-    // the surrounding production effect drain to be instantiated in tests.
-    if (builtin.is_test) return error.Unsupported;
-    if (builtin.os.tag == .windows) return error.Unsupported;
-    try std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios);
-}
-
-fn enterRawMode(tty: *vaxis.Tty) !void {
-    if (builtin.is_test) return error.Unsupported;
-    if (builtin.os.tag == .windows) return error.Unsupported;
-    tty.termios = try vaxis.Tty.makeRaw(tty.fd.handle);
 }
 
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
@@ -2562,6 +2465,7 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
             .enabled = false,
             .coordinate_protocol = .cell_sgr,
         },
+        undefined, // no foreground command is queued in this drain test
         .{ .runtime = .{
             .allocator = std.testing.allocator,
             .io = std.testing.io,
@@ -3009,37 +2913,6 @@ fn foregroundCommandParentCanary(map: *const std.process.Environ.Map) ![]const u
     return error.SkipZigTest;
 }
 
-const InjectedForegroundCommandProcessOps = struct {
-    mode: enum { spawn_failure, wait_failure },
-    seen_environment: *?*const std.process.Environ.Map,
-    kill_count: *usize,
-
-    const ChildState = struct {};
-
-    fn spawn(
-        self: @This(),
-        _: std.Io,
-        options: std.process.SpawnOptions,
-    ) error{InjectedSpawn}!ChildState {
-        self.seen_environment.* = options.environ_map;
-        if (self.mode == .spawn_failure) return error.InjectedSpawn;
-        return .{};
-    }
-
-    fn wait(
-        self: @This(),
-        _: *ChildState,
-        _: std.Io,
-    ) error{InjectedWait}!std.process.Child.Term {
-        if (self.mode == .wait_failure) return error.InjectedWait;
-        return .{ .exited = 0 };
-    }
-
-    fn kill(self: @This(), _: *ChildState, _: std.Io) void {
-        self.kill_count.* += 1;
-    }
-};
-
 test "foreground command inherit cwd reaches child spawn" {
     const TestMsg = union(enum) { finished };
     var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
@@ -3060,14 +2933,11 @@ test "foreground command inherit cwd reaches child spawn" {
         .inherit => {},
         else => return error.TestUnexpectedResult,
     }
-    const outcome = spawnAndWaitForegroundCommand(
+    const outcome = foreground_job.testRun(
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
         entry.runtimeChildEnvironment(),
-        .ignore,
-        .ignore,
-        .ignore,
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3140,14 +3010,11 @@ test "foreground environment replacement snapshot reaches child without parent l
         else => return error.TestUnexpectedResult,
     }
     const queued_environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
-    const outcome = spawnAndWaitForegroundCommand(
+    const outcome = foreground_job.testRun(
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
         queued_environment,
-        .ignore,
-        .ignore,
-        .ignore,
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3184,14 +3051,11 @@ test "foreground environment inherit and empty replacement remain distinct in ch
         var entry = pending[0];
         defer entry.runtimeDeinit(std.testing.allocator);
         try std.testing.expect(entry.runtimeChildEnvironment() == null);
-        const outcome = spawnAndWaitForegroundCommand(
+        const outcome = foreground_job.testRun(
             std.testing.io,
             entry.argv,
             entry.runtimeChildCwd(),
             entry.runtimeChildEnvironment(),
-            .ignore,
-            .ignore,
-            .ignore,
         );
         switch (outcome) {
             .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3212,65 +3076,17 @@ test "foreground environment inherit and empty replacement remain distinct in ch
         defer entry.runtimeDeinit(std.testing.allocator);
         const queued_empty = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 0), queued_empty.count());
-        const outcome = spawnAndWaitForegroundCommand(
+        const outcome = foreground_job.testRun(
             std.testing.io,
             entry.argv,
             entry.runtimeChildCwd(),
             queued_empty,
-            .ignore,
-            .ignore,
-            .ignore,
         );
         switch (outcome) {
             .exited => |code| try std.testing.expect(code != 0),
             else => return error.TestUnexpectedResult,
         }
     }
-}
-
-test "foreground environment spawn and wait seams preserve replacement pointer and failures" {
-    var replacement: std.process.Environ.Map = .init(std.testing.allocator);
-    defer replacement.deinit();
-    try replacement.put("ISSUE55_SEAM", "value");
-
-    var seen_environment: ?*const std.process.Environ.Map = null;
-    var kill_count: usize = 0;
-    const spawn_failure = spawnAndWaitForegroundCommandWithOps(
-        std.testing.io,
-        &.{"command"},
-        .inherit,
-        &replacement,
-        .ignore,
-        .ignore,
-        .ignore,
-        InjectedForegroundCommandProcessOps{
-            .mode = .spawn_failure,
-            .seen_environment = &seen_environment,
-            .kill_count = &kill_count,
-        },
-    );
-    try std.testing.expectEqualStrings("InjectedSpawn", spawn_failure.spawn_failed);
-    try std.testing.expect(seen_environment.? == &replacement);
-    try std.testing.expectEqual(@as(usize, 0), kill_count);
-
-    seen_environment = null;
-    const wait_failure = spawnAndWaitForegroundCommandWithOps(
-        std.testing.io,
-        &.{"command"},
-        .inherit,
-        &replacement,
-        .ignore,
-        .ignore,
-        .ignore,
-        InjectedForegroundCommandProcessOps{
-            .mode = .wait_failure,
-            .seen_environment = &seen_environment,
-            .kill_count = &kill_count,
-        },
-    );
-    try std.testing.expectEqualStrings("InjectedWait", wait_failure.wait_failed);
-    try std.testing.expect(seen_environment.? == &replacement);
-    try std.testing.expectEqual(@as(usize, 1), kill_count);
 }
 
 test "foreground command directory cwd keeps identity across rename and caller close" {
@@ -3309,14 +3125,11 @@ test "foreground command directory cwd keeps identity across rename and caller c
     try tmp.dir.rename("original", tmp.dir, "renamed", std.testing.io);
     try tmp.dir.createDir(std.testing.io, "original", .default_dir);
 
-    const outcome = spawnAndWaitForegroundCommand(
+    const outcome = foreground_job.testRun(
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
         entry.runtimeChildEnvironment(),
-        .ignore,
-        .ignore,
-        .ignore,
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3367,14 +3180,11 @@ test "foreground command path cwd copies bytes and resolves at spawn time" {
 
     try tmp.dir.rename("original", tmp.dir, "renamed", std.testing.io);
     try tmp.dir.createDir(std.testing.io, "original", .default_dir);
-    const outcome = spawnAndWaitForegroundCommand(
+    const outcome = foreground_job.testRun(
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
         entry.runtimeChildEnvironment(),
-        .ignore,
-        .ignore,
-        .ignore,
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3408,17 +3218,14 @@ test "foreground command accepts a duplicable non-directory and reports spawn fa
     const pending = app_ctx.takePendingForegroundCommands();
     var entry = pending[0];
     defer entry.runtimeDeinit(std.testing.allocator);
-    const outcome = spawnAndWaitForegroundCommand(
+    const outcome = foreground_job.testRun(
         std.testing.io,
         entry.argv,
         entry.runtimeChildCwd(),
         entry.runtimeChildEnvironment(),
-        .ignore,
-        .ignore,
-        .ignore,
     );
     switch (outcome) {
-        .spawn_failed => {},
+        .failed => |f| try std.testing.expectEqual(foreground_command.ForegroundCommandFailure.Stage.spawn, f.stage),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -3564,6 +3371,9 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
         exited,
         signaled,
         app_update_error,
+        cleanup_failure,
+        tty_restore_failure,
+        stopped,
     };
     const TestMsg = union(enum) {
         finished,
@@ -3572,10 +3382,12 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
     };
     const TestApp = struct {
         fail_update: bool,
+        updates: usize = 0,
 
         pub const Msg = TestMsg;
 
         pub fn update(self: *@This(), _: Msg, _: *ctx_mod.Ctx(Msg)) !void {
+            self.updates += 1;
             if (self.fail_update) return error.InjectedAppUpdate;
         }
     };
@@ -3596,11 +3408,21 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
             return switch (self.mode) {
                 .terminal_leave_error => error.InjectedTerminalLeave,
                 .terminal_restore_error => error.InjectedTerminalRestore,
-                .spawn_failure => .{ .spawn_failed = "InjectedSpawn" },
-                .wait_failure => .{ .wait_failed = "InjectedWait" },
+                .spawn_failure => foreground_job.failure(.spawn, "InjectedSpawn"),
+                .wait_failure => foreground_job.failure(.wait, "InjectedWait"),
                 .exited, .app_update_error => .{ .exited = 0 },
                 .signaled => .{ .signaled = 15 },
+                .stopped => .{ .stopped = 20 },
+                .cleanup_failure => foreground_job.failure(.cleanup, "ChildAuthorityLost"),
+                .tty_restore_failure => foreground_job.failure(.restore_tty, "InjectedRestore"),
             };
+        }
+    };
+    const Completion = struct {
+        var calls: usize = 0;
+        fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
+            calls += 1;
+            return .finished;
         }
     };
     const Harness = struct {
@@ -3619,15 +3441,12 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
                 ._io = std.testing.io,
             };
             defer app_ctx.runtimeClearPendingEffectCopies();
+            Completion.calls = 0;
             _ = try app_ctx.terminal().runForegroundCommand(.{
                 .argv = &.{"command"},
                 .cwd = .{ .dir = caller_dir },
                 .environment = .{ .replace = &caller_environment },
-                .finished = &struct {
-                    fn done(_: foreground_command.ForegroundCommandResult) TestMsg {
-                        return .finished;
-                    }
-                }.done,
+                .finished = Completion.done,
             });
 
             var duplicate_fd: ?std.Io.Dir.Handle = null;
@@ -3655,6 +3474,8 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
                 try std.testing.expectEqual(expected_error orelse return err, err);
             }
 
+            try std.testing.expectEqual(@as(usize, 1), Completion.calls);
+            try std.testing.expectEqual(@as(usize, if (expected_error != null and expected_error.? == error.ForegroundRecoveryFailed) 0 else 1), app.updates);
             const owned_fd = duplicate_fd orelse return error.TestUnexpectedResult;
             try std.testing.expect(!foregroundCommandProgramTestFdOpen(owned_fd));
             try std.testing.expect(foregroundCommandProgramTestFdOpen(caller_dir.handle));
@@ -3663,27 +3484,259 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
     };
 
     const cases = [_]struct { mode: Mode, expected_error: ?anyerror }{
-        .{ .mode = .terminal_leave_error, .expected_error = error.InjectedTerminalLeave },
-        .{ .mode = .terminal_restore_error, .expected_error = error.InjectedTerminalRestore },
+        .{ .mode = .terminal_leave_error, .expected_error = error.ForegroundRecoveryFailed },
+        .{ .mode = .terminal_restore_error, .expected_error = error.ForegroundRecoveryFailed },
         .{ .mode = .spawn_failure, .expected_error = null },
         .{ .mode = .wait_failure, .expected_error = null },
         .{ .mode = .exited, .expected_error = null },
         .{ .mode = .signaled, .expected_error = null },
         .{ .mode = .app_update_error, .expected_error = error.InjectedAppUpdate },
+        .{ .mode = .cleanup_failure, .expected_error = error.ForegroundRecoveryFailed },
+        .{ .mode = .tty_restore_failure, .expected_error = error.ForegroundRecoveryFailed },
+        .{ .mode = .stopped, .expected_error = null },
     };
     for (cases) |case| try Harness.run(case.mode, case.expected_error);
 }
 
-test "foreground command termination mapping preserves exit signal and wait outcomes" {
-    const exited = foregroundCommandOutcomeFromTerm(.{ .exited = 7 });
-    try std.testing.expectEqual(@as(u8, 7), exited.exited);
+/// Wire ownership, distinct from capability responses in vx.state. This record
+/// owns one kitty layer and only the modes enabled by this runtime invocation.
+const TerminalModes = struct {
+    in_band_resize: bool = false,
+    unicode: bool = false,
+    kitty: bool = false,
+    kitty_flags: u5 = 0,
+    kitty_uncertain: bool = false,
+    poisoned: bool = false,
+    const Saved = struct { modes: TerminalModes, alt: bool, paste: bool, mouse: bool, pixels: bool };
+    fn snapshot(self: TerminalModes, vx: *vaxis.Vaxis) Saved {
+        return .{ .modes = self, .alt = vx.state.alt_screen, .paste = vx.state.bracketed_paste, .mouse = vx.state.mouse, .pixels = vx.state.pixel_mouse };
+    }
+    fn poison(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        // Failed File.Writer flush retains its pending bytes. Never allow a
+        // later reset/flush to replay a partially transmitted stack operation.
+        _ = writer.consumeAll();
+        self.poisoned = true;
+        if (self.kitty_uncertain) {
+            self.kitty = false;
+            vx.state.kitty_keyboard = false;
+        }
+    }
+    fn setKitty(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer, enable: bool) !void {
+        self.kitty_uncertain = true;
+        errdefer self.poison(vx, writer);
+        if (enable) try writer.print("\x1b[>{d}u", .{self.kitty_flags}) else try writer.writeAll("\x1b[<u");
+        try writer.flush();
+        self.kitty_uncertain = false;
+        self.kitty = enable;
+        vx.state.kitty_keyboard = enable;
+    }
+    fn leave(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer, mouse: terminal_mouse.Policy) !void {
+        errdefer self.poison(vx, writer);
+        try mouse.leave(vx, writer);
+        try vx.setBracketedPaste(writer, false);
+        if (self.in_band_resize) {
+            try writer.writeAll("\x1b[?2048l");
+            try writer.flush();
+            self.in_band_resize = false;
+        }
+        vx.state.in_band_resize = false;
+        if (self.unicode) {
+            try writer.writeAll("\x1b[?2027l");
+            try writer.flush();
+            self.unicode = false;
+        }
+        if (self.kitty) try self.setKitty(vx, writer, false);
+        try writer.writeAll("\x1b[?25h\x1b[0m\x1b[0 q");
+        try writer.flush();
+        if (vx.state.alt_screen) try vx.exitAltScreen(writer);
+    }
+    fn restore(self: *TerminalModes, saved: Saved, vx: *vaxis.Vaxis, writer: *std.Io.Writer, mouse: terminal_mouse.Policy) !void {
+        errdefer self.poison(vx, writer);
+        if (saved.alt) try vx.enterAltScreen(writer);
+        if (saved.modes.unicode) {
+            self.unicode = true;
+            try writer.writeAll("\x1b[?2027h");
+            try writer.flush();
+        }
+        self.kitty_flags = saved.modes.kitty_flags;
+        if (saved.modes.kitty) try self.setKitty(vx, writer, true);
+        if (saved.modes.in_band_resize) {
+            self.in_band_resize = true;
+            try writer.writeAll("\x1b[?2048h");
+            try writer.flush();
+        }
+        if (saved.paste) try vx.setBracketedPaste(writer, true);
+        if (saved.mouse) try mouse.enterCoordinates(vx, writer, saved.pixels);
+    }
+    fn cleanup(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        // Idempotent final resets use only a clean buffer. The one known kitty
+        // layer is popped at most once; an uncertain stack is never retried.
+        if (self.poisoned) _ = writer.consumeAll();
+        if (self.kitty and !self.kitty_uncertain) self.setKitty(vx, writer, false) catch {};
+        vx.state.kitty_keyboard = false;
+        if (self.in_band_resize) writer.writeAll("\x1b[?2048l") catch {
+            _ = writer.consumeAll();
+        };
+        if (self.unicode) writer.writeAll("\x1b[?2027l") catch {
+            _ = writer.consumeAll();
+        };
+        writer.flush() catch {
+            _ = writer.consumeAll();
+        };
+        vx.state.in_band_resize = false;
+        self.in_band_resize = false;
+        self.unicode = false;
+    }
+};
 
-    const signaled = foregroundCommandOutcomeFromTerm(.{ .signal = .TERM });
-    try std.testing.expectEqual(@as(u32, @intFromEnum(std.posix.SIG.TERM)), signaled.signaled);
+const ForegroundWireWriter = struct {
+    writer: std.Io.Writer,
+    output: [1024]u8 = undefined,
+    used: usize = 0,
+    remaining: usize,
+    fn init(buffer: []u8, budget: usize) ForegroundWireWriter {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer }, .remaining = budget };
+    }
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *ForegroundWireWriter = @alignCast(@fieldParentPtr("writer", writer));
+        if (self.remaining == 0) return error.WriteFailed;
+        const header = writer.buffered();
+        if (header.len > 0) {
+            const n = @min(header.len, self.remaining);
+            @memcpy(self.output[self.used..][0..n], header[0..n]);
+            self.used += n;
+            self.remaining -= n;
+            return writer.consume(n);
+        }
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |chunk| {
+            const n = @min(chunk.len, self.remaining);
+            @memcpy(self.output[self.used..][0..n], chunk[0..n]);
+            self.used += n;
+            self.remaining -= n;
+            consumed += n;
+            if (n != chunk.len) return consumed;
+        }
+        for (0..splat) |_| {
+            const chunk = data[data.len - 1];
+            const n = @min(chunk.len, self.remaining);
+            @memcpy(self.output[self.used..][0..n], chunk[0..n]);
+            self.used += n;
+            self.remaining -= n;
+            consumed += n;
+            if (n != chunk.len) return consumed;
+        }
+        return consumed;
+    }
+};
 
-    const stopped = foregroundCommandOutcomeFromTerm(.{ .stopped = .STOP });
-    try std.testing.expectEqual(@as(u32, @intFromEnum(std.posix.SIG.STOP)), stopped.signaled);
+test "foreground uncertain buffered kitty bytes cannot replay during final cleanup" {
+    for ([_]bool{ false, true }) |enable| {
+        var env = try std.testing.environ.createMap(std.testing.allocator);
+        defer env.deinit();
+        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+        var buffer: [64]u8 = undefined;
+        var writer = ForegroundWireWriter.init(&buffer, 2);
+        var modes: TerminalModes = .{ .kitty = !enable, .kitty_flags = 1, .in_band_resize = true };
+        vx.state.kitty_keyboard = !enable;
+        // Two bytes reach the simulated terminal, the remaining stack bytes
+        // stay buffered when the next native drain fails.
+        try std.testing.expectError(error.WriteFailed, modes.setKitty(&vx, &writer.writer, enable));
+        try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
+        try std.testing.expect(modes.kitty_uncertain);
+        try std.testing.expect(!vx.state.kitty_keyboard);
+        writer.remaining = 900;
+        modes.cleanup(&vx, &writer.writer);
+        vx.deinit(std.testing.allocator, &writer.writer);
+        const output = writer.output[0..writer.used];
+        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[>1u") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[<u") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2048l") != null);
+    }
+}
 
-    const unknown = foregroundCommandOutcomeFromTerm(.{ .unknown = 99 });
-    try std.testing.expectEqualStrings("UnknownTermination", unknown.wait_failed);
+test "foreground leave failures at every byte prevent duplicate kitty cleanup" {
+    // One real buffered writer, not a mock operation counter: exercise all
+    // partial boundaries of the finite leave sequence including its flushes.
+    for (0..90) |budget| {
+        var env = try std.testing.environ.createMap(std.testing.allocator);
+        defer env.deinit();
+        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+        vx.state.kitty_keyboard = true;
+        vx.state.alt_screen = true;
+        vx.state.bracketed_paste = true;
+        vx.state.mouse = true;
+        var buffer: [64]u8 = undefined;
+        var writer = ForegroundWireWriter.init(&buffer, budget);
+        var modes: TerminalModes = .{ .kitty = true, .kitty_flags = 1, .in_band_resize = true, .unicode = true };
+        const mouse: terminal_mouse.Policy = .{ .enabled = true, .coordinate_protocol = .cell_sgr };
+        modes.leave(&vx, &writer.writer, mouse) catch {
+            try std.testing.expect(modes.poisoned);
+            try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
+        };
+        writer.remaining = 900;
+        modes.cleanup(&vx, &writer.writer);
+        vx.deinit(std.testing.allocator, &writer.writer);
+        try std.testing.expect(std.mem.count(u8, writer.output[0..writer.used], "\x1b[<u") <= 1);
+    }
+}
+
+test "foreground shutdown abandons queued command once and rejects followups" {
+    const Harness = struct {
+        var calls: usize = 0;
+        var frees: usize = 0;
+        const Msg = struct {
+            pub const undelivered_policy = .deinit;
+            bytes: []u8,
+            pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
+                allocator.free(self.bytes);
+                frees += 1;
+            }
+        };
+        fn done(result: foreground_command.ForegroundCommandResult) Msg {
+            std.debug.assert(result.outcome == .runtime_abandoned);
+            calls += 1;
+            return .{ .bytes = std.testing.allocator.dupe(u8, "completion") catch unreachable };
+        }
+    };
+    Harness.calls = 0;
+    Harness.frees = 0;
+    var app_ctx: ctx_mod.Ctx(Harness.Msg) = .{ ._allocator = std.testing.allocator };
+    defer app_ctx.runtimeClearPendingEffectCopies();
+    _ = try app_ctx.terminal().runForegroundCommand(.{ .argv = &.{"never-spawn"}, .finished = Harness.done });
+    app_ctx.quit();
+    discardQueuedForegroundCommands(Harness.Msg, &app_ctx, std.testing.allocator);
+    discardQueuedForegroundCommands(Harness.Msg, &app_ctx, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), Harness.calls);
+    try std.testing.expectEqual(@as(usize, 1), Harness.frees);
+    try std.testing.expectError(error.ForegroundCommandRuntimeStopped, app_ctx.terminal().runForegroundCommand(.{ .argv = &.{"never-spawn"}, .finished = Harness.done }));
+}
+
+test "foreground restore failures at every byte never replay the kitty push" {
+    for (0..90) |budget| {
+        var env = try std.testing.environ.createMap(std.testing.allocator);
+        defer env.deinit();
+        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+        var buffer: [64]u8 = undefined;
+        var writer = ForegroundWireWriter.init(&buffer, budget);
+        var modes: TerminalModes = .{};
+        const saved: TerminalModes.Saved = .{
+            .modes = .{ .kitty = true, .kitty_flags = 1, .in_band_resize = true, .unicode = true },
+            .alt = true,
+            .paste = true,
+            .mouse = true,
+            .pixels = true,
+        };
+        const mouse: terminal_mouse.Policy = .{ .enabled = true, .coordinate_protocol = .auto };
+        modes.restore(saved, &vx, &writer.writer, mouse) catch {
+            try std.testing.expect(modes.poisoned);
+            try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
+        };
+        writer.remaining = 900;
+        modes.cleanup(&vx, &writer.writer);
+        vx.deinit(std.testing.allocator, &writer.writer);
+        const output = writer.output[0..writer.used];
+        try std.testing.expect(std.mem.count(u8, output, "\x1b[>1u") <= 1);
+        try std.testing.expect(std.mem.count(u8, output, "\x1b[<u") <= 1);
+    }
 }

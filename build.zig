@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
 
     const mod = b.addModule("chasen", .{
         .root_source_file = b.path("src/root.zig"),
+        .optimize = optimize,
+        .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
         .target = target,
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
@@ -48,6 +50,7 @@ pub fn build(b: *std.Build) void {
 
     const runtime_mod = b.addModule("chasen_runtime", .{
         .root_source_file = b.path("src/runtime.zig"),
+        .optimize = optimize,
         .target = target,
     });
 
@@ -71,6 +74,8 @@ pub fn build(b: *std.Build) void {
     for (example_names) |name| {
         const example_exe = b.addExecutable(.{
             .name = name,
+            .use_llvm = true,
+            .use_lld = if (target.result.os.tag == .linux) true else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{name})),
                 .target = target,
@@ -88,6 +93,10 @@ pub fn build(b: *std.Build) void {
         check_example_step.dependOn(&example_exe.step);
         check_examples_step.dependOn(&example_exe.step);
 
+        if (std.mem.eql(u8, name, "foreground_command")) {
+            const install_demo = b.addInstallArtifact(example_exe, .{});
+            b.step("install-foreground_command", "Install the foreground demo for isolated manual QA").dependOn(&install_demo.step);
+        }
         const run_example = b.addRunArtifact(example_exe);
         const run_example_step = b.step(
             b.fmt("run-{s}", .{name}),
@@ -160,12 +169,15 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .use_llvm = true,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
         .filters = test_filters,
     });
     const runtime_mod_tests = b.addTest(.{
         .root_module = runtime_mod,
         .filters = test_filters,
     });
+    b.step("check-foreground-tests", "Compile focused foreground tests for native or cross targets").dependOn(&mod_tests.step);
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -195,7 +207,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
             .use_llvm = true,
-            .use_lld = true,
+            .use_lld = if (target.result.os.tag == .linux) true else null,
         });
         const run_terminal_input_integration = b.addRunArtifact(terminal_input_integration);
         terminal_input_step.dependOn(&run_terminal_input_integration.step);
@@ -206,6 +218,27 @@ pub fn build(b: *std.Build) void {
         const unsupported = b.addFail("test-terminal-input requires a Linux target with PTY support");
         terminal_input_step.dependOn(&unsupported.step);
     }
+
+    const foreground_step = b.step("test-foreground-command", "Run actual foreground runtime in isolated Linux PTYs");
+    if (target.result.os.tag == .linux) {
+        const foreground_test = b.addExecutable(.{
+            .name = "foreground-command-integration",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/foreground_command_integration.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "chasen", .module = mod }},
+            }),
+            .use_llvm = true,
+            .use_lld = if (target.result.os.tag == .linux) true else null,
+        });
+        const install_fixture = b.addInstallArtifact(foreground_test, .{});
+        b.step("install-foreground-fixture", "Install the isolated foreground PTY helper").dependOn(&install_fixture.step);
+        const run_foreground_test = b.addRunArtifact(foreground_test);
+        foreground_step.dependOn(&run_foreground_test.step);
+        if (test_filter == null) test_step.dependOn(&run_foreground_test.step);
+    } else foreground_step.dependOn(&b.addFail("foreground PTY gate requires Linux").step);
 
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
