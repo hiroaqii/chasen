@@ -116,14 +116,9 @@ const NativeForegroundCommandEnvironmentOps = struct {
     }
 };
 
-pub const TaskFailure = union(enum) {
-    start_failed: []const u8,
-    /// The app queued the task, but runtime error unwind happened before the
-    /// task was transferred to a future. The existing failure callback still
-    /// consumes captured `spawnWith` context; its returned message is disposed
-    /// as undelivered instead of being posted.
-    runtime_abandoned,
-};
+/// A task identity is scoped to one Ctx/run and never reused in that run.
+pub const TaskId = enum(u64) { _ };
+pub const TaskStartError = error{ OutOfMemory, ConcurrencyUnavailable };
 
 /// Context object passed to `init` and `update`.
 ///
@@ -132,8 +127,8 @@ pub const TaskFailure = union(enum) {
 /// `quit()` remains a direct shortcut because nearly every interactive app
 /// needs it.
 pub fn Ctx(comptime Msg: type) type {
-    const TaskFn = *const fn (std.mem.Allocator, std.Io) Msg;
-    const TaskFailedFn = *const fn (TaskFailure) Msg;
+    const TaskFn = *const fn (std.mem.Allocator, std.Io) std.Io.Cancelable!Msg;
+    const TaskFailedFn = *const fn (TaskStartError) Msg;
     const max_tasks = runtime_limits.max_tasks;
     const max_ticks = 8;
     const max_everys = 8;
@@ -166,26 +161,63 @@ pub fn Ctx(comptime Msg: type) type {
             msg: Msg,
         };
 
-        pub const TaskWithEntry = struct {
-            ctx: *anyopaque,
-            run: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
-            failed: *const fn (*anyopaque, TaskFailure, std.mem.Allocator) Msg,
-        };
-
         pub const SpawnOptions = struct {
             run: TaskFn,
             failed: TaskFailedFn,
         };
 
-        pub const SpawnWithOptions = struct {
-            ctx: *anyopaque,
-            run: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
-            failed: *const fn (*anyopaque, TaskFailure, std.mem.Allocator) Msg,
+        const Callbacks = union(enum) {
+            plain: SpawnOptions,
+            owned: struct {
+                context: *anyopaque,
+                run: *const fn (*anyopaque, std.mem.Allocator, std.Io) std.Io.Cancelable!Msg,
+                failed: *const fn (*anyopaque, TaskStartError, std.mem.Allocator) Msg,
+                cleanup: *const fn (*anyopaque, std.mem.Allocator) void,
+            },
         };
 
+        /// Runtime/test bridge. Taking an entry transfers ownership: consume it
+        /// exactly once with run, failed, or discard. Do not copy and reuse it.
+        /// The bytes hide typed callbacks, not arbitrary casts or forged values.
         pub const TaskEntry = struct {
-            run: TaskFn,
-            failed: TaskFailedFn,
+            id: TaskId,
+            canceled: bool = false,
+            _storage: [@sizeOf(Callbacks)]u8 align(@alignOf(Callbacks)),
+
+            fn init(id: TaskId, callbacks_: Callbacks) TaskEntry {
+                var entry: TaskEntry = .{ .id = id, ._storage = undefined };
+                @memcpy(&entry._storage, std.mem.asBytes(&callbacks_));
+                return entry;
+            }
+
+            fn callbacks(self: *const TaskEntry) *const Callbacks {
+                return @ptrCast(&self._storage);
+            }
+
+            pub fn run(self: TaskEntry, allocator_: std.mem.Allocator, io_: std.Io) std.Io.Cancelable!Msg {
+                defer self.discard(allocator_);
+                if (self.canceled) return error.Canceled;
+                return switch (self.callbacks().*) {
+                    .plain => |opts| opts.run(allocator_, io_),
+                    .owned => |opts| opts.run(opts.context, allocator_, io_),
+                };
+            }
+
+            pub fn failed(self: TaskEntry, failure: TaskStartError, allocator_: std.mem.Allocator) Msg {
+                std.debug.assert(!self.canceled);
+                defer self.discard(allocator_);
+                return switch (self.callbacks().*) {
+                    .plain => |opts| opts.failed(failure),
+                    .owned => |opts| opts.failed(opts.context, failure, allocator_),
+                };
+            }
+
+            pub fn discard(self: TaskEntry, allocator_: std.mem.Allocator) void {
+                switch (self.callbacks().*) {
+                    .plain => {},
+                    .owned => |opts| opts.cleanup(opts.context, allocator_),
+                }
+            }
         };
 
         pub const TerminalImageLoadEntry = struct {
@@ -288,8 +320,11 @@ pub fn Ctx(comptime Msg: type) type {
         _should_quit: bool = false,
         _pending_tasks: [max_tasks]TaskEntry = undefined,
         _pending_tasks_len: u8 = 0,
-        _pending_tasks_with: [max_tasks]TaskWithEntry = undefined,
-        _pending_tasks_with_len: u8 = 0,
+        _next_task_id: u64 = 1,
+        _task_runtime: ?struct {
+            context: *anyopaque,
+            request: *const fn (*anyopaque, TaskId, std.Io) void,
+        } = null,
         _pending_ticks: [max_ticks]TickEntry = undefined,
         _pending_ticks_len: u8 = 0,
         _pending_everys: [max_everys]EveryEntry = undefined,
@@ -339,40 +374,64 @@ pub fn Ctx(comptime Msg: type) type {
         pub const TaskEffects = struct {
             ctx: *Self,
 
-            /// Spawn an async task. The task function will be called
-            /// concurrently and its return value delivered as a message to
-            /// `update`.
-            ///
-            /// The task is queued here and started by the runtime after
-            /// `update` returns.
-            /// Started task futures are awaited during terminal shutdown and
-            /// should eventually return.
-            pub fn spawn(self: TaskEffects, opts: SpawnOptions) error{TaskLimitExceeded}!void {
-                if (self.ctx._pending_tasks_len + self.ctx._pending_tasks_with_len >= max_tasks) return error.TaskLimitExceeded;
-                self.ctx._pending_tasks[self.ctx._pending_tasks_len] = .{
-                    .run = opts.run,
-                    .failed = opts.failed,
-                };
-                self.ctx._pending_tasks_len += 1;
+            /// Queue a plain task. No context or cancellation bookkeeping is
+            /// required by the caller; discard the returned ID when unused.
+            pub fn spawn(self: TaskEffects, opts: SpawnOptions) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
+                return self.enqueue(.{ .plain = opts });
             }
 
-            /// Spawn an async task with captured context.
-            ///
-            /// The caller must ensure `opts.ctx` remains valid until the task
-            /// returns. Started task futures are awaited during terminal
-            /// shutdown and should eventually return.
-            pub fn spawnWith(
-                self: TaskEffects,
-                opts: SpawnWithOptions,
-            ) error{TaskLimitExceeded}!void {
-                if (self.ctx._pending_tasks_len + self.ctx._pending_tasks_with_len >= max_tasks)
-                    return error.TaskLimitExceeded;
-                self.ctx._pending_tasks_with[self.ctx._pending_tasks_with_len] = .{
-                    .ctx = opts.ctx,
-                    .run = opts.run,
-                    .failed = opts.failed,
+            /// Transfer context ownership only on successful admission. Chasen
+            /// calls cleanup once after run/failed, or instead of either when
+            /// abandoned before start. Borrowed fields still require a valid
+            /// lifetime; clear fields moved into a result before returning.
+            pub fn spawnOwned(self: TaskEffects, context: anytype, comptime opts: anytype) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
+                const Pointer = @TypeOf(context);
+                comptime {
+                    if (@typeInfo(Pointer) != .pointer or @typeInfo(Pointer).pointer.size != .one or @typeInfo(Pointer).pointer.is_const)
+                        @compileError("task context must be a mutable single-item pointer");
+                }
+                const Adapter = struct {
+                    fn run(ptr: *anyopaque, alloc: std.mem.Allocator, io_: std.Io) std.Io.Cancelable!Msg {
+                        const callback: *const fn (Pointer, std.mem.Allocator, std.Io) std.Io.Cancelable!Msg = opts.run;
+                        return callback(@ptrCast(@alignCast(ptr)), alloc, io_);
+                    }
+                    fn failed(ptr: *anyopaque, failure: TaskStartError, alloc: std.mem.Allocator) Msg {
+                        const callback: *const fn (Pointer, TaskStartError, std.mem.Allocator) Msg = opts.failed;
+                        return callback(@ptrCast(@alignCast(ptr)), failure, alloc);
+                    }
+                    fn cleanup(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                        const callback: *const fn (Pointer, std.mem.Allocator) void = opts.cleanup;
+                        callback(@ptrCast(@alignCast(ptr)), alloc);
+                    }
                 };
-                self.ctx._pending_tasks_with_len += 1;
+                return self.enqueue(.{ .owned = .{
+                    .context = context,
+                    .run = Adapter.run,
+                    .failed = Adapter.failed,
+                    .cleanup = Adapter.cleanup,
+                } });
+            }
+
+            fn enqueue(self: TaskEffects, callbacks: Callbacks) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
+                if (self.ctx._pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
+                if (self.ctx._next_task_id == 0) return error.TaskIdExhausted;
+                const id: TaskId = @enumFromInt(self.ctx._next_task_id);
+                self.ctx._next_task_id +%= 1;
+                self.ctx._pending_tasks[self.ctx._pending_tasks_len] = TaskEntry.init(id, callbacks);
+                self.ctx._pending_tasks_len += 1;
+                return id;
+            }
+
+            /// Owning runtime thread only (init/update). Notify without joining
+            /// or allocating. Completion/queued results can still win the race.
+            pub fn requestCancel(self: TaskEffects, id: TaskId) void {
+                for (self.ctx._pending_tasks[0..self.ctx._pending_tasks_len]) |*entry| {
+                    if (entry.id == id) {
+                        entry.canceled = true;
+                        return;
+                    }
+                }
+                if (self.ctx._task_runtime) |runtime_| runtime_.request(runtime_.context, id, self.ctx._io);
             }
         };
 
@@ -725,10 +784,9 @@ pub fn Ctx(comptime Msg: type) type {
             return pending;
         }
 
-        pub fn takePendingTasksWith(self: *@This()) []const TaskWithEntry {
-            const pending = self._pending_tasks_with[0..self._pending_tasks_with_len];
-            self._pending_tasks_with_len = 0;
-            return pending;
+        /// Shared abandonment for runtime unwind, quit and lightweight tests.
+        pub fn discardPendingTasks(self: *@This()) void {
+            for (self.takePendingTasks()) |entry| entry.discard(self._allocator);
         }
 
         pub fn takePendingTicks(self: *@This()) []const TickEntry {
@@ -964,23 +1022,24 @@ test "Ctx spawn accumulates tasks" {
     var ctx_val: Ctx(TestMsg) = .{};
 
     const task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
             return .hello;
         }
-        fn failed(_: TaskFailure) TestMsg {
+        fn failed(_: TaskStartError) TestMsg {
             return .failed;
         }
     };
 
-    try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
+    _ = try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_tasks_len);
 
-    try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
+    _ = try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
     try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_tasks_len);
 
     const slice = ctx_val._pending_tasks[0..ctx_val._pending_tasks_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
-    try std.testing.expectEqual(@as(*const fn (TaskFailure) TestMsg, task.failed), slice[0].failed);
+    try std.testing.expectEqual(TestMsg.hello, try slice[0].run(std.testing.allocator, std.testing.io));
+    slice[1].discard(std.testing.allocator);
 }
 
 test "Ctx frame request marks a pending frame request" {
@@ -997,15 +1056,15 @@ test "Ctx spawn returns error when task queue is full" {
     var ctx_val: Ctx(TestMsg) = .{};
 
     const task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
             return .hello;
         }
-        fn failed(_: TaskFailure) TestMsg {
+        fn failed(_: TaskStartError) TestMsg {
             return .failed;
         }
     };
 
-    for (0..16) |_| try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
+    for (0..16) |_| _ = try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
     try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed }));
 }
 
@@ -1166,29 +1225,41 @@ test "Ctx timer cancel leaves pending timers unchanged when cancel queue is full
     try std.testing.expectEqualStrings("pending", ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].id);
 }
 
-test "Ctx spawnWith accumulates tasks" {
-    const TestMsg = union(enum) { done, failed };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    var dummy_ctx: u32 = 42;
-    const task = struct {
-        fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
-            return .done;
+test "task owned entries consume once on run failure discard and pending cancel" {
+    const Capture = struct {
+        cleanups: *usize,
+        fn run(_: *@This(), _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!u32 {
+            return 42;
         }
-        fn failed(_: *anyopaque, _: TaskFailure, _: std.mem.Allocator) TestMsg {
-            return .failed;
+        fn failed(_: *@This(), _: TaskStartError, _: std.mem.Allocator) u32 {
+            return 17;
+        }
+        fn cleanup(self: *@This(), alloc: std.mem.Allocator) void {
+            self.cleanups.* += 1;
+            alloc.destroy(self);
         }
     };
-
-    try ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_tasks_with_len);
-
-    try ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task.run, .failed = task.failed });
-    try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_tasks_with_len);
-
-    const slice = ctx_val._pending_tasks_with[0..ctx_val._pending_tasks_with_len];
-    try std.testing.expectEqual(@as(usize, 2), slice.len);
-    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&dummy_ctx)), slice[0].ctx);
+    var count: usize = 0;
+    var ctx: Ctx(u32) = .{ ._allocator = std.testing.allocator };
+    for (0..4) |terminal| {
+        const capture = try std.testing.allocator.create(Capture);
+        capture.* = .{ .cleanups = &count };
+        const id = try ctx.task().spawnOwned(capture, .{ .run = Capture.run, .failed = Capture.failed, .cleanup = Capture.cleanup });
+        if (terminal == 3) {
+            ctx.task().requestCancel(id);
+            ctx.task().requestCancel(id);
+        }
+        const entry = ctx.takePendingTasks()[0];
+        switch (terminal) {
+            0 => try std.testing.expectEqual(@as(u32, 42), try entry.run(std.testing.allocator, std.testing.io)),
+            1 => try std.testing.expectEqual(@as(u32, 17), entry.failed(error.ConcurrencyUnavailable, std.testing.allocator)),
+            2 => entry.discard(std.testing.allocator),
+            3 => try std.testing.expectError(error.Canceled, entry.run(std.testing.allocator, std.testing.io)),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(terminal + 1, count);
+        ctx.task().requestCancel(id); // consumed IDs are harmless without a registry
+    }
 }
 
 test "Ctx image loadPath copies queued path" {
@@ -1786,36 +1857,41 @@ test "Ctx redraw skip sets _redraw_suppressed to true" {
     try std.testing.expectEqual(true, ctx_val._redraw_suppressed);
 }
 
-test "Ctx spawn and spawnWith share task limit" {
-    const TestMsg = union(enum) { hello, done, failed };
-    var ctx_val: Ctx(TestMsg) = .{};
-
-    const task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
-            return .hello;
+test "task shared admission limit and exhausted identities preserve caller ownership" {
+    const Task = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!u8 {
+            return 1;
         }
-        fn failed(_: TaskFailure) TestMsg {
-            return .failed;
+        fn failed(_: TaskStartError) u8 {
+            return 0;
         }
-    };
-
-    var dummy_ctx: u32 = 0;
-    const task_with = struct {
-        fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) TestMsg {
-            return .done;
+        fn ownedRun(_: *usize, _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!u8 {
+            return 2;
         }
-        fn failed(_: *anyopaque, _: TaskFailure, _: std.mem.Allocator) TestMsg {
-            return .failed;
+        fn ownedFailed(_: *usize, _: TaskStartError, _: std.mem.Allocator) u8 {
+            return 0;
+        }
+        fn cleanup(count: *usize, _: std.mem.Allocator) void {
+            count.* += 1;
         }
     };
-
-    // Fill 10 with spawn, 6 with spawnWith = 16 total (max_tasks)
-    for (0..10) |_| try ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed });
-    for (0..6) |_| try ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task_with.run, .failed = task_with.failed });
-
-    // Both should fail now
-    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawn(.{ .run = task.run, .failed = task.failed }));
-    try std.testing.expectError(error.TaskLimitExceeded, ctx_val.task().spawnWith(.{ .ctx = @ptrCast(&dummy_ctx), .run = task_with.run, .failed = task_with.failed }));
+    var ctx: Ctx(u8) = .{ ._allocator = std.testing.allocator };
+    var cleanups: usize = 0;
+    const opts = .{ .run = Task.ownedRun, .failed = Task.ownedFailed, .cleanup = Task.cleanup };
+    for (0..10) |_| _ = try ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed });
+    for (0..6) |_| _ = try ctx.task().spawnOwned(&cleanups, opts);
+    try std.testing.expectError(error.TaskLimitExceeded, ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed }));
+    try std.testing.expectError(error.TaskLimitExceeded, ctx.task().spawnOwned(&cleanups, opts));
+    try std.testing.expectEqual(@as(usize, 0), cleanups);
+    ctx.discardPendingTasks();
+    try std.testing.expectEqual(@as(usize, 6), cleanups);
+    ctx._next_task_id = std.math.maxInt(u64);
+    const last = try ctx.task().spawnOwned(&cleanups, opts);
+    try std.testing.expectEqual(std.math.maxInt(u64), @intFromEnum(last));
+    try std.testing.expectError(error.TaskIdExhausted, ctx.task().spawnOwned(&cleanups, opts));
+    ctx.discardPendingTasks();
+    try std.testing.expectEqual(@as(usize, 7), cleanups);
+    try std.testing.expectError(error.TaskIdExhausted, ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed }));
 }
 
 test "Ctx take pending queues returns empty slices initially" {
@@ -1823,7 +1899,6 @@ test "Ctx take pending queues returns empty slices initially" {
     var ctx_val: Ctx(TestMsg) = .{};
 
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTasks().len);
-    try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingTicks().len);
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingEverys().len);
     try std.testing.expectEqual(@as(usize, 0), ctx_val.takePendingCancels().len);

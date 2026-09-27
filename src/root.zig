@@ -45,7 +45,8 @@ pub const ClipboardCopyResult = clipboard.ClipboardCopyResult;
 
 pub const ctx = runtime.ctx;
 pub const Ctx = runtime.Ctx;
-pub const TaskFailure = runtime.TaskFailure;
+pub const TaskStartError = runtime.TaskStartError;
+pub const TaskId = runtime.TaskId;
 pub const UndeliveredPolicy = runtime.UndeliveredPolicy;
 
 pub const testing = @import("testing.zig");

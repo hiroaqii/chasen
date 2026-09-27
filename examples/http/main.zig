@@ -157,7 +157,7 @@ const HttpDemo = struct {
                 .loading => {},
                 else => {
                     self.state = .loading;
-                    try ctx.task().spawn(.{ .run = doFetch, .failed = fetchFailed });
+                    _ = try ctx.task().spawn(.{ .run = doFetch, .failed = fetchFailed });
                 },
             },
             .got_response => |body| {
@@ -180,7 +180,7 @@ const HttpDemo = struct {
     /// WriteFailed, which is caught below and reported as got_error.
     /// For larger responses, prefer streaming only the displayable portion or
     /// using an allocator-backed writer with an explicit size limit.
-    fn doFetch(allocator: std.mem.Allocator, io: std.Io) Msg {
+    fn doFetch(allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
         const url = "http://example.com";
         const method: std.http.Method = .GET;
         // Only explicitly configured request headers are shown in the UI. The
@@ -207,17 +207,20 @@ const HttpDemo = struct {
                 .accept_encoding = .omit,
             },
             .extra_headers = &request_headers,
-        }) catch {
+        }) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
             return .{ .got_error = BoundedStr.from("HTTP request failed") };
         };
         defer req.deinit();
 
-        req.sendBodiless() catch {
+        req.sendBodiless() catch |err| {
+            if (err == error.Canceled) return error.Canceled;
             return .{ .got_error = BoundedStr.from("HTTP request failed") };
         };
 
         var redirect_buf: [8192]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch {
+        var response = req.receiveHead(&redirect_buf) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
             return .{ .got_error = BoundedStr.from("HTTP request failed") };
         };
 
@@ -282,13 +285,6 @@ pub fn main(init: std.process.Init) !void {
     try chasen.run(init, HttpDemo{});
 }
 
-fn fetchFailed(failure: chasen.TaskFailure) HttpDemo.Msg {
-    return .{
-        .got_error = switch (failure) {
-            .start_failed => |message| BoundedStr.from(message),
-            // Shutdown-owned callbacks are deinitialized without reaching update;
-            // this branch keeps the callback exhaustive if it is reused elsewhere.
-            .runtime_abandoned => BoundedStr.from("runtime shutting down"),
-        },
-    };
+fn fetchFailed(failure: chasen.TaskStartError) HttpDemo.Msg {
+    return .{ .got_error = BoundedStr.from(@errorName(failure)) };
 }

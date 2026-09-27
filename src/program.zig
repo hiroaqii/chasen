@@ -173,6 +173,7 @@ fn ResizePollState(comptime Msg: type) type {
 
 fn TaskDelivery(comptime Msg: type) type {
     return union(enum) {
+        none,
         posted,
         undelivered: Msg,
     };
@@ -182,7 +183,12 @@ fn PendingTask(comptime Msg: type) type {
     return struct {
         const Self = @This();
 
+        id: ctx_mod.TaskId = undefined,
         future: std.Io.Future(TaskDelivery(Msg)) = undefined,
+        worker: ?std.Io.Future(TaskDelivery(Msg)) = null,
+        published: std.Io.Event = .unset,
+        wake: std.Io.Event = .unset,
+        cancel_requested: std.atomic.Value(bool) = .init(false),
         completed: std.atomic.Value(bool) = .init(false),
 
         fn create(allocator: std.mem.Allocator, pending: *std.ArrayList(*Self)) !*Self {
@@ -192,10 +198,35 @@ fn PendingTask(comptime Msg: type) type {
             return task;
         }
 
+        fn requestCancel(self: *Self, io: std.Io) void {
+            self.cancel_requested.store(true, .release);
+            self.wake.set(io);
+        }
+
+        fn requestFromRegistry(context: *anyopaque, id: ctx_mod.TaskId, io: std.Io) void {
+            const pending: *std.ArrayList(*Self) = @ptrCast(@alignCast(context));
+            for (pending.items) |task| {
+                if (task.id == id) {
+                    task.requestCancel(io);
+                    return;
+                }
+            }
+        }
+
+        fn supervise(self: *Self, io: std.Io) TaskDelivery(Msg) {
+            defer self.completed.store(true, .release);
+            // Runtime never cancels this supervisor. Publication must happen
+            // even after worker admission failure, before runtime can unwind.
+            self.published.waitUncancelable(io);
+            const worker = if (self.worker) |*worker| worker else return .none;
+            self.wake.waitUncancelable(io);
+            return if (self.cancel_requested.load(.acquire)) worker.cancel(io) else worker.await(io);
+        }
+
         fn awaitAndDestroy(self: *Self, allocator: std.mem.Allocator, io: std.Io) void {
             var outcome = self.future.await(io);
             switch (outcome) {
-                .posted => {},
+                .none, .posted => {},
                 .undelivered => |*msg| root.runtime.deinitUndeliveredMessage(Msg, msg, allocator),
             }
             allocator.destroy(self);
@@ -366,40 +397,20 @@ fn pasteControlText(key: vaxis.Key) ?[]const u8 {
     };
 }
 
-/// Runs a user task and posts its result back into the vaxis event loop.
+/// The consuming entry cleans context before delivery; the supervisor alone
+/// owns this worker's Future. Wake only after every worker-side operation.
 fn SpawnHelper(comptime Msg: type) type {
-    const Event = InternalEvent(Msg);
     return struct {
         fn run(
             task: ctx_mod.Ctx(Msg).TaskEntry,
             alloc: std.mem.Allocator,
             spawn_io: std.Io,
-            loop_ptr: *vaxis.Loop(Event),
+            loop_ptr: *vaxis.Loop(InternalEvent(Msg)),
             shutting_down: *const std.atomic.Value(bool),
-            completed: *std.atomic.Value(bool),
+            pending: *PendingTask(Msg),
         ) TaskDelivery(Msg) {
-            defer completed.store(true, .release);
-            const msg = task.run(alloc, spawn_io);
-            return transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
-        }
-    };
-}
-
-/// Runs a user task with captured context and posts its result back.
-fn SpawnWithHelper(comptime Msg: type) type {
-    const Event = InternalEvent(Msg);
-    return struct {
-        fn run(
-            ctx_ptr: *anyopaque,
-            run_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io) Msg,
-            alloc: std.mem.Allocator,
-            spawn_io: std.Io,
-            loop_ptr: *vaxis.Loop(Event),
-            shutting_down: *const std.atomic.Value(bool),
-            completed: *std.atomic.Value(bool),
-        ) TaskDelivery(Msg) {
-            defer completed.store(true, .release);
-            const msg = run_fn(ctx_ptr, alloc, spawn_io);
+            defer pending.wake.set(spawn_io);
+            const msg = task.run(alloc, spawn_io) catch return .none;
             return transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
         }
     };
@@ -626,10 +637,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     const stats_enabled = opts.runtime.stats_fn != null;
 
     // --- Pending futures (for spawned async tasks) ---
-    // Stable nodes keep worker completion flags valid across list growth and
-    // removal. Completed tasks are joined during effect drain; shutdown awaits
-    // the remaining tasks because their callbacks are not cancellation-aware.
+    // Stable nodes keep publication/wake and completion valid across list
+    // growth. Runtime joins only supervisors; each supervisor owns its worker.
     var pending_futures: std.ArrayList(*PendingTask(Msg)) = .empty;
+    app_ctx._task_runtime = .{ .context = &pending_futures, .request = PendingTask(Msg).requestFromRegistry };
 
     // --- Running timers (id-tracked for cancel support) ---
     // Completed one-shot ticks remain here until shutdown because std.Io.Future
@@ -851,6 +862,10 @@ fn shutdownRuntime(
 ) void {
     shutting_down.store(true, .seq_cst);
     app_ctx.quit();
+    // Broadcast before any join: a non-cooperative task cannot withhold the
+    // cancellation notification from a later task. No shutdown allocation.
+    for (pending_futures.items) |task| task.requestCancel(io);
+    app_ctx.discardPendingTasks();
 
     // Do not call Loop.stop here: its DSR wake + await can block behind a full
     // queue or a terminal that does not answer the query. Canceling the
@@ -878,7 +893,7 @@ fn shutdownRuntime(
 
     drainInternalEventsForShutdown(App.Msg, loop, allocator);
     runtime_completions.deinitUndelivered(allocator);
-    discardQueuedTasks(App.Msg, app_ctx, allocator);
+    app_ctx._task_runtime = null;
     discardQueuedForegroundCommands(App.Msg, app_ctx, allocator);
 }
 
@@ -947,24 +962,6 @@ fn drainInternalEventsForShutdown(
             },
             else => {},
         }
-    }
-}
-
-/// Error unwind may bypass `drainPendingEffects` after App.update queued task
-/// entries. Reuse the failure callback so captured spawnWith context follows
-/// its existing consume path, then dispose the manufactured undelivered Msg.
-fn discardQueuedTasks(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    allocator: std.mem.Allocator,
-) void {
-    for (app_ctx.takePendingTasks()) |entry| {
-        var msg = entry.failed(.runtime_abandoned);
-        root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-    }
-    for (app_ctx.takePendingTasksWith()) |entry| {
-        var msg = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
     }
 }
 
@@ -1404,6 +1401,20 @@ fn runForegroundCommand(
     return outcome;
 }
 
+fn appendTaskStartFailure(
+    comptime Msg: type,
+    task: ctx_mod.Ctx(Msg).TaskEntry,
+    failure: ctx_mod.TaskStartError,
+    completions: *RuntimeCompletionBuffer(Msg),
+    allocator: std.mem.Allocator,
+) !void {
+    var msg = task.failed(failure, allocator);
+    completions.append(msg) catch |err| {
+        root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
+        return err;
+    };
+}
+
 /// Starts tasks queued in Ctx and tracks their futures for shutdown.
 /// Task start failures are delivered through the app-provided failure callback
 /// before ownership is transferred to the concurrent task body.
@@ -1418,54 +1429,37 @@ fn spawnPendingTasks(
     shutting_down: *const std.atomic.Value(bool),
 ) !void {
     const Msg = App.Msg;
-    // Run even when no new task is queued. A last completion racing this scan
-    // can wait for the next effect drain (or shutdown), without adding a wake.
     reapCompletedTasks(Msg, pending_futures, allocator, io);
-    for (app_ctx.takePendingTasks()) |task| {
+    const tasks = app_ctx.takePendingTasks();
+    var consumed: usize = 0;
+    // Taking clears the queue. A completion-buffer error must still consume
+    // every later entry that never reached worker admission.
+    defer for (tasks[consumed..]) |task| task.discard(allocator);
+    for (tasks) |task| {
+        consumed += 1;
+        if (task.canceled or app_ctx.shouldQuit() or shutting_down.load(.acquire)) {
+            task.discard(allocator);
+            continue;
+        }
         const pending = PendingTask(Msg).create(allocator, pending_futures) catch |err| {
-            var msg = task.failed(.{ .start_failed = @errorName(err) });
-            runtime_completions.append(msg) catch |append_err| {
-                root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                return append_err;
-            };
+            try appendTaskStartFailure(Msg, task, err, runtime_completions, allocator);
             continue;
         };
-        pending.future = io.concurrent(
-            SpawnHelper(Msg).run,
-            .{ task, allocator, io, loop, shutting_down, &pending.completed },
-        ) catch |err| {
+        pending.id = task.id;
+        pending.future = io.concurrent(PendingTask(Msg).supervise, .{ pending, io }) catch |err| {
             allocator.destroy(pending);
-            var msg = task.failed(.{ .start_failed = @errorName(err) });
-            runtime_completions.append(msg) catch |append_err| {
-                root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                return append_err;
-            };
+            try appendTaskStartFailure(Msg, task, err, runtime_completions, allocator);
             continue;
         };
         pending_futures.appendAssumeCapacity(pending);
-    }
-    for (app_ctx.takePendingTasksWith()) |entry| {
-        const pending = PendingTask(Msg).create(allocator, pending_futures) catch |err| {
-            var msg = entry.failed(entry.ctx, .{ .start_failed = @errorName(err) }, allocator);
-            runtime_completions.append(msg) catch |append_err| {
-                root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                return append_err;
-            };
+        pending.worker = io.concurrent(SpawnHelper(Msg).run, .{ task, allocator, io, loop, shutting_down, pending }) catch |err| {
+            // Publish the no-worker terminal before any fallible processing.
+            // Do not join the supervisor in the ordinary start-failure path.
+            pending.published.set(io);
+            try appendTaskStartFailure(Msg, task, err, runtime_completions, allocator);
             continue;
         };
-        pending.future = io.concurrent(
-            SpawnWithHelper(Msg).run,
-            .{ entry.ctx, entry.run, allocator, io, loop, shutting_down, &pending.completed },
-        ) catch |err| {
-            allocator.destroy(pending);
-            var msg = entry.failed(entry.ctx, .{ .start_failed = @errorName(err) }, allocator);
-            runtime_completions.append(msg) catch |append_err| {
-                root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                return append_err;
-            };
-            continue;
-        };
-        pending_futures.appendAssumeCapacity(pending);
+        pending.published.set(io);
     }
 }
 
@@ -1818,7 +1812,7 @@ const ReapingTestTask = struct {
     };
 
     counts: *Counts,
-    payload: OwnershipTestPayload,
+    payload: ?OwnershipTestPayload,
     gate: ?*std.Io.Event = null,
     var plain: *ReapingTestTask = undefined;
 
@@ -1834,35 +1828,40 @@ const ReapingTestTask = struct {
     }
 
     fn consume(self: *ReapingTestTask) OwnershipTestMsg {
-        const msg: OwnershipTestMsg = .{ .owned = self.payload };
-        _ = self.counts.contexts.fetchAdd(1, .monotonic);
-        std.testing.allocator.destroy(self);
+        const msg: OwnershipTestMsg = .{ .owned = self.payload.? };
+        self.payload = null;
         return msg;
     }
 
-    fn run(ptr: *anyopaque, _: std.mem.Allocator, io: std.Io) OwnershipTestMsg {
-        const self: *ReapingTestTask = @ptrCast(@alignCast(ptr));
+    fn cleanup(self: *ReapingTestTask, allocator: std.mem.Allocator) void {
+        if (self.payload) |payload| allocator.free(payload.bytes);
+        _ = self.counts.contexts.fetchAdd(1, .monotonic);
+        allocator.destroy(self);
+    }
+
+    fn run(self: *ReapingTestTask, _: std.mem.Allocator, io: std.Io) std.Io.Cancelable!OwnershipTestMsg {
         _ = self.counts.runs.fetchAdd(1, .monotonic);
-        if (self.gate) |gate| gate.wait(io) catch unreachable;
+        if (self.gate) |gate| gate.waitUncancelable(io);
         return self.consume();
     }
 
-    fn failed(ptr: *anyopaque, _: ctx_mod.TaskFailure, _: std.mem.Allocator) OwnershipTestMsg {
-        const self: *ReapingTestTask = @ptrCast(@alignCast(ptr));
+    fn failed(self: *ReapingTestTask, _: ctx_mod.TaskStartError, _: std.mem.Allocator) OwnershipTestMsg {
         self.counts.failures += 1;
         return self.consume();
     }
 
-    fn plainRun(allocator: std.mem.Allocator, io: std.Io) OwnershipTestMsg {
-        return ReapingTestTask.run(plain, allocator, io);
+    fn plainRun(allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!OwnershipTestMsg {
+        defer plain.cleanup(allocator);
+        return plain.run(allocator, io);
     }
 
-    fn plainFailed(reason: ctx_mod.TaskFailure) OwnershipTestMsg {
-        return failed(plain, reason, std.testing.allocator);
+    fn plainFailed(reason: ctx_mod.TaskStartError) OwnershipTestMsg {
+        defer plain.cleanup(std.testing.allocator);
+        return plain.failed(reason, std.testing.allocator);
     }
 };
 
-test "task reclamation bounds repeated spawn and spawnWith results including early completion" {
+test "task reclamation bounds repeated plain and owned tasks results including early completion" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
@@ -1878,15 +1877,18 @@ test "task reclamation bounds repeated spawn and spawnWith results including ear
     var counts: ReapingTestTask.Counts = .{};
     var app: ReapingTestTask.App = .{};
 
-    // Force the helper's completion before the runtime installs its Future.
+    // Complete the worker before publishing its Future to the supervisor.
     const early = try PendingTask(Msg).create(allocator, &pending);
     const task = try ReapingTestTask.create(&counts);
-    const future = try io.concurrent(SpawnWithHelper(Msg).run, .{
-        task, ReapingTestTask.run, allocator, io, &loop, &shutting_down, &early.completed,
-    });
-    while (!early.completed.load(.acquire)) try std.Thread.yield();
-    early.future = future;
+    early.id = try ctx.task().spawnOwned(task, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
+    const entry = ctx.takePendingTasks()[0];
+    early.future = try io.concurrent(PendingTask(Msg).supervise, .{ early, io });
+    const future = try io.concurrent(SpawnHelper(Msg).run, .{ entry, allocator, io, &loop, &shutting_down, early });
+    early.wake.waitUncancelable(io);
+    early.worker = future;
+    early.published.set(io);
     pending.appendAssumeCapacity(early);
+    while (!early.completed.load(.acquire)) try std.Thread.yield();
 
     // The ordinary test stays short; the optional finite soak uses this same
     // production spawn/reap path in one process, without a second test harness.
@@ -1903,12 +1905,8 @@ test "task reclamation bounds repeated spawn and spawnWith results including ear
         // Exactly one plain task per batch: its context remains fixed until
         // every worker in the batch has been joined.
         ReapingTestTask.plain = try ReapingTestTask.create(&counts);
-        try ctx.task().spawn(.{ .run = ReapingTestTask.plainRun, .failed = ReapingTestTask.plainFailed });
-        for (0..3) |_| try ctx.task().spawnWith(.{
-            .ctx = try ReapingTestTask.create(&counts),
-            .run = ReapingTestTask.run,
-            .failed = ReapingTestTask.failed,
-        });
+        _ = try ctx.task().spawn(.{ .run = ReapingTestTask.plainRun, .failed = ReapingTestTask.plainFailed });
+        for (0..3) |_| _ = try ctx.task().spawnOwned(try ReapingTestTask.create(&counts), .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
         try spawnPendingTasks(ReapingTestTask.App, &ctx, &pending, &completions, allocator, io, &loop, &shutting_down);
         try std.testing.expectEqual(@as(usize, 4), pending.items.len);
         for (pending.items) |active| while (!active.completed.load(.acquire)) {
@@ -1941,12 +1939,8 @@ test "task reclamation skips running work and shutdown owns only remaining full-
     var gate: std.Io.Event = .unset;
     const slow = try ReapingTestTask.create(&counts);
     slow.gate = &gate;
-    try ctx.task().spawnWith(.{ .ctx = slow, .run = ReapingTestTask.run, .failed = ReapingTestTask.failed });
-    for (0..2) |_| try ctx.task().spawnWith(.{
-        .ctx = try ReapingTestTask.create(&counts),
-        .run = ReapingTestTask.run,
-        .failed = ReapingTestTask.failed,
-    });
+    _ = try ctx.task().spawnOwned(slow, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
+    for (0..2) |_| _ = try ctx.task().spawnOwned(try ReapingTestTask.create(&counts), .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
     try spawnPendingTasks(ReapingTestTask.App, &ctx, &pending, &completions, allocator, io, &loop, &shutting_down);
     for (pending.items[1..]) |task| while (!task.completed.load(.acquire)) {
         try std.Thread.yield();
@@ -1969,17 +1963,17 @@ test "task reclamation skips running work and shutdown owns only remaining full-
 }
 
 test "task reclamation start failures consume context and payload once" {
-    const Failure = enum { list_allocation, node_allocation, concurrent_start };
+    const Failure = enum { list_allocation, node_allocation, supervisor_start, worker_start };
     for (std.enums.values(Failure)) |failure| {
         for ([_]bool{ false, true }) |with_context| {
             const allocator = std.testing.allocator;
             var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = switch (failure) {
                 .list_allocation => 0,
                 .node_allocation => 1,
-                .concurrent_start => std.math.maxInt(usize),
+                .supervisor_start, .worker_start => std.math.maxInt(usize),
             } });
             const task_allocator = failing.allocator();
-            var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .nothing });
+            var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(if (failure == .worker_start) 1 else 0) });
             defer threaded.deinit();
             const io = threaded.io();
             const Msg = OwnershipTestMsg;
@@ -1994,12 +1988,16 @@ test "task reclamation start failures consume context and payload once" {
             var counts: ReapingTestTask.Counts = .{};
             const task = try ReapingTestTask.create(&counts);
             if (with_context) {
-                try ctx.task().spawnWith(.{ .ctx = task, .run = ReapingTestTask.run, .failed = ReapingTestTask.failed });
+                _ = try ctx.task().spawnOwned(task, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
             } else {
                 ReapingTestTask.plain = task;
-                try ctx.task().spawn(.{ .run = ReapingTestTask.plainRun, .failed = ReapingTestTask.plainFailed });
+                _ = try ctx.task().spawn(.{ .run = ReapingTestTask.plainRun, .failed = ReapingTestTask.plainFailed });
             }
             try spawnPendingTasks(ReapingTestTask.App, &ctx, &pending, &completions, task_allocator, io, &loop, &shutting_down);
+            for (pending.items) |active| while (!active.completed.load(.acquire)) {
+                try std.Thread.yield();
+            };
+            reapCompletedTasks(Msg, &pending, task_allocator, io);
             try std.testing.expectEqual(@as(usize, 0), pending.items.len);
             try std.testing.expectEqual(@as(usize, 0), counts.runs.load(.monotonic));
             try std.testing.expectEqual(@as(usize, 1), counts.contexts.load(.monotonic));
@@ -2009,6 +2007,158 @@ test "task reclamation start failures consume context and payload once" {
             try std.testing.expectEqual(@as(usize, 1), counts.payloads);
         }
     }
+}
+
+const CancellationTestTask = struct {
+    const Msg = enum {
+        done,
+        pub const undelivered_policy = .plain;
+    };
+    const App = struct {
+        pub const Msg = CancellationTestTask.Msg;
+    };
+    const State = struct {
+        started: std.Io.Event = .unset,
+        cleanup_entered: std.Io.Event = .unset,
+        cleaned: std.Io.Event = .unset,
+        count: std.atomic.Value(usize) = .init(0),
+    };
+    state: *State,
+    io: std.Io,
+    release: ?*std.Io.Event,
+
+    fn submit(ctx: *ctx_mod.Ctx(Msg), state: *State, io: std.Io, release: ?*std.Io.Event) !ctx_mod.TaskId {
+        const task = try std.testing.allocator.create(CancellationTestTask);
+        errdefer std.testing.allocator.destroy(task);
+        task.* = .{ .state = state, .io = io, .release = release };
+        return ctx.task().spawnOwned(task, .{ .run = CancellationTestTask.run, .failed = failed, .cleanup = cleanup });
+    }
+    fn run(self: *@This(), _: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+        self.state.started.set(io);
+        try io.sleep(.fromSeconds(3600), .awake);
+        return .done;
+    }
+    fn failed(_: *@This(), _: ctx_mod.TaskStartError, _: std.mem.Allocator) Msg {
+        unreachable;
+    }
+    fn cleanup(self: *@This(), allocator: std.mem.Allocator) void {
+        const state = self.state;
+        const io = self.io;
+        state.cleanup_entered.set(io);
+        // Deliberately non-cooperative cleanup, controlled by the test. Real
+        // cleanup is documented as bounded and must not wait for other work.
+        if (self.release) |release| release.waitUncancelable(io);
+        allocator.destroy(self);
+        _ = state.count.fetchAdd(1, .monotonic);
+        state.cleaned.set(io);
+    }
+};
+
+test "task cancel request returns during slow cleanup and shutdown broadcasts before joining" {
+    const Task = CancellationTestTask;
+    const Msg = Task.Msg;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |via_shutdown| {
+        var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+        var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
+        ctx._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
+        var completions: RuntimeCompletionBuffer(Msg) = .{};
+        try completions.init(allocator);
+        var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var slow: Task.State = .{};
+        var fast: Task.State = .{};
+        var release: std.Io.Event = .unset;
+        const slow_id = try Task.submit(&ctx, &slow, io, if (via_shutdown) &fast.cleaned else &release);
+        const fast_id = try Task.submit(&ctx, &fast, io, null);
+        try spawnPendingTasks(Task.App, &ctx, &pending, &completions, allocator, io, &loop, &shutting_down);
+        slow.started.waitUncancelable(io);
+        fast.started.waitUncancelable(io);
+        if (!via_shutdown) {
+            ctx.task().requestCancel(slow_id);
+            slow.cleanup_entered.waitUncancelable(io);
+            // If requestCancel joined slow, execution could not reach here.
+            ctx.task().requestCancel(fast_id);
+            ctx.task().requestCancel(fast_id);
+            fast.cleaned.waitUncancelable(io);
+            try std.testing.expectEqual(@as(usize, 0), slow.count.load(.acquire));
+            release.set(io);
+        }
+        var timers: std.ArrayList(TimerHandle) = .empty;
+        var frame: ?std.Io.Future(void) = null;
+        shutdownRuntime(Task.App, &ctx, &pending, &timers, &completions, &frame, &loop, allocator, io, &shutting_down);
+        try std.testing.expectEqual(@as(usize, 1), slow.count.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), fast.count.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), pending.items.len);
+        try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try loop.tryEvent());
+    }
+}
+
+test "task cancel and completion races preserve moved results on runtime including full queue" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Msg = OwnershipTestMsg;
+    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
+    defer pending.deinit(allocator);
+    ctx._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
+    var completions: RuntimeCompletionBuffer(Msg) = .{};
+    try completions.init(allocator);
+    defer completions.deinitUndelivered(allocator);
+    var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
+    var shutting_down: std.atomic.Value(bool) = .init(false);
+    var counts: ReapingTestTask.Counts = .{};
+    for (0..128) |i| {
+        const full = i % 3 == 0;
+        if (full) while (try loop.tryPostEvent(.continue_effect_drain)) {};
+        const task = try ReapingTestTask.create(&counts);
+        const id = try ctx.task().spawnOwned(task, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
+        try spawnPendingTasks(ReapingTestTask.App, &ctx, &pending, &completions, allocator, io, &loop, &shutting_down);
+        if (i % 3 == 1) while (!pending.items[0].completed.load(.acquire)) {
+            try std.Thread.yield();
+        };
+        ctx.task().requestCancel(id);
+        while (!pending.items[0].completed.load(.acquire)) try std.Thread.yield();
+        reapCompletedTasks(Msg, &pending, allocator, io);
+        if (full) try std.testing.expectEqual(i + 1, counts.payloads);
+        drainInternalEventsForShutdown(Msg, &loop, allocator);
+        try std.testing.expectEqual(i + 1, counts.payloads);
+        try std.testing.expectEqual(i + 1, counts.contexts.load(.acquire));
+        ctx.task().requestCancel(id); // absent after reaping
+    }
+}
+
+test "task failure completion overflow discards all remaining taken contexts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Msg = OwnershipTestMsg;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
+    defer pending.deinit(allocator);
+    var completions: RuntimeCompletionBuffer(Msg) = .{};
+    try completions.init(allocator);
+    defer completions.deinitUndelivered(allocator);
+    var buffer_payloads: usize = 0;
+    for (0..RuntimeCompletionBuffer(Msg).capacity) |_| try completions.append(.{ .owned = .{
+        .bytes = try allocator.dupe(u8, "already buffered"),
+        .deinit_count = &buffer_payloads,
+    } });
+    var counts: ReapingTestTask.Counts = .{};
+    for (0..3) |_| _ = try ctx.task().spawnOwned(try ReapingTestTask.create(&counts), .{
+        .run = ReapingTestTask.run,
+        .failed = ReapingTestTask.failed,
+        .cleanup = ReapingTestTask.cleanup,
+    });
+    var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
+    var shutting_down: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectError(error.RuntimeCompletionLimitExceeded, spawnPendingTasks(ReapingTestTask.App, &ctx, &pending, &completions, failing.allocator(), io, &loop, &shutting_down));
+    try std.testing.expectEqual(@as(usize, 3), counts.contexts.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), counts.failures);
+    try std.testing.expectEqual(@as(usize, 1), counts.payloads);
+    try std.testing.expectEqual(@as(usize, 0), counts.runs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 
 test "task delivery returns undelivered message after shutdown barrier" {
@@ -2026,7 +2176,7 @@ test "task delivery returns undelivered message after shutdown barrier" {
         &shutting_down,
     );
     switch (outcome) {
-        .posted => return error.TestUnexpectedResult,
+        .none, .posted => return error.TestUnexpectedResult,
         .undelivered => |value| {
             var msg = value;
             root.runtime.deinitUndeliveredMessage(OwnershipTestMsg, &msg, std.testing.allocator);
@@ -2091,7 +2241,7 @@ test "task delivery escapes full queue when shutdown begins" {
     shutting_down.store(true, .seq_cst);
     var outcome = future.await(std.testing.io);
     switch (outcome) {
-        .posted => return error.TestUnexpectedResult,
+        .none, .posted => return error.TestUnexpectedResult,
         .undelivered => |*msg| root.runtime.deinitUndeliveredMessage(OwnershipTestMsg, msg, std.testing.allocator),
     }
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
@@ -2328,11 +2478,11 @@ test "task start failure uses runtime completion buffer with full event queue" {
         }
     };
     const Task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
             unreachable;
         }
 
-        fn failed(_: ctx_mod.TaskFailure) TestMsg {
+        fn failed(_: ctx_mod.TaskStartError) TestMsg {
             return .failed;
         }
     };
@@ -2342,7 +2492,7 @@ test "task start failure uses runtime completion buffer with full event queue" {
         ._allocator = std.testing.allocator,
         ._io = std.testing.io,
     };
-    try app_ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed });
+    _ = try app_ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed });
     var pending_futures: std.ArrayList(*PendingTask(TestMsg)) = .empty;
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
     try completions.init(std.testing.allocator);
@@ -2392,11 +2542,11 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         pub const undelivered_policy = .plain;
     };
     const Task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
             unreachable;
         }
 
-        fn failed(_: ctx_mod.TaskFailure) TestMsg {
+        fn failed(_: ctx_mod.TaskStartError) TestMsg {
             return .second;
         }
     };
@@ -2408,7 +2558,7 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
             self.update_count += 1;
             switch (msg) {
-                .first => try ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed }),
+                .first => _ = try ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed }),
                 .second => {},
             }
         }
@@ -2655,52 +2805,50 @@ test "runtime completion update error remains app-owned" {
     try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
 }
 
-test "discard queued spawnWith task consumes context and returned message" {
+test "task pending cancel quit and unwind discard contexts without failure messages" {
     const Capture = struct {
         bytes: []u8,
-        failure_seen: *bool,
-        deinit_count: *usize,
-
-        fn run(_: *anyopaque, _: std.mem.Allocator, _: std.Io) OwnershipTestMsg {
+        cleanups: *usize,
+        fn run(_: *@This(), _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!OwnershipTestMsg {
             unreachable;
         }
-
-        fn failed(ptr: *anyopaque, failure: ctx_mod.TaskFailure, allocator: std.mem.Allocator) OwnershipTestMsg {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.failure_seen.* = failure == .runtime_abandoned;
-            const msg: OwnershipTestMsg = .{ .owned = .{
-                .bytes = self.bytes,
-                .deinit_count = self.deinit_count,
-            } };
+        fn failed(_: *@This(), _: ctx_mod.TaskStartError, _: std.mem.Allocator) OwnershipTestMsg {
+            unreachable;
+        }
+        fn cleanup(self: *@This(), allocator: std.mem.Allocator) void {
+            self.cleanups.* += 1;
+            allocator.free(self.bytes);
             allocator.destroy(self);
-            return msg;
         }
     };
-
-    var failure_seen = false;
-    var deinit_count: usize = 0;
-    const capture = try std.testing.allocator.create(Capture);
-    capture.* = .{
-        .bytes = try std.testing.allocator.dupe(u8, "captured-task-context"),
-        .failure_seen = &failure_seen,
-        .deinit_count = &deinit_count,
-    };
-
-    var app_ctx: ctx_mod.Ctx(OwnershipTestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
-    try app_ctx.task().spawnWith(.{
-        .ctx = capture,
-        .run = Capture.run,
-        .failed = Capture.failed,
-    });
-
-    discardQueuedTasks(OwnershipTestMsg, &app_ctx, std.testing.allocator);
-
-    try std.testing.expect(failure_seen);
-    try std.testing.expectEqual(@as(usize, 1), deinit_count);
-    try std.testing.expectEqual(@as(usize, 0), app_ctx.takePendingTasksWith().len);
+    const Terminal = enum { cancel, quit, unwind };
+    for (std.enums.values(Terminal)) |terminal| {
+        var cleanups: usize = 0;
+        const capture = try std.testing.allocator.create(Capture);
+        capture.* = .{ .bytes = try std.testing.allocator.dupe(u8, "pending context"), .cleanups = &cleanups };
+        var ctx: ctx_mod.Ctx(OwnershipTestMsg) = .{ ._allocator = std.testing.allocator };
+        const id = try ctx.task().spawnOwned(capture, .{ .run = Capture.run, .failed = Capture.failed, .cleanup = Capture.cleanup });
+        if (terminal == .unwind) {
+            ctx.discardPendingTasks();
+        } else {
+            if (terminal == .quit) ctx.quit() else ctx.task().requestCancel(id);
+            const App = struct {
+                pub const Msg = OwnershipTestMsg;
+            };
+            var pending: std.ArrayList(*PendingTask(OwnershipTestMsg)) = .empty;
+            defer pending.deinit(std.testing.allocator);
+            var completions: RuntimeCompletionBuffer(OwnershipTestMsg) = .{};
+            try completions.init(std.testing.allocator);
+            defer completions.deinitUndelivered(std.testing.allocator);
+            var loop = vaxis.Loop(InternalEvent(OwnershipTestMsg)).init(std.testing.io, undefined, undefined);
+            var shutting_down: std.atomic.Value(bool) = .init(false);
+            try spawnPendingTasks(App, &ctx, &pending, &completions, std.testing.allocator, std.testing.io, &loop, &shutting_down);
+            try std.testing.expectEqual(@as(usize, 0), pending.items.len);
+            try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
+        }
+        try std.testing.expectEqual(@as(usize, 1), cleanups);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    }
 }
 
 test "BracketedPasteAccumulator combines pasted key text" {

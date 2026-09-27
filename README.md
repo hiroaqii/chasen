@@ -258,17 +258,22 @@ ctx.frame().request();
 ctx.redraw().skip();
 
 // Run background work that does not need captured app-owned context.
-try ctx.task().spawn(.{
+_ = try ctx.task().spawn(.{
     .run = Task.run,
     .failed = Task.failed,
 });
 
-// Run background work with an explicit context pointer owned by the app.
-try ctx.task().spawnWith(.{
-    .ctx = task,
+// Transfer an owned typed context only after successful admission.
+const task_id = ctx.task().spawnOwned(task, .{
     .run = Task.run,
     .failed = Task.failed,
-});
+    .cleanup = Task.destroy,
+}) catch |err| {
+    Task.destroy(task, ctx.allocator()); // admission failed: caller still owns it
+    return err;
+};
+// Notify without waiting for the task to finish.
+ctx.task().requestCancel(task_id);
 
 // Send `.reload` once after the given delay.
 try ctx.timer().tick("reload", 1_000_000_000, .reload);
@@ -295,22 +300,40 @@ const clipboard_request_id = try ctx.terminal().copyToClipboard(.{
 // page/surface metadata in app state under this id and take it on completion.
 ```
 
-Effects are not executed immediately. They are stored in `Ctx` and drained by
-the runtime after `init` or `update` returns. This keeps state changes and
-runtime work in a clear order.
+Most effects are stored in `Ctx` and drained after `init` or `update` returns.
+Task cancellation is an immediate notification; it still leaves joining and
+result cleanup to the runtime.
 
-Task effects are delivered as either the task's success message or the required
-`failed(.start_failed)` message when the runtime cannot start the task. A task
-left queued during runtime error unwind receives `.runtime_abandoned`; its
-failure callback must consume any `spawnWith` context, but the returned message
-is deinitialized without entering `update`. If a
-terminal foreground command is running, completed task results are queued by the
-event loop and delivered after Chasen resumes. Apps must still use request ids,
-generations, or other identity checks for stale results; foreground completion
-ordering is not a correctness contract. Started task futures are awaited during
-terminal shutdown. Results that can no longer be delivered use the root Msg
-policy above, so task functions should eventually return; a task that never
-returns can still block shutdown.
+Task `run` returns `std.Io.Cancelable!Msg`; use `try` at standard Io cancellation
+points. Plain `failed` accepts `chasen.TaskStartError` (`OutOfMemory` or
+`ConcurrencyUnavailable`) and returns a Msg. For owned contexts the signatures
+are `run(*T, Allocator, Io) Cancelable!Msg`,
+`failed(*T, TaskStartError, Allocator) Msg`, and `cleanup(*T, Allocator) void`.
+After successful admission Chasen calls cleanup exactly once. Run/failed must
+not destroy the context themselves. Clear any field moved into an owning Msg.
+Borrowed fields still need an application-proven lifetime through cleanup.
+
+Task IDs need no release and are never reused within one Ctx/run. Admission can
+fail with `TaskLimitExceeded` or `TaskIdExhausted`, leaving caller ownership.
+`requestCancel` is an owning-runtime-thread operation (init/update), with no
+allocation or join. Pending canceled/abandoned tasks only run cleanup; started
+work can return `error.Canceled` without a Msg. A request does not revoke results
+already produced/queued, so keep generation/identity checks for stale results.
+Foreground commands continue to defer normal message delivery until TUI resume.
+
+Shutdown notifies all started tasks before joining, discards pending contexts,
+and finishes context/message cleanup before `App.deinit`. Non-cooperative code
+can still block shutdown; cancellation does not undo side effects. Undelivered
+Msgs are always destroyed on the runtime thread. Normal context cleanup runs on
+the worker, start-failure/pending cleanup on runtime. Cleanup must be bounded,
+not enqueue effects or join work.
+
+The current standard-Io implementation uses a worker and a waiting supervisor
+per started task, including plain tasks. `std.Io.Threaded` therefore needs two
+concurrency units per live task, and its pool retains peak threads until backend
+deinit. Reaping task records does not shrink that pool. See
+[Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md) for terminal and
+testing contracts.
 
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then

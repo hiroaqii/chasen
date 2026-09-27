@@ -177,6 +177,20 @@ pub fn build(b: *std.Build) void {
         .root_module = runtime_mod,
         .filters = test_filters,
     });
+    const task_consumer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/task_entry_consumer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "chasen", .module = mod }},
+        }),
+        .use_llvm = true,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
+        .filters = test_filters,
+    });
+    const check_task_tests = b.step("check-task-tests", "Compile task tests for native or cross targets");
+    check_task_tests.dependOn(&mod_tests.step);
+    check_task_tests.dependOn(&task_consumer_tests.step);
     b.step("check-foreground-tests", "Compile focused foreground tests for native or cross targets").dependOn(&mod_tests.step);
 
     // A run step that will run the test executable.
@@ -189,6 +203,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_runtime_mod_tests.step);
+    test_step.dependOn(&b.addRunArtifact(task_consumer_tests).step);
 
     const terminal_input_step = b.step(
         "test-terminal-input",

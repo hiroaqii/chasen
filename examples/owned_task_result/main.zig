@@ -10,7 +10,6 @@ const OwnedTaskResult = struct {
     const Failure = enum {
         allocation_failed,
         task_start_failed,
-        runtime_abandoned,
     };
 
     pub const Msg = union(enum) {
@@ -52,7 +51,7 @@ const OwnedTaskResult = struct {
                 if (self.loading) return;
                 self.loading = true;
                 self.failure = null;
-                try ctx.task().spawn(.{ .run = loadText, .failed = loadFailed });
+                _ = try ctx.task().spawn(.{ .run = loadText, .failed = loadFailed });
             },
             .loaded => |bytes| {
                 if (self.text) |old| ctx.allocator().free(old);
@@ -89,23 +88,16 @@ const OwnedTaskResult = struct {
         col.borrowText("space: load  q: quit", .{ .dim = true });
     }
 
-    fn loadText(allocator: std.mem.Allocator, io: std.Io) Msg {
-        io.sleep(.fromMilliseconds(250), .awake) catch {};
+    fn loadText(allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+        try io.sleep(.fromMilliseconds(250), .awake);
         const text = allocator.dupe(u8, "This text is owned by the task result.") catch {
             return .{ .failed = .allocation_failed };
         };
         return .{ .loaded = text };
     }
 
-    fn loadFailed(failure: chasen.TaskFailure) Msg {
-        return .{
-            .failed = switch (failure) {
-                .start_failed => .task_start_failed,
-                // A queued task can be abandoned during runtime unwind. Chasen
-                // immediately passes this result to deinitUndelivered.
-                .runtime_abandoned => .runtime_abandoned,
-            },
-        };
+    fn loadFailed(_: chasen.TaskStartError) Msg {
+        return .{ .failed = .task_start_failed };
     }
 };
 

@@ -127,6 +127,11 @@ pub const TestSurface = struct {
     }
 };
 
+/// Discard pending tasks through the production cleanup path. No Msg is made.
+pub fn discardPendingTasks(comptime Msg: type, ctx: *ctx_mod.Ctx(Msg)) void {
+    ctx.discardPendingTasks();
+}
+
 /// Lightweight test wrapper around `Ctx(Msg)`.
 ///
 /// Provides a properly initialised `Ctx` for unit-testing `update`
@@ -152,9 +157,8 @@ pub fn TestCtx(comptime Msg: type) type {
         /// Clears pending side effects and redraw suppression.
         /// Preserves the quit request and allocator.
         pub fn resetTransient(self: *@This()) void {
+            discardPendingTasks(Msg, &self.ctx);
             self.ctx.runtimeClearPendingEffectCopies();
-            _ = self.ctx.takePendingTasks();
-            _ = self.ctx.takePendingTasksWith();
             self.ctx.resetRedrawSuppressed();
             _ = self.ctx.takeFrameRequest();
         }
@@ -165,10 +169,6 @@ pub fn TestCtx(comptime Msg: type) type {
 
         pub fn pendingTaskCount(self: *const @This()) usize {
             return self.ctx._pending_tasks_len;
-        }
-
-        pub fn pendingTaskWithCount(self: *const @This()) usize {
-            return self.ctx._pending_tasks_with_len;
         }
 
         pub fn pendingTickCount(self: *const @This()) usize {
@@ -221,14 +221,14 @@ test "resetTransient clears pending queues and redraw suppression" {
 
     // Accumulate some state
     const task = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestMsg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
             return .inc;
         }
-        fn failed(_: ctx_mod.TaskFailure) TestMsg {
+        fn failed(_: ctx_mod.TaskStartError) TestMsg {
             return .dec;
         }
     };
-    try tc.ctx.task().spawn(.{ .run = task.run, .failed = task.failed });
+    _ = try tc.ctx.task().spawn(.{ .run = task.run, .failed = task.failed });
     try tc.ctx.timer().tick("t1", 1_000, .inc);
     try tc.ctx.timer().every("e1", 2_000, .dec);
     try tc.ctx.timer().cancel("x");
@@ -254,7 +254,6 @@ test "resetTransient clears pending queues and redraw suppression" {
     tc.resetTransient();
 
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskCount());
-    try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskWithCount());
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount());
     try std.testing.expectEqual(@as(usize, 0), tc.pendingEveryCount());
     try std.testing.expectEqual(@as(usize, 0), tc.pendingCancelCount());
@@ -330,4 +329,34 @@ test "TestSurface snapshot captures child clipping" {
     _ = child.borrowTextAt(0, 0, "abcd", .{});
 
     try ts.expectSnapshot(" abc \n     ");
+}
+
+test "task reset and explicit discard share ownership and preserve identity" {
+    const Capture = struct {
+        cleanups: *usize,
+        fn run(_: *@This(), _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!u8 {
+            unreachable;
+        }
+        fn failed(_: *@This(), _: ctx_mod.TaskStartError, _: std.mem.Allocator) u8 {
+            unreachable;
+        }
+        fn cleanup(self: *@This(), alloc: std.mem.Allocator) void {
+            self.cleanups.* += 1;
+            alloc.destroy(self);
+        }
+    };
+    var tc: TestCtx(u8) = .{};
+    var count: usize = 0;
+    var previous: u64 = 0;
+    for (0..2) |i| {
+        const capture = try std.testing.allocator.create(Capture);
+        capture.* = .{ .cleanups = &count };
+        const id = try tc.ctx.task().spawnOwned(capture, .{ .run = Capture.run, .failed = Capture.failed, .cleanup = Capture.cleanup });
+        try std.testing.expect(@intFromEnum(id) > previous);
+        previous = @intFromEnum(id);
+        if (i == 0) tc.resetTransient() else discardPendingTasks(u8, &tc.ctx);
+        try std.testing.expectEqual(i + 1, count);
+    }
+    tc.resetTransient();
+    try std.testing.expectEqual(@as(usize, 2), count);
 }

@@ -51,7 +51,7 @@ decision in the same change.
 The runnable [`owned_task_result`](../examples/owned_task_result/main.zig)
 example shows both sides of the transfer: `update` adopts a delivered buffer,
 while `deinitUndelivered` releases the same variant if shutdown prevents
-delivery. It also keeps `TaskFailure` exhaustive.
+delivery. The task propagates cancellation without constructing a failure Msg.
 
 ## Ownership states
 
@@ -75,18 +75,15 @@ Normal event dispatch stops after the app requests quit, but producers may
 still be active. The terminal runner therefore performs an ownership barrier
 before `App.deinit`:
 
-1. Raise the runtime shutdown flag so worker and timer helpers stop posting.
-2. Cancel the already-started tty reader future in place, without allocating a
-   shutdown helper. Cancellation interrupts both tty reads and bounded-queue
-   condition waits; then drain events left in the queue.
+1. Raise the shutdown flag, prevent new starts, notify every started task of
+   cancellation before the first join, and discard pending task contexts.
+2. Cancel the existing tty reader without allocating a helper and drain events.
 3. Cancel frame and timer futures.
-4. Await every started one-shot task future. Deinitialize every
-   `.undelivered(Msg)` outcome.
-5. Drain messages already transferred to the event queue.
-6. Deinitialize runtime-thread completions that were not applied.
-7. Consume queued-but-unstarted task contexts through their required failure
-   callbacks, then deinitialize the returned messages.
-8. Run `App.deinit`, followed by terminal and image-registry cleanup.
+4. Await task supervisors, each the sole owner of its worker Future; deinitialize
+   undelivered results on runtime, after worker-side context cleanup completes.
+5. Drain already-posted messages and unapplied runtime-thread completions.
+6. Clean remaining foreground/clipboard effects and run `App.deinit`, followed
+   by terminal and image-registry cleanup.
 
 OSC 52 clipboard responses are a separate terminal-internal ownership case.
 Chasen exposes clipboard writes, not clipboard-read requests, and deliberately
@@ -106,25 +103,68 @@ metadata under the request id and consume it on matching completion; unknown or
 superseded ids can therefore be discarded without reconstructing origin in a
 static callback.
 
-Started tasks are awaited rather than force-cancelled because the task API
-returns an application message, not a cancellation-aware result. A task that
-never returns can therefore block shutdown. Keep task bodies finite and use
-request ids or generations to reject stale results during normal operation.
+## Task context and cancellation
 
-## Task failure callbacks
+`spawn` needs only run/failed callbacks; `spawnOwned(context, options)` adds a
+typed context and one cleanup callback. Both return a `TaskId`, scoped to one
+Ctx/run and never reused there. Ignore it when individual cancellation is not
+needed. `requestCancel(id)` may only be called from init/update on the owning
+runtime thread. It marks pending work or notifies the live task, without join
+or allocation; repeated requests and completed/absent IDs are harmless.
 
-`chasen.TaskFailure` has two cases:
+| Terminal | Context owner/action | Message |
+| --- | --- | --- |
+| Admission error (limit or ID exhaustion) | Caller retains context; no callback | None |
+| Accepted but not started: cancel, quit, unwind, test discard | Runtime/test caller invokes cleanup once | None; no failed callback |
+| Tracking/supervisor/worker admission failure | Runtime invokes failed, then cleanup once | Existing runtime completion buffer or undelivered cleanup |
+| Started run returns Msg or Canceled | Worker invokes cleanup once after run | Msg moves to queue/outcome; Canceled makes no Msg |
+| Undelivered result | Context already consumed | Runtime invokes root Msg destructor once |
 
-- `.start_failed: []const u8`: the runtime could not allocate tracking storage
-  or start the worker. The callback result is normally delivered to `update`
-  through the runtime-thread completion buffer.
-- `.runtime_abandoned`: runtime error unwind found a queued task before it was
-  transferred to a future. The callback exists to consume `spawnWith` context;
-  its returned `Msg` is immediately handled as undelivered and never reaches
-  `update`.
+Owned signatures are `run(*T, Allocator, Io) Io.Cancelable!Msg`,
+`failed(*T, TaskStartError, Allocator) Msg`, and `cleanup(*T, Allocator) void`.
+Plain signatures omit *T (and failed omits Allocator). `TaskStartError` is
+`error{OutOfMemory, ConcurrencyUnavailable}`. Data/work errors belong in Msg;
+propagate `error.Canceled` from cooperative Io operations without failure Msg.
 
-Failure callbacks should be exhaustive even when their user-facing text is
-only observable for `.start_failed`.
+Do not free context in run/failed. Move owned fields into a result and clear
+the source before the shared cleanup sees it. Borrowed fields remain the
+application's lifetime responsibility; a typed pointer is not a lifetime proof.
+Cleanup must not enqueue effects or wait for work; normal run cleanup remains
+on the worker, failed/pending cleanup on runtime. Msg cleanup stays on runtime.
+
+Cancellation does not revoke a produced/queued Msg, force arbitrary code to
+stop, undo effects, guarantee an exit deadline, or determine staleness. Keep
+application generations/identity checks. Cancellation during full-queue result
+transfer returns the owned Msg for runtime destruction. Non-cooperative tasks
+can still delay shutdown.
+
+A supervisor waits for publication of its optional worker Future, then for
+completion or a cancellation request, and alone awaits/cancels that Future.
+Runtime reaps only completed supervisors during ordinary effect drain; a last
+completion may wait for the next event or shutdown. Each started task costs two
+Io concurrency units. Threaded retains its peak thread pool until backend deinit;
+reclaimed task nodes do not imply reclaimed threads. This cost applies to plain
+tasks too, without requiring extra caller bookkeeping.
+
+## Tests and migration
+
+Use `chasen.testing.discardPendingTasks(Msg, &ctx)` or `TestCtx.resetTransient()`
+to abandon pending tasks with the same production cleanup. Neither runs a task
+nor makes a synthetic Msg; resetting preserves the next task identity.
+Low-level tests taking `ctx.takePendingTasks()` consume every returned entry
+exactly once through `run(Allocator, Io)`, `failed(TaskStartError, Allocator)`
+(for an uncanceled unstarted entry), or `discard(Allocator)`.
+The raw typed context/callback representation and its decoder are private.
+Internal byte storage is not a supported accessor: modifying/reinterpreting it,
+forging entries, or copying and consuming an entry twice is outside the contract.
+This boundary does not provide linear ownership or make bytes inaccessible.
+
+Replace the old untyped context submission with spawnOwned and typed callbacks;
+move repeated run/failed destruction into cleanup. Preserve admission-error
+cleanup in the caller. Replace old task failure unions with TaskStartError and
+remove abandonment-only message branches. Do not remove unrelated foreground
+command terminals with similar names. The replaced task API is removed without
+a compatibility period. See README for a complete admission-error example.
 
 ## Runtime-thread callbacks
 
