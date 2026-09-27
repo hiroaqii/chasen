@@ -166,6 +166,44 @@ remove abandonment-only message branches. Do not remove unrelated foreground
 command terminals with similar names. The replaced task API is removed without
 a compatibility period. See README for a complete admission-error example.
 
+### Runnable owned search
+
+The [task_cancellation example](../examples/task_cancellation/main.zig) combines a
+typed owned query, a cancellable standard-Io wait, a result that takes the query
+buffer, and generation checks for late messages. Run `zig build run-task_cancellation`.
+
+- Space creates a search; after three seconds its result appears and cleanup has
+  consumed the context. The displayed result buffer remains application-owned.
+- Space again while waiting requests cancellation and starts a new generation.
+  Press p immediately: the independent counter responds without joining either
+  task. Only the latest generation can replace the displayed result.
+- x closes the search and invalidates its generation. Press p to refresh the
+  cleanup count; cancellation itself does not promise an immediate completion
+  event or redraw.
+- q during the wait returns through Chasen's shutdown barrier. The final terminal
+  line reports created/cleaned context counts; they must match. Repeat after a
+  normal completion to check application-owned result cleanup.
+
+The example's shared cleanup counter is atomic because normal context cleanup
+runs on a worker. Production apps need no such counter to use cancellation.
+No network, Git operation, external file or application setting is needed.
+
+### Migration checklist
+
+| Old task usage | Replacement |
+| --- | --- |
+| `try spawn(...)` returning void | `const id = try spawn(...)`, or `_ = try` if unused |
+| `spawnWith` and callback casts | `spawnOwned(context, options)` with typed `*T` callbacks |
+| Run/failed each destroy context | One cleanup callback; clear fields moved into Msg |
+| `TaskFailure.start_failed` | `TaskStartError` in failed; task work errors stay in Msg |
+| Abandonment makes a throwaway failure Msg | Pending discard invokes cleanup only |
+| Manual pending cleanup in tests | `discardPendingTasks` or `TestCtx.resetTransient` |
+
+A caller cleans up only if admission fails. After successful admission, neither
+later update errors nor cancel requests give that ownership back to the caller.
+The low-level consuming bridge is for runtime/tests; ordinary applications only
+need spawn/spawnOwned and, when useful, the returned TaskId.
+
 ## Runtime-thread callbacks
 
 Task start failures and terminal image load callbacks are produced on the

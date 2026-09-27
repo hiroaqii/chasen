@@ -335,6 +335,15 @@ deinit. Reaping task records does not shrink that pool. See
 [Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md) for terminal and
 testing contracts.
 
+Try the [task cancellation example](examples/task_cancellation/main.zig) with
+`zig build run-task_cancellation`. Space starts or replaces a three-second search,
+x closes it, p increments a separate counter and refreshes cleanup observations,
+and q quits, including while a search is waiting. Search results carry a generation
+so a late result cannot reopen a closed or replaced search. Context creation and
+cleanup counts are visible, and the process prints matching final counts after
+shutdown. Cancel requests count explicit replace/close actions; shutdown also
+requests cancellation internally.
+
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
 waits for the interval again. Timer intervals do not compensate for app
@@ -532,6 +541,7 @@ zig build run-selection      # selectable menu with Event -> Msg -> update
 zig build run-stopwatch      # repeating timer with ctx.timer().every
 zig build run-tick           # one-shot timer and timer cancellation
 zig build run-owned_task_result # allocator-owned task result cleanup
+zig build run-task_cancellation # owned search, replace/close, responsive cancel and quit
 zig build run-animation      # frame request loop
 zig build run-surface_layout # Rect-based regions and child surfaces
 zig build run-runtime_stats  # runtime timing stats callback

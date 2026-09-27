@@ -443,7 +443,7 @@ Effect drain currently processes pending work in this order:
 1. runtime-thread callback completions
 2. foreground commands
 3. terminal clipboard copies
-4. `ctx.task().spawn` / `ctx.task().spawnWith`
+4. `ctx.task().spawn` / `ctx.task().spawnOwned`
 5. `ctx.timer().cancel`
 6. `ctx.timer().tick`
 7. `ctx.timer().every`

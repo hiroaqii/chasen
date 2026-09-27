@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         "tick",
         "http",
         "owned_task_result",
+        "task_cancellation",
         "animation",
         "runtime_stats",
         "runtime_trace",
@@ -93,9 +94,9 @@ pub fn build(b: *std.Build) void {
         check_example_step.dependOn(&example_exe.step);
         check_examples_step.dependOn(&example_exe.step);
 
-        if (std.mem.eql(u8, name, "foreground_command")) {
+        if (std.mem.eql(u8, name, "foreground_command") or std.mem.eql(u8, name, "task_cancellation")) {
             const install_demo = b.addInstallArtifact(example_exe, .{});
-            b.step("install-foreground_command", "Install the foreground demo for isolated manual QA").dependOn(&install_demo.step);
+            b.step(b.fmt("install-{s}", .{name}), b.fmt("Install the {s} demo for isolated manual QA", .{name})).dependOn(&install_demo.step);
         }
         const run_example = b.addRunArtifact(example_exe);
         const run_example_step = b.step(
