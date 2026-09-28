@@ -234,8 +234,12 @@ fn runCase(executable: [:0]const u8, mode: [:0]const u8, enhanced: bool, resize_
     const pid = c.forkpty(&master, null, null, &size);
     if (pid < 0) return error.ForkPtyFailed;
     if (pid == 0) {
-        if (c.chdir(cwd) != 0) c._exit(79);
+        if (c.chdir(cwd) != 0) {
+            marker("\nfixture chdir failed: errno={d}\n", .{std.c._errno().*});
+            c._exit(79);
+        }
         _ = std.c.execve(executable.ptr, &argv, environ);
+        marker("\nfixture execve failed: errno={d}\n", .{std.c._errno().*});
         c._exit(80);
     }
     defer _ = c.close(master);
@@ -268,6 +272,14 @@ fn runCase(executable: [:0]const u8, mode: [:0]const u8, enhanced: bool, resize_
         _ = c.poll(&pfd, 1, 50);
         const n = c.read(master, output[len..].ptr, output.len - len);
         if (n > 0) len += @intCast(n);
+        if (n <= 0 and phase != .done) {
+            // Detect early exit without reaping: cleanup still owns the PID.
+            var info: c.siginfo_t = std.mem.zeroes(c.siginfo_t);
+            if (c.waitid(c.P_PID, @intCast(pid), &info, c.WNOHANG | c.WEXITED | c.WNOWAIT) == 0 and info.si_signo != 0) {
+                std.debug.print("foreground PTY exited early {s} phase {s}\n{s}\n", .{ mode, @tagName(phase), output[0..len] });
+                return error.AppExitedEarly;
+            }
+        }
         if (len == output.len) return error.ExcessiveOutput;
         try wire.consume(master, output[0..len], resize_response);
         const recent = output[phase_start..len];
@@ -357,7 +369,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) return error.SubreaperFailed;
-    const executable = try init.arena.allocator().dupeZ(u8, args[0]);
+    // Re-exec happens after chdir, so argv[0] may no longer resolve there.
+    const executable = try std.process.executablePathAlloc(init.io, init.arena.allocator());
     const temporary = init.environ_map.get("TMPDIR") orelse return error.MissingManagedTmpdir;
     const cwd = try std.fmt.allocPrintSentinel(init.arena.allocator(), "{s}/foreground-cwd-XXXXXX", .{temporary}, 0);
     if (c.mkdtemp(cwd) == null) return error.CwdSetupFailed;
