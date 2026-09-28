@@ -22,6 +22,8 @@ jobs:
         run: zig build
 
       - name: Test
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: zig build test
 
       - name: Check Io.Threaded example
