@@ -10,6 +10,8 @@ Chasen intentionally keeps the core small. A component is not a framework-owned
 object and does not need to implement a trait. Prefer plain Zig structs and
 functions that are easy for applications to compose.
 
+Start with the [README](../README.md) for installation and a minimal app.
+
 ## Core Contract
 
 A Chasen application owns semantic state in its model and routes all state
@@ -202,7 +204,9 @@ tests without a runtime `std.Io`.
 `chasen.Surface` is the low-level drawing substrate. Component packages should
 prefer this API over libvaxis types so Chasen can keep a stable boundary.
 
-Important APIs:
+For introductory drawing examples and text lifetimes, see [Surface Drawing](SURFACE.md).
+
+API sketch (handle errors and return values at the call site):
 
 ```zig
 surface.size();
@@ -280,14 +284,14 @@ Use `printAt` for formatted text and `copyText` / `copyTextAt` for dynamic text
 that must be made frame-owned:
 
 ```zig
-try surface.printAt(0, 0, .{}, "count: {d}", .{count});
+_ = try surface.printAt(0, 0, .{}, "count: {d}", .{count});
 
 const title = try surface.copyText(dynamic_title);
 panel.view(surface, .{ .title = title });
 ```
 
-`frameAllocator()` is reset after the current frame. Use it only for temporary
-formatting or layout buffers during `view`. Never store memory from the frame
+`frameAllocator()` is reset before each render and retains capacity. Use it only
+for temporary formatting or layout buffers during `view`. Never store memory from the frame
 allocator in `Model`, `Msg`, or `ComponentStateStore`.
 
 The `surface_basics` example shows these rules in a runnable app:
@@ -393,107 +397,20 @@ keeps requesting frames.
 
 ## Effect Lifecycle
 
-`Ctx` queues effects; it does not execute them immediately. The runtime drains
-pending effects after `init` and after each `update`.
+Queue effects from `init` or `update`, and keep `view` draw-only. Most effects
+are drained after these callbacks return; `requestCancel` is an immediate,
+non-blocking notification on the owning runtime thread.
 
-Startup order:
+The runtime delivers the initial terminal size, when available, before the first
+render. Terminal events go through optional `handleEvent`; effect-produced app
+messages go directly to `update`. `redraw().skip()` is message-scoped, and resize
+always redraws. A frame request asks for one event, so animations must request
+another while active and use elapsed time rather than assume a fixed cadence.
 
-```text
-app.init?(*Ctx)
-runtime drains effects queued during init
-app.view(*Surface)
-render
-```
-
-Terminal event path:
-
-```text
-terminal event
-app.handleEvent(Event) ?Msg
-if handleEvent returns Msg:
-  app.update(Msg, *Ctx)
-  runtime drains effects queued during update
-  app.view(*Surface), unless the app suppressed redraw
-  render
-else:
-  no update and no redraw from that event
-```
-
-Runtime message path:
-
-```text
-spawn/tick/every completes
-runtime receives user Msg
-app.update(Msg, *Ctx)
-runtime drains effects queued during update
-app.view(*Surface), unless the app suppressed redraw
-render
-```
-
-Effect-produced messages bypass `handleEvent`; they are already app `Msg`
-values. Terminal-facing events call `handleEvent`, and `update` only runs when
-`handleEvent` returns a message.
-
-Terminal resize is the exception: after a winsize event, the runtime redraws
-even if `handleEvent` returns `null` or the app suppresses redraw. This keeps
-the screen buffer matched to the new terminal size.
-
-Effect drain currently processes pending work in this order:
-
-1. runtime-thread callback completions
-2. foreground commands
-3. terminal clipboard copies
-4. `ctx.task().spawn` / `ctx.task().spawnOwned`
-5. `ctx.timer().cancel`
-6. `ctx.timer().tick`
-7. `ctx.timer().every`
-8. `ctx.image().unload` / `ctx.image().loadPath`
-9. `ctx.frame().request`
-
-`ctx.timer().tick(id, after_ns, msg)` schedules one future message.
-`ctx.timer().every(id, interval_ns, msg)` schedules repeated messages until
-cancelled. Scheduling a new `tick` or `every` with the same id replaces the
-existing running timer with that id. Timer ids are copied into runtime-owned
-memory while queueing, so callers may pass temporary or dynamically formatted
-ids. Timer message templates themselves must be non-owning/copy-safe: the
-runtime may copy, reuse, replace, or drop them without calling the root Msg
-cleanup hook.
-
-The `tick` example shows a one-shot timer, same-id replacement, and
-`ctx.timer().cancel` in a runnable app:
-
-```sh
-zig build run-tick
-```
-
-`ctx.timer().cancel(id)` removes matching timers queued in the current `Ctx`
-and also queues cancellation for matching timers already running in the runtime.
-It returns an error if the cancel request cannot be queued.
-
-`ctx.timer().every` is a fixed-delay timer, not a fixed-rate scheduler. The
-runtime sleeps for `interval_ns`, posts the message, then sleeps for
-`interval_ns` again. Time spent in the app's `update`, effect drain, `view`, and
-terminal render path is not subtracted from the next interval. Use it for
-periodic polling, refresh prompts, clocks, and low-precision UI updates. For
-animations, compute progress from `ctx.now()`, `Frame.now_ns`, or
-`Frame.delta_ns` instead of counting timer ticks.
-
-`ctx.frame().request()` requests one future `Event.frame`. It is coalesced
-while a frame request is already in flight; it does not create an idle render
-loop by itself. Re-request from `update` while animation should continue, and
-stop requesting when the animation is done.
-
-Frame requests are also fixed-delay in the current terminal runtime. Chasen
-waits for the runtime's frame interval before posting the next frame event, and
-the app receives timing data in `Frame` so animation state can be time-based.
-The frame API is therefore a render driver, not a guarantee that every frame is
-delivered at an exact fixed-rate cadence.
-
-`ctx.redraw().skip()` is message-scoped. The runtime resets that flag
-immediately before each `update`; if the update suppresses redraw, pending
-effects are still drained, but the redraw for that message is skipped. An
-app that decides redraw in several places should compose its own disposition
-and call `skip()` at most once at the end of its update.
+See [Runtime and Effects](RUNTIME.md) for startup, effect timing, timers,
+foreground commands, and terminal options. See
+[Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md) for task cancellation
+and cleanup contracts.
 
 ## Msg Ownership
 

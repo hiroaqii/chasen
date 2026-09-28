@@ -53,6 +53,8 @@ example shows both sides of the transfer: `update` adopts a delivered buffer,
 while `deinitUndelivered` releases the same variant if shutdown prevents
 delivery. The task propagates cancellation without constructing a failure Msg.
 
+Run it from a repository checkout with `zig build run-owned_task_result`.
+
 ## Ownership states
 
 | State | Owner | Next step |
@@ -146,6 +148,27 @@ Io concurrency units. Threaded retains its peak thread pool until backend deinit
 reclaimed task nodes do not imply reclaimed threads. This cost applies to plain
 tasks too, without requiring extra caller bookkeeping.
 
+### Queueing an owned task
+
+Inside `init` or `update`, after creating a typed `task` context and callbacks:
+
+```zig
+// Transfer an owned typed context only after successful admission.
+const task_id = ctx.task().spawnOwned(task, .{
+    .run = Task.run,
+    .failed = Task.failed,
+    .cleanup = Task.destroy,
+}) catch |err| {
+    Task.destroy(task, ctx.allocator()); // admission failed: caller still owns it
+    return err;
+};
+// Notify without waiting for the task to finish.
+ctx.task().requestCancel(task_id);
+```
+
+The caller destroys the context only when admission fails. After successful
+admission, the runtime owns cleanup even if cancellation or shutdown follows.
+
 ## Tests and migration
 
 Use `chasen.testing.discardPendingTasks(Msg, &ctx)` or `TestCtx.resetTransient()`
@@ -164,7 +187,8 @@ move repeated run/failed destruction into cleanup. Preserve admission-error
 cleanup in the caller. Replace old task failure unions with TaskStartError and
 remove abandonment-only message branches. Do not remove unrelated foreground
 command terminals with similar names. The replaced task API is removed without
-a compatibility period. See README for a complete admission-error example.
+a compatibility period. See [Queueing an owned task](#queueing-an-owned-task)
+for admission-error handling.
 
 ### Runnable owned search
 
@@ -239,3 +263,8 @@ When adding a new asynchronously produced message variant:
 5. Do not use an owning variant as a timer template.
 6. Add a test that constructs the owned variant, calls
    `deinitUndelivered`, and passes under `std.testing.allocator`.
+
+## Related Guides
+
+- [Runtime and Effects](RUNTIME.md): event flow, timers, terminal effects, and options.
+- [Development and Testing](DEVELOPMENT.md): local checks and Linux PTY tests.
