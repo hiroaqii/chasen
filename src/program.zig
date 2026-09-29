@@ -20,7 +20,9 @@ const EffectDrainResult = struct {
     needs_render: bool = false,
 };
 
-fn InternalEvent(comptime Msg: type) type {
+// Shared with the OSC 52 regression executable so it uses the runtime's exact
+// event type. This is internal to Chasen and is not re-exported by root.zig.
+pub fn InternalEvent(comptime Msg: type) type {
     return union(enum) {
         key_press: vaxis.Key,
         winsize: vaxis.Winsize,
@@ -2341,50 +2343,6 @@ test "resize poll thread wakes an empty event queue" {
     const latest = resize_poll.takeLatest().?;
     try std.testing.expectEqual(@as(u16, 40), latest.rows);
     try std.testing.expectEqual(@as(u16, 80), latest.cols);
-}
-
-test "libvaxis frees OSC 52 responses without queueing owned paste" {
-    const TestMsg = union(enum) {
-        noop,
-
-        pub const undelivered_policy = .plain;
-    };
-    const Event = InternalEvent(TestMsg);
-
-    var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
-    while (try loop.tryPostEvent(.continue_effect_drain)) {}
-
-    var parser: vaxis.Parser = .{};
-    var cache: vaxis.GraphemeCache = .{};
-    for ([_][]const u8{
-        "\x1b]52;c;Zmlyc3Q=\x1b\\",
-        "\x1b]52;c;c2Vjb25k\x1b\\",
-    }) |input| {
-        const result = try parser.parse(input, std.testing.allocator);
-        try std.testing.expectEqual(input.len, result.n);
-        try std.testing.expect(result.event.? == .paste);
-
-        // InternalEvent has no `.paste` field, so libvaxis frees the decoded
-        // bytes here instead of attempting a blocking post into the full queue.
-        try vaxis.loop.handleEventGeneric(
-            &loop,
-            undefined,
-            &cache,
-            Event,
-            result.event.?,
-            std.testing.allocator,
-        );
-    }
-
-    // Invalid OSC 52 payloads are consumed without an event. libvaxis frees
-    // the temporary decode buffer before returning, so the testing allocator
-    // still verifies that the producer-local allocation does not leak.
-    const invalid_input = "\x1b]52;c;!!!!\x1b\\";
-    const invalid_result = try parser.parse(invalid_input, std.testing.allocator);
-    try std.testing.expectEqual(invalid_input.len, invalid_result.n);
-    try std.testing.expectEqual(@as(?vaxis.Event, null), invalid_result.event);
-
-    drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
 }
 
 test "loop reader stop needs no extra concurrency slot on full queue" {

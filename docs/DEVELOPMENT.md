@@ -26,6 +26,25 @@ browser execution test. The optional `anim_transition` example needs a local
 zig build check-anim_transition -Dchasen-anim-path=../chasen-anim
 ```
 
+## OSC 52 Ownership Check
+
+On Linux and macOS, `zig build test` includes an OSC 52 ownership regression
+check. It can also run independently without a terminal or `TMPDIR`:
+
+```sh
+zig build test-osc52-ownership
+```
+
+The check uses Chasen's actual internal event type and libvaxis's parser and
+event handler. It verifies that valid clipboard responses release their decoded
+buffers even with a full event queue, invalid responses release their temporary
+buffers, and queued events remain unchanged. A debug allocator checks for leaks.
+
+This is a normal executable because the pinned libvaxis test-only Tty lacks
+`resetSignalHandler` on macOS. The executable uses the production type without
+opening a terminal or registering signal handlers. No dependency patch or macOS
+test skip is needed.
+
 ## Linux PTY Integration Tests
 
 On Linux, unfiltered `zig build test` includes both integration tests below:
@@ -61,8 +80,9 @@ zig build test -Dtest-filter=foreground
 ```
 
 A test filter excludes the two PTY gates; run them explicitly when validating
-terminal behavior. Cross-compile without trying to execute Linux binaries on
-macOS:
+terminal behavior. The OSC 52 executable runs when the filter matches
+`libvaxis frees OSC 52 responses without queueing owned paste`.
+Cross-compile without trying to execute Linux binaries on macOS:
 
 ```sh
 zig build check-foreground-tests -Dtarget=x86_64-linux-gnu
@@ -76,6 +96,12 @@ Compilation checks types and linking, but cannot verify signals, terminal
 ownership, cwd behavior, or runtime cleanup. Run the integration gates on Linux
 for those checks.
 
+To compile the OSC 52 check for a macOS target without running it:
+
+```sh
+zig build check-osc52-ownership -Dtarget=aarch64-macos
+```
+
 ## CI Coverage
 
 [CI configuration](../.github/workflows/ci.yml) runs independent jobs on
@@ -87,7 +113,8 @@ so a failure on one OS does not cancel the other job. Both jobs run:
 3. `zig build check-io-threaded --summary all`
 4. `zig build check-examples --summary all`
 
-The Linux job also runs the real PTY integration tests included in `test`.
+Both jobs run the OSC 52 ownership executable as part of `test`. The Linux job
+also runs the real PTY integration tests included in `test`.
 The macOS job runs native unit/consumer tests and the example checks; the
 Linux-only PTY gates remain excluded there. CI does not currently run Windows
 or `check-runtime-wasm`.

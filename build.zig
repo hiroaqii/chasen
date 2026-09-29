@@ -206,6 +206,45 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_mod_tests.step);
     test_step.dependOn(&b.addRunArtifact(task_consumer_tests).step);
 
+    const osc52_step = b.step("test-osc52-ownership", "Check OSC 52 ownership without opening a terminal");
+    const check_osc52_step = b.step("check-osc52-ownership", "Compile the OSC 52 ownership check for native or cross targets");
+    if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
+        // A normal executable uses libvaxis's production Tty. Its macOS
+        // TestTty is missing a method referenced by handleEventGeneric.
+        const osc52_check = b.addExecutable(.{
+            .name = "osc52-ownership",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/osc52_ownership.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                    .{ .name = "chasen_program", .module = b.createModule(.{
+                        .root_source_file = b.path("src/program.zig"),
+                        .target = target,
+                        .optimize = optimize,
+                        .imports = &.{.{ .name = "vaxis", .module = vaxis.module("vaxis") }},
+                    }) },
+                },
+            }),
+            .use_llvm = true,
+            .use_lld = if (target.result.os.tag == .linux) true else null,
+        });
+        const run_osc52_check = b.addRunArtifact(osc52_check);
+        osc52_step.dependOn(&run_osc52_check.step);
+        check_osc52_step.dependOn(&osc52_check.step);
+        // Preserve filtering by the name of the unit test moved to this fixture.
+        const osc52_test_name = "libvaxis frees OSC 52 responses without queueing owned paste";
+        if (test_filter == null or std.mem.indexOf(u8, osc52_test_name, test_filter.?) != null) {
+            test_step.dependOn(&run_osc52_check.step);
+        }
+    } else {
+        const unsupported = b.addFail("OSC 52 ownership check requires Linux or macOS");
+        osc52_step.dependOn(&unsupported.step);
+        check_osc52_step.dependOn(&unsupported.step);
+    }
+
     const terminal_input_step = b.step(
         "test-terminal-input",
         "Run the Linux PTY terminal-input integration test",
