@@ -17,6 +17,7 @@ extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 extern "c" fn posix_spawnattr_setpgroup(*c.posix_spawnattr_t, c.pid_t) c_int;
 extern "c" fn posix_spawnattr_setsigmask(*c.posix_spawnattr_t, *const c.sigset_t) c_int;
 extern "c" fn posix_spawnattr_setsigdefault(*c.posix_spawnattr_t, *const c.sigset_t) c_int;
+extern "c" fn proc_listpids(u32, u32, *anyopaque, c_int) c_int;
 const wait_flags: c_int = if (darwin) 0x04 | 0x08 | 0x20 else 0x04 | 0x02 | 0x01000000;
 const wait_death: c_int = if (darwin) 0x04 | 0x20 else 0x04 | 0x01000000;
 const wait_nohang: c_int = 1;
@@ -118,8 +119,9 @@ pub const Prepared = struct {
             var actions: c.posix_spawn_file_actions_t = undefined;
             try spawnChecked(c.posix_spawn_file_actions_init(&actions));
             self.spawn_actions = actions;
-            try spawnChecked(c.posix_spawnattr_setflags(&attr, .{ .START_SUSPENDED = true, .SETPGROUP = true, .SETSIGMASK = true, .SETSIGDEF = true, .CLOEXEC_DEFAULT = true }));
-            try spawnChecked(posix_spawnattr_setpgroup(&attr, 0));
+            // Native setters may replace the handle; update its cleanup owner directly.
+            try spawnChecked(c.posix_spawnattr_setflags(&self.spawn_attr.?, .{ .START_SUSPENDED = true, .SETPGROUP = true, .SETSIGMASK = true, .SETSIGDEF = true, .CLOEXEC_DEFAULT = true }));
+            try spawnChecked(posix_spawnattr_setpgroup(&self.spawn_attr.?, 0));
             var mask: c.sigset_t = undefined;
             var defaults: c.sigset_t = undefined;
             _ = c.sigemptyset(&defaults);
@@ -128,11 +130,11 @@ pub const Prepared = struct {
                 _ = c.sigdelset(&mask, sig);
                 _ = c.sigaddset(&defaults, sig);
             }
-            try spawnChecked(posix_spawnattr_setsigmask(&attr, &mask));
-            try spawnChecked(posix_spawnattr_setsigdefault(&attr, &defaults));
-            for (0..3) |dest| try spawnChecked(c.posix_spawn_file_actions_adddup2(&actions, self.stdio, @intCast(dest)));
-            if (self.cwd_path) |path| try spawnChecked(c.posix_spawn_file_actions_addchdir_np(&actions, path.ptr));
-            if (self.cwd_fd) |cwd| try spawnChecked(c.posix_spawn_file_actions_addfchdir_np(&actions, cwd));
+            try spawnChecked(posix_spawnattr_setsigmask(&self.spawn_attr.?, &mask));
+            try spawnChecked(posix_spawnattr_setsigdefault(&self.spawn_attr.?, &defaults));
+            for (0..3) |dest| try spawnChecked(c.posix_spawn_file_actions_adddup2(&self.spawn_actions.?, self.stdio, @intCast(dest)));
+            if (self.cwd_path) |path| try spawnChecked(c.posix_spawn_file_actions_addchdir_np(&self.spawn_actions.?, path.ptr));
+            if (self.cwd_fd) |cwd| try spawnChecked(c.posix_spawn_file_actions_addfchdir_np(&self.spawn_actions.?, cwd));
         } else {
             self.status = try makeStatusPipe();
         }
@@ -219,13 +221,14 @@ pub const TtouMask = struct {
 };
 
 /// Named faults exist only at this private boundary; callers cannot configure them.
-const Fault = enum { none, spawn, handoff, cooked, admission_continue, wait, wait_interrupted, authority_lost, cleanup, death_wait, group_kill, reap, restore, parent_mask };
+const Fault = enum { none, spawn, handoff, cooked, admission_continue, wait, wait_interrupted, authority_lost, cleanup, death_wait, group_kill, group_query, reap, restore, parent_mask };
 const Probe = struct {
     fault: Fault = .none,
     signals: usize = 0,
     direct_kills: usize = 0,
     deaths: usize = 0,
     reaps: usize = 0,
+    group_queries: usize = 0,
     inject_preexec_signals: bool = false,
     input_at_barriers: ?c_int = null,
     stop_before_group: bool = false,
@@ -439,7 +442,13 @@ const Child = struct {
             c._errno().* = @intFromEnum(c.E.PERM);
             break :blk @as(c_int, -1);
         } else c.kill(-self.pid, .KILL);
-        const group_ok = killed == 0 or errno() == .SRCH;
+        const kill_error: ?c.E = if (killed == 0) null else errno();
+        var group_ok = kill_error == null or kill_error == .SRCH;
+        if (darwin and kill_error == .PERM and self.probe.fault != .group_kill) {
+            // Darwin skips zombies in group kill and may report EPERM for an
+            // empty live group. The unreaped child still pins this identity.
+            group_ok = self.onlyOwnedZombie();
+        }
         var status: c_int = 0;
         if (self.probe.fault == .reap) {
             // Model a competing reap at this exact boundary; the real reap
@@ -454,6 +463,15 @@ const Child = struct {
         self.identity = .reaped;
         self.probe.reaps += 1;
         return group_ok and self.probe.fault != .cleanup;
+    }
+    fn onlyOwnedZombie(self: *Child) bool {
+        if (!self.dead or self.identity == .lost or self.identity == .reaped) return false;
+        self.probe.group_queries += 1;
+        var pids: [2]c.pid_t = undefined;
+        // PROC_PGRP_ONLY includes live and zombie members. A full buffer is
+        // insufficient proof, even if its first entry is our owned child.
+        const bytes = if (self.probe.fault == .group_query) 0 else proc_listpids(2, @intCast(self.pid), &pids, @sizeOf(@TypeOf(pids)));
+        return bytes == @sizeOf(c.pid_t) and pids[0] == self.pid;
     }
     fn finishFailure(self: *Child, outcome: Outcome) Outcome {
         return if (self.cleanup()) outcome else failure(.cleanup, "ChildCleanupFailed");
@@ -547,7 +565,7 @@ test "foreground prepared child closes input and returns exec failure" {
 
 test "foreground real wait fault cleans exactly once while ECHILD never signals" {
     if (!supported) return error.SkipZigTest;
-    var prepared = try Prepared.init(std.testing.allocator, &.{"/bin/true"}, .inherit, null);
+    var prepared = try Prepared.init(std.testing.allocator, &.{ "/bin/sh", "-c", "exit 0" }, .inherit, null);
     defer prepared.deinit();
     const file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .read_write });
     defer file.close(std.testing.io);
@@ -875,4 +893,195 @@ test "foreground cleanup faults stop signaling and still reap a proven dead chil
         // Only the test owns the deliberately unconsumed death-wait status.
         if (fault == .death_wait) try std.testing.expectEqual(pid, c.waitpid(pid, null, 0));
     }
+}
+
+// Run these tests under GuardMalloc with CHASEN_TEST_REQUIRE_NATIVE_REWRITE=1
+// to require an observed native relocation as well as correct Prepared cleanup.
+test "foreground macOS ownership native rewrite witness" {
+    if (!darwin or c.getenv("CHASEN_TEST_REQUIRE_NATIVE_REWRITE") == null) return error.SkipZigTest;
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    var rewrites: usize = 0;
+    for (0..8) |_| {
+        var actions: c.posix_spawn_file_actions_t = undefined;
+        try spawnChecked(c.posix_spawn_file_actions_init(&actions));
+        defer _ = c.posix_spawn_file_actions_destroy(&actions);
+        var previous = @intFromPtr(actions);
+        for (0..3) |dest| {
+            try spawnChecked(c.posix_spawn_file_actions_adddup2(&actions, file.handle, @intCast(dest)));
+            if (@intFromPtr(actions) != previous) rewrites += 1;
+            previous = @intFromPtr(actions);
+        }
+        try spawnChecked(c.posix_spawn_file_actions_addchdir_np(&actions, "/"));
+        if (@intFromPtr(actions) != previous) rewrites += 1;
+    }
+    std.debug.print("native handle rewrites: {d}\n", .{rewrites});
+    try std.testing.expect(rewrites > 0);
+}
+
+fn testNativeReleased(prepared: *Prepared, caller_fd: c_int, owned_fd: c_int) !void {
+    try std.testing.expectEqual(@as(c_int, -1), prepared.stdio);
+    try std.testing.expect(prepared.spawn_actions == null);
+    try std.testing.expect(prepared.spawn_attr == null);
+    try std.testing.expect(prepared.status == null);
+    try std.testing.expectEqual(@as(c_int, -1), c.fcntl(owned_fd, c.F.GETFD));
+    try std.testing.expectEqual(c.E.BADF, errno());
+    try std.testing.expect(c.fcntl(caller_fd, c.F.GETFD) >= 0);
+    prepared.releaseLaunch();
+    try std.testing.expect(c.fcntl(caller_fd, c.F.GETFD) >= 0);
+}
+
+test "foreground macOS ownership runs three stdio actions and both cwd forms repeatedly" {
+    if (!darwin) return error.SkipZigTest;
+    const root = try std.Io.Dir.openDirAbsolute(std.testing.io, "/", .{});
+    defer root.close(std.testing.io);
+    for ([_]types.ForegroundCommandCwd{ .{ .path = "/" }, .{ .dir = root } }) |cwd| {
+        var pair: [2]c_int = undefined;
+        try checked(c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &pair));
+        defer close(pair[0]);
+        defer close(pair[1]);
+        var prepared = try Prepared.init(std.testing.allocator, &.{
+            "/bin/sh",                                                                                                   "-c",
+            "read value && [ \"$value\" = input ] && [ \"$(/bin/pwd -P)\" = / ] || exit 42; printf out; printf err >&2",
+        }, cwd, null);
+        defer prepared.deinit();
+        for (0..8) |_| {
+            try std.testing.expectEqual(@as(isize, 6), c.write(pair[0], "input\n", 6));
+            try prepared.prepareLaunch(pair[1]);
+            const owned_fd = prepared.stdio;
+            try std.testing.expect(prepared.spawn_actions != null and prepared.spawn_attr != null);
+            var probe: Probe = .{};
+            const result = runWithProbe(&prepared, pair[1], null, null, &probe);
+            if (result == .failed) std.debug.print("native launch failed: {t} / {s}\n", .{ result.failed.stage, result.failed.error_name });
+            try std.testing.expect(result == .exited);
+            try std.testing.expectEqual(@as(u8, 0), result.exited);
+            try testNativeReleased(&prepared, pair[1], owned_fd);
+            var output: [6]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < output.len) {
+                const n = c.recv(pair[0], output[offset..].ptr, output.len - offset, c.MSG.DONTWAIT);
+                try std.testing.expect(n > 0);
+                offset += @intCast(n);
+            }
+            try std.testing.expectEqualStrings("outerr", &output);
+            try std.testing.expect(c.fcntl(root.handle, c.F.GETFD) >= 0);
+        }
+    }
+}
+
+test "foreground macOS ownership releases real spawn failures" {
+    if (!darwin) return error.SkipZigTest;
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    var prepared = try Prepared.init(std.testing.allocator, &.{"/dev/null/chasen-missing-executable"}, .{ .path = "/" }, null);
+    defer prepared.deinit();
+    for (0..8) |_| {
+        try prepared.prepareLaunch(file.handle);
+        const owned_fd = prepared.stdio;
+        var probe: Probe = .{};
+        const result = runWithProbe(&prepared, file.handle, null, null, &probe);
+        try std.testing.expectEqual(Stage.spawn, result.failed.stage);
+        try std.testing.expectEqualStrings("NOENT", result.failed.error_name);
+        try testNativeReleased(&prepared, file.handle, owned_fd);
+    }
+}
+
+test "foreground macOS ownership releases partial preparation and retries" {
+    if (!darwin) return error.SkipZigTest;
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    const root = try std.Io.Dir.openDirAbsolute(std.testing.io, "/", .{});
+    defer root.close(std.testing.io);
+    var prepared = try Prepared.init(std.testing.allocator, &.{"/usr/bin/true"}, .{ .dir = root }, null);
+    defer prepared.deinit();
+    for (0..8) |_| {
+        // No intervening descriptor allocation: prepareLaunch takes this lowest free fd.
+        const failed_fd = try duplicateStdio(file.handle);
+        close(failed_fd);
+        prepared.cwd_fd = -1; // Real addfchdir failure, after the three adddup2 calls.
+        try std.testing.expectError(error.NativeSpawnPreparationFailed, prepared.prepareLaunch(file.handle));
+        try testNativeReleased(&prepared, file.handle, failed_fd);
+        prepared.cwd_fd = root.handle;
+        try prepared.prepareLaunch(file.handle);
+        const owned_fd = prepared.stdio;
+        var probe: Probe = .{};
+        const result = runWithProbe(&prepared, file.handle, null, null, &probe);
+        if (result == .failed) std.debug.print("native retry failed: {t} / {s}\n", .{ result.failed.stage, result.failed.error_name });
+        try std.testing.expect(result == .exited);
+        try std.testing.expectEqual(@as(u8, 0), result.exited);
+        try testNativeReleased(&prepared, file.handle, owned_fd);
+        try std.testing.expect(c.fcntl(root.handle, c.F.GETFD) >= 0);
+    }
+}
+
+fn testStoppedGroupMember(group: c.pid_t) !c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        if (c.setpgid(0, group) != 0) c._exit(90);
+        _ = c.raise(.STOP);
+        c._exit(0);
+    }
+    var status: c_int = 0;
+    if (c.waitpid(pid, &status, c.W.UNTRACED) != pid) return error.ChildWaitFailed;
+    if (status & 0xff != 0x7f) return error.ChildDidNotStop;
+    return pid;
+}
+
+test "foreground macOS group cleanup accepts only its unreaped dead child" {
+    if (!darwin) return error.SkipZigTest;
+    for ([_]Fault{ .none, .group_query, .group_kill }) |fault| {
+        const pid = try testStoppedGroupMember(0);
+        var probe: Probe = .{ .fault = fault };
+        var owner: Child = .{ .pid = pid, .probe = &probe };
+        defer if (owner.identity == .owned or owner.identity == .observed) {
+            _ = owner.cleanup();
+        };
+        try checked(c.kill(pid, .KILL));
+        var info: c.siginfo_t = std.mem.zeroes(c.siginfo_t);
+        try std.testing.expect(observe(pid, &info, wait_death, false) == null);
+        try std.testing.expect(info.code >= 1 and info.code <= 3);
+        owner.dead = true;
+        owner.identity = .observed;
+        try std.testing.expectEqual(fault == .none, owner.cleanup());
+        try std.testing.expectEqual(@as(usize, 1), probe.signals);
+        try std.testing.expectEqual(@as(usize, 1), probe.reaps);
+        try std.testing.expectEqual(@as(usize, if (fault == .group_kill) 0 else 1), probe.group_queries);
+        const counts = probe;
+        try std.testing.expect(!owner.cleanup());
+        try std.testing.expect(!owner.onlyOwnedZombie());
+        try std.testing.expectEqual(counts.signals, probe.signals);
+        try std.testing.expectEqual(counts.reaps, probe.reaps);
+        try std.testing.expectEqual(counts.group_queries, probe.group_queries);
+    }
+}
+
+test "foreground macOS group cleanup rejects an additional live member and still kills the group" {
+    if (!darwin) return error.SkipZigTest;
+    const leader = try testStoppedGroupMember(0);
+    var probe: Probe = .{};
+    var owner: Child = .{ .pid = leader, .probe = &probe };
+    defer if (owner.identity == .owned or owner.identity == .observed) {
+        _ = owner.cleanup();
+    };
+    const member = try testStoppedGroupMember(leader);
+    var member_reaped = false;
+    defer if (!member_reaped) {
+        _ = c.kill(member, .KILL);
+        _ = c.waitpid(member, null, 0);
+    };
+    try checked(c.kill(leader, .KILL));
+    var info: c.siginfo_t = std.mem.zeroes(c.siginfo_t);
+    try std.testing.expect(observe(leader, &info, wait_death, false) == null);
+    owner.dead = true;
+    owner.identity = .observed;
+    try std.testing.expect(!owner.onlyOwnedZombie());
+    try std.testing.expect(owner.cleanup());
+    try std.testing.expectEqual(@as(usize, 1), probe.reaps);
+    try std.testing.expectEqual(@as(usize, 1), probe.group_queries);
+    var status: c_int = 0;
+    const waited = c.waitpid(member, &status, 0);
+    member_reaped = waited == member or (waited < 0 and errno() == .CHILD);
+    try std.testing.expectEqual(member, waited);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(c.SIG.KILL)), status);
 }
