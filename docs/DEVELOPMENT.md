@@ -78,16 +78,19 @@ for those checks.
 
 ## CI Coverage
 
-[CI configuration](../.github/workflows/ci.yml) currently runs on `ubuntu-latest`
-with Zig 0.16.0:
+[CI configuration](../.github/workflows/ci.yml) runs independent jobs on
+`ubuntu-24.04` and `macos-26` with Zig 0.16.0. The matrix uses `fail-fast: false`,
+so a failure on one OS does not cancel the other job. Both jobs run:
 
-1. `zig build`
-2. `zig build test`, with `TMPDIR` set to `${{ runner.temp }}`
-3. `zig build check-io-threaded`
-4. `zig build check-examples`
+1. `zig build --summary all`
+2. `zig build test --summary all`, with `TMPDIR` set to `${{ runner.temp }}`
+3. `zig build check-io-threaded --summary all`
+4. `zig build check-examples --summary all`
 
-CI does not currently run a macOS/Windows matrix or `check-runtime-wasm`.
-A passing native macOS test run is therefore not equivalent to this Linux gate.
+The Linux job also runs the real PTY integration tests included in `test`.
+The macOS job runs native unit/consumer tests and the example checks; the
+Linux-only PTY gates remain excluded there. CI does not currently run Windows
+or `check-runtime-wasm`.
 
 For unit tests that queue tasks without running the terminal, use
 `chasen.testing.discardPendingTasks` or `TestCtx.resetTransient` to clean up owned
