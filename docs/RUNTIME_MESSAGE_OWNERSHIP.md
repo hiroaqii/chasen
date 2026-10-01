@@ -171,16 +171,55 @@ admission, the runtime owns cleanup even if cancellation or shutdown follows.
 
 ## Tests and migration
 
-Use `chasen.testing.discardPendingTasks(Msg, &ctx)` or `TestCtx.resetTransient()`
-to abandon pending tasks with the same production cleanup. Neither runs a task
-nor makes a synthetic Msg; resetting preserves the next task identity.
-Low-level tests taking `ctx.takePendingTasks()` consume every returned entry
-exactly once through `run(Allocator, Io)`, `failed(TaskStartError, Allocator)`
-(for an uncanceled unstarted entry), or `discard(Allocator)`.
-The raw typed context/callback representation and its decoder are private.
-Internal byte storage is not a supported accessor: modifying/reinterpreting it,
-forging entries, or copying and consuming an entry twice is outside the contract.
-This boundary does not provide linear ownership or make bytes inaccessible.
+Initialize `TestCtx` in its final storage with an allocator and a valid Io:
+
+```zig
+var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+tc.init(std.testing.allocator, std.testing.io);
+defer tc.deinit();
+try app.update(msg, &tc.ctx);
+```
+
+Do not move the fixture after initialization: its `Ctx` borrows its production
+`Requests` owner. Empty literals and private-field injection are no longer
+supported. Custom Io and failing allocators are supplied through the same init.
+
+`tickAt`, `everyAt`, `cancelAt`, `foregroundAt`, and `clipboardAt` return optional
+read-only observations. Their IDs, text, argv, cwd, and environment are borrowed
+until the next owner mutation/reset/deinit; do not free or close them. Views give
+no callback or cleanup authority.
+
+`takeTask(index)` removes one task, preserves the order of the rest, and returns
+an optional test-owned handle. Keep one owner and `defer task.deinit()` immediately.
+`task.run()` or `task.fail(error.OutOfMemory)` consumes it before invoking user
+code; a second consumption returns `AlreadyConsumed`. Canceled tasks return
+`Canceled` and clean their context without a failed callback. `deinit` discards
+only an unconsumed context and is otherwise a no-op. Detached handles survive
+fixture reset and use the allocator/Io captured when taken.
+
+`completeForeground(index, outcome)` and `completeClipboard(index, outcome)`
+remove the request before making its callback Msg and freeing request resources.
+They simulate no terminal execution. A Msg returned by run/fail/complete belongs
+to the test: pass it to `App.update` or use `tc.discardMessage(&msg)` with the root
+Msg's undelivered policy. Do not discard it again after transfer to update.
+
+`tc.discardPendingTasks()` and `tc.discardPendingEffects()` clean only their
+respective task/non-task groups through production ownership code, without
+synthetic callback messages. `resetTransient()` cleans both groups and clears
+frame/redraw requests, preserving quit and ID sequences. `deinit()` destroys
+the owner. Neither owns detached task handles. `fillTaskSlots(count)` submits
+real discard-only tasks for admission-limit tests; accepted prefixes remain
+owned if the call returns a limit error. Do not run/fail these saturation tasks.
+
+Runtime consumers detach each request kind into an independent fixed-capacity
+batch. `next()` transfers one entry to its consumer; batch cleanup handles only
+the unconsumed suffix. New pending requests remain separately owned. Timer
+message templates remain copy-safe and are not disposed as undelivered Msgs.
+Resource-only cleanup does not invoke app callbacks; runtime foreground
+abandonment separately produces and disposes its required result. The Ctx
+entry/take/cleanup bridge has been removed. Arbitrary byte copies cannot enforce
+linear ownership: forging entries or consuming copied handles twice remains
+outside the contract.
 
 Replace the old untyped context submission with spawnOwned and typed callbacks;
 move repeated run/failed destruction into cleanup. Preserve admission-error
@@ -221,12 +260,14 @@ No network, Git operation, external file or application setting is needed.
 | Run/failed each destroy context | One cleanup callback; clear fields moved into Msg |
 | `TaskFailure.start_failed` | `TaskStartError` in failed; task work errors stay in Msg |
 | Abandonment makes a throwaway failure Msg | Pending discard invokes cleanup only |
-| Manual pending cleanup in tests | `discardPendingTasks` or `TestCtx.resetTransient` |
+| Manual pending cleanup in tests | `tc.discardPendingTasks()` or `tc.resetTransient()` |
+| Empty `Ctx`/`TestCtx` literals and raw pending arrays | In-place `tc.init(allocator, io)` and observation methods |
+| Raw task entry/take access | `tc.takeTask(index)` and one consuming `TestTask` handle |
 
 A caller cleans up only if admission fails. After successful admission, neither
 later update errors nor cancel requests give that ownership back to the caller.
-The low-level consuming bridge is for runtime/tests; ordinary applications only
-need spawn/spawnOwned and, when useful, the returned TaskId.
+Ordinary applications only need spawn/spawnOwned and, when useful, the returned
+TaskId. Runtime ownership entry points live on Requests, not the app facade.
 
 ## Runtime-thread callbacks
 

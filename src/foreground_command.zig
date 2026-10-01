@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Working directory requested for a foreground command.
 ///
@@ -98,4 +99,223 @@ pub const ForegroundCommandOutcome = union(enum) {
 pub const ForegroundCommandResult = struct {
     request_id: ForegroundCommandRequestId,
     outcome: ForegroundCommandOutcome,
+};
+
+// Internal acquisition seams shared with request admission tests.
+pub const foreground_command_duplicate_min_fd: c_int = 3;
+
+pub const DuplicateForegroundCommandDirResult = union(enum) {
+    success: std.Io.Dir,
+    interrupted,
+    invalid,
+    process_fd_quota,
+    system_fd_quota,
+    failed,
+};
+
+pub const NativeForegroundCommandCwdOps = struct {
+    pub fn duplicate(
+        _: @This(),
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        return switch (builtin.os.tag) {
+            .linux => duplicateLinux(dir, minimum_fd),
+            .macos => duplicateMacos(dir, minimum_fd),
+            else => unreachable,
+        };
+    }
+
+    fn duplicateLinux(
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        const rc = std.os.linux.fcntl(
+            dir.handle,
+            std.os.linux.F.DUPFD_CLOEXEC,
+            @intCast(minimum_fd),
+        );
+        return switch (std.os.linux.errno(rc)) {
+            .SUCCESS => .{ .success = .{ .handle = @intCast(rc) } },
+            .INTR => .interrupted,
+            .BADF => .invalid,
+            .MFILE => .process_fd_quota,
+            .NFILE => .system_fd_quota,
+            else => .failed,
+        };
+    }
+
+    fn duplicateMacos(
+        dir: std.Io.Dir,
+        minimum_fd: c_int,
+    ) DuplicateForegroundCommandDirResult {
+        const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, minimum_fd);
+        return switch (std.c.errno(rc)) {
+            .SUCCESS => .{ .success = .{ .handle = rc } },
+            .INTR => .interrupted,
+            .BADF => .invalid,
+            .MFILE => .process_fd_quota,
+            .NFILE => .system_fd_quota,
+            else => .failed,
+        };
+    }
+};
+
+pub fn targetSupportsForegroundCommandDir(comptime os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .linux or os_tag == .macos;
+}
+
+fn validateForegroundCommandCwdTarget(
+    cwd: ForegroundCommandCwd,
+) ForegroundCommandQueueError!void {
+    switch (cwd) {
+        .inherit, .path => {},
+        .dir => if (!targetSupportsForegroundCommandDir(builtin.os.tag))
+            return error.ForegroundCommandCwdUnsupported,
+    }
+}
+
+pub fn duplicateForegroundCommandDirWith(
+    dir: std.Io.Dir,
+    ops: anytype,
+) ForegroundCommandQueueError!std.Io.Dir {
+    while (true) switch (ops.duplicate(dir, foreground_command_duplicate_min_fd)) {
+        .success => |duplicate| return duplicate,
+        .interrupted => continue,
+        .invalid => return error.ForegroundCommandInvalidCwd,
+        .process_fd_quota => return error.ForegroundCommandProcessFdQuotaExceeded,
+        .system_fd_quota => return error.ForegroundCommandSystemFdQuotaExceeded,
+        .failed => return error.ForegroundCommandDuplicateCwdFailed,
+    };
+}
+
+fn closeForegroundCommandDir(dir: std.Io.Dir) void {
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.close(dir.handle),
+        .macos => _ = std.c.close(dir.handle),
+        else => unreachable,
+    }
+}
+
+const NativeForegroundCommandCwdCloseOps = struct {
+    pub fn close(_: @This(), dir: std.Io.Dir) void {
+        closeForegroundCommandDir(dir);
+    }
+};
+
+pub const NativeForegroundCommandEnvironmentOps = struct {
+    pub fn clone(
+        _: @This(),
+        map: *const std.process.Environ.Map,
+        gpa: std.mem.Allocator,
+    ) std.mem.Allocator.Error!std.process.Environ.Map {
+        return map.clone(gpa);
+    }
+};
+
+const OwnedForegroundCommandCwd = union(enum) {
+    inherit,
+    path: []const u8,
+    dir: std.Io.Dir,
+
+    fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+        self.deinitWith(gpa, NativeForegroundCommandCwdCloseOps{});
+    }
+
+    fn deinitWith(self: @This(), gpa: std.mem.Allocator, close_ops: anytype) void {
+        switch (self) {
+            .inherit => {},
+            .path => |path| gpa.free(path),
+            .dir => |dir| close_ops.close(dir),
+        }
+    }
+
+    fn childCwd(self: @This()) ForegroundCommandCwd {
+        return switch (self) {
+            .inherit => .inherit,
+            .path => |path| .{ .path = path },
+            .dir => |dir| .{ .dir = dir },
+        };
+    }
+};
+
+const OwnedForegroundCommandEnvironment = union(enum) {
+    inherit,
+    replace: std.process.Environ.Map,
+
+    fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .inherit => {},
+            .replace => |*map| map.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    fn childEnvironment(self: *const @This()) ?*const std.process.Environ.Map {
+        return switch (self.*) {
+            .inherit => null,
+            .replace => |*map| map,
+        };
+    }
+};
+
+/// Owned command inputs. Construct before publishing a pending request and
+/// keep this value alive through child execution and synchronous update.
+pub const OwnedInput = struct {
+    argv: []const []const u8,
+    cwd: OwnedForegroundCommandCwd,
+    environment: OwnedForegroundCommandEnvironment,
+
+    pub fn initWithOps(gpa: std.mem.Allocator, argv: []const []const u8, cwd: ForegroundCommandCwd, environment: ForegroundCommandEnvironment, cwd_ops: anytype, environment_ops: anytype) ForegroundCommandQueueError!OwnedInput {
+        try validateForegroundCommandCwdTarget(cwd);
+
+        const copied_argv = try gpa.alloc([]const u8, argv.len);
+        errdefer gpa.free(copied_argv);
+
+        var copied_count: usize = 0;
+        errdefer {
+            for (copied_argv[0..copied_count]) |arg| {
+                gpa.free(arg);
+            }
+        }
+
+        for (argv, 0..) |arg, i| {
+            copied_argv[i] = try gpa.dupe(u8, arg);
+            copied_count += 1;
+        }
+
+        const owned_cwd: OwnedForegroundCommandCwd = switch (cwd) {
+            .inherit => .inherit,
+            .path => |path| .{ .path = try gpa.dupe(u8, path) },
+            .dir => |dir| .{ .dir = try duplicateForegroundCommandDirWith(dir, cwd_ops) },
+        };
+        errdefer owned_cwd.deinit(gpa);
+
+        var owned_environment: OwnedForegroundCommandEnvironment = switch (environment) {
+            .inherit => .inherit,
+            .replace => |map| .{ .replace = try environment_ops.clone(map, gpa) },
+        };
+        errdefer owned_environment.deinit();
+
+        return .{ .argv = copied_argv, .cwd = owned_cwd, .environment = owned_environment };
+    }
+
+    pub fn deinit(self: *OwnedInput, gpa: std.mem.Allocator) void {
+        self.deinitWith(gpa, NativeForegroundCommandCwdCloseOps{});
+    }
+
+    pub fn deinitWith(self: *OwnedInput, gpa: std.mem.Allocator, close_ops: anytype) void {
+        self.environment.deinit();
+        self.cwd.deinitWith(gpa, close_ops);
+        for (self.argv) |arg| gpa.free(arg);
+        gpa.free(self.argv);
+        self.* = undefined;
+    }
+
+    pub fn childCwd(self: *const OwnedInput) ForegroundCommandCwd {
+        return self.cwd.childCwd();
+    }
+    pub fn childEnvironment(self: *const OwnedInput) ?*const std.process.Environ.Map {
+        return self.environment.childEnvironment();
+    }
 };

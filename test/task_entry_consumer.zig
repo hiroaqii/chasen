@@ -22,28 +22,31 @@ test "task public consumer transfers an entry independently of the pending slot"
             allocator.destroy(self);
         }
     };
-    const Entry = chasen.Ctx(Msg).TaskEntry;
-    // Reintroducing the old raw public field would reopen the consuming bypass.
-    try std.testing.expect(!@hasField(Entry, "callbacks"));
-    try std.testing.expect(!@hasField(Entry, "context"));
+    // The app window no longer exports runtime entry/take/cleanup authority.
+    try std.testing.expect(!@hasDecl(chasen.Ctx(Msg), "TaskEntry"));
+    try std.testing.expect(!@hasDecl(chasen.Ctx(Msg), "takePendingTasks"));
+    try std.testing.expect(!@hasDecl(chasen.Ctx(Msg), "runtimeClearPendingEffectCopies"));
 
     const allocator = std.testing.allocator;
     var cleaned: usize = 0;
-    var tc: chasen.testing.TestCtx(Msg) = .{};
-    defer tc.resetTransient();
+    var tc: chasen.testing.TestCtx(Msg) = undefined;
+    tc.init(allocator, std.testing.io);
+    defer tc.deinit();
     const first = try allocator.create(Task);
     first.* = .{ .bytes = try allocator.dupe(u8, "moved result"), .cleaned = &cleaned };
     _ = try tc.ctx.task().spawnOwned(first, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.cleanup });
     // Move the value out before the pending slot is overwritten by another task.
-    const moved = tc.ctx.takePendingTasks()[0];
+    var moved = tc.takeTask(0) orelse return error.TestUnexpectedResult;
+    defer moved.deinit();
     const second = try allocator.create(Task);
     second.* = .{ .bytes = try allocator.dupe(u8, "discarded context"), .cleaned = &cleaned };
     _ = try tc.ctx.task().spawnOwned(second, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.cleanup });
 
-    const result = try moved.run(allocator, std.testing.io);
+    const result = try moved.run();
     defer allocator.free(result.bytes);
     try std.testing.expectEqualStrings("moved result", result.bytes);
     try std.testing.expectEqual(@as(usize, 1), cleaned);
+    try std.testing.expectError(error.AlreadyConsumed, moved.run());
     tc.resetTransient();
     try std.testing.expectEqual(@as(usize, 2), cleaned);
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTaskCount());

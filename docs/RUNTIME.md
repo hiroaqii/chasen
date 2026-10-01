@@ -20,7 +20,7 @@ flowchart TD
     RuntimeMsg["App message<br/>timer result / task result"]
     Handle["app.handleEvent?(Event) ?Msg"]
     Update["app.update(Msg, *Ctx)"]
-    Effects["Runtime drains pending Ctx effects"]
+    Effects["Runtime drains pending Requests effects"]
     NeedRender{"Redraw needed?<br/>Resize always redraws"}
     View["app.view(*Surface)"]
     Render["Terminal render"]
@@ -122,7 +122,12 @@ const clipboard_request_id = try ctx.terminal().copyToClipboard(.{
 // page/surface metadata in app state under this id and take it on completion.
 ```
 
-Most effects are stored in `Ctx` and drained after `init` or `update` returns.
+`Ctx` borrows an initialized `Requests(Msg)` owner; it holds no pending queues.
+Most effects are stored in that owner and drained after `init` or `update` returns.
+The runtime supplies its allocator and Io explicitly and keeps it in stable
+storage. Apps use the received `*Ctx` only during `init`/`update` on the runtime
+thread. Headless tests use an explicitly initialized
+[`TestCtx`](RUNTIME_MESSAGE_OWNERSHIP.md#tests-and-migration).
 Task cancellation is an immediate notification; it still leaves joining and
 result cleanup to the runtime.
 
@@ -138,6 +143,12 @@ Each effect-drain pass processes runtime-thread completions, foreground commands
 clipboard writes, tasks, timer cancels, one-shot timers, repeating timers, images,
 and frame requests in that order. Follow-up synchronous effects are processed
 in bounded rounds; remaining work is continued on a later event-loop turn.
+
+Each stage detaches its own fixed-capacity value batch immediately before use.
+Follow-up requests occupy separate pending storage, so an update cannot overwrite
+the batch being processed. On error, the stage releases its unconsumed suffix;
+the request owner separately releases new pending work. Detaching adds no heap
+allocation and does not change the existing stage order or queue limits.
 
 For task callback signatures, admission-error handling, cancellation, cleanup,
 and worker concurrency costs, see [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md).

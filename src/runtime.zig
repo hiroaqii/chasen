@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const ctx = @import("ctx.zig");
 pub const Ctx = ctx.Ctx;
+pub const Requests = @import("requests.zig").Requests;
 pub const TaskStartError = ctx.TaskStartError;
 pub const TaskId = ctx.TaskId;
 

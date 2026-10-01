@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const surface_mod = @import("surface.zig");
 const Surface = surface_mod.Surface;
 const ctx_mod = @import("ctx.zig");
+const requests_mod = @import("requests.zig");
 const root = @import("root.zig");
 const terminal_image = @import("terminal_image.zig");
 const terminal_mouse = @import("terminal_mouse.zig");
@@ -404,7 +405,7 @@ fn pasteControlText(key: vaxis.Key) ?[]const u8 {
 fn SpawnHelper(comptime Msg: type) type {
     return struct {
         fn run(
-            task: ctx_mod.Ctx(Msg).TaskEntry,
+            task: requests_mod.Requests(Msg).TaskEntry,
             alloc: std.mem.Allocator,
             spawn_io: std.Io,
             loop_ptr: *vaxis.Loop(InternalEvent(Msg)),
@@ -622,10 +623,10 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
             });
         }
     }
-    // Ctx keeps Io privately so user code can call ctx.now() without receiving
-    // direct access to the runtime Io handle.
-    var app_ctx: ctx_mod.Ctx(Msg) = .{ ._io = io, ._allocator = allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    // Keep the request owner in stable storage for the borrowed app facade.
+    var app_ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+    defer app_ctx_requests.deinit();
+    var app_ctx = ctx_mod.Ctx(Msg).init(&app_ctx_requests);
     var frame_in_flight = false;
     var frame_future: ?std.Io.Future(void) = null;
     var last_frame_ns = timestampNs(io);
@@ -642,7 +643,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
     // Stable nodes keep publication/wake and completion valid across list
     // growth. Runtime joins only supervisors; each supervisor owns its worker.
     var pending_futures: std.ArrayList(*PendingTask(Msg)) = .empty;
-    app_ctx._task_runtime = .{ .context = &pending_futures, .request = PendingTask(Msg).requestFromRegistry };
+    app_ctx.requests._task_runtime = .{ .context = &pending_futures, .request = PendingTask(Msg).requestFromRegistry };
 
     // --- Running timers (id-tracked for cancel support) ---
     // Completed one-shot ticks remain here until shutdown because std.Io.Future
@@ -817,7 +818,7 @@ pub fn run(comptime App: type, opts: root.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during update
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
-        if (app_ctx.hasPendingForegroundCommands()) {
+        if (app_ctx.requests.hasPendingForegroundCommands()) {
             bracketed_paste.cancel();
         }
         // Drain effects even when the app already requested a redraw; using
@@ -867,7 +868,7 @@ fn shutdownRuntime(
     // Broadcast before any join: a non-cooperative task cannot withhold the
     // cancellation notification from a later task. No shutdown allocation.
     for (pending_futures.items) |task| task.requestCancel(io);
-    app_ctx.discardPendingTasks();
+    app_ctx.requests.discardPendingTasks();
 
     // Do not call Loop.stop here: its DSR wake + await can block behind a full
     // queue or a terminal that does not answer the query. Canceling the
@@ -895,7 +896,7 @@ fn shutdownRuntime(
 
     drainInternalEventsForShutdown(App.Msg, loop, allocator);
     runtime_completions.deinitUndelivered(allocator);
-    app_ctx._task_runtime = null;
+    app_ctx.requests._task_runtime = null;
     discardQueuedForegroundCommands(App.Msg, app_ctx, allocator);
 }
 
@@ -968,11 +969,13 @@ fn drainInternalEventsForShutdown(
 }
 
 fn discardQueuedForegroundCommands(comptime Msg: type, app_ctx: *ctx_mod.Ctx(Msg), allocator: std.mem.Allocator) void {
-    for (app_ctx.takePendingForegroundCommands()) |queued| {
+    var batch = app_ctx.requests.detachForegroundCommands();
+    defer batch.deinit();
+    while (batch.next()) |queued| {
         var entry = queued;
         var msg = entry.finished(.{ .request_id = entry.request_id, .outcome = .runtime_abandoned });
         root.runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-        entry.runtimeDeinit(allocator);
+        entry.deinit(allocator);
     }
 }
 
@@ -1092,7 +1095,7 @@ fn applyMsg(
     opts: root.RunOptions,
 ) !bool {
     const measure = stats.* != null;
-    app_ctx.resetRedrawSuppressed();
+    app_ctx.requests.resetRedrawSuppressed();
 
     trace(opts, .update_start);
     const update_start = timingStart(measure, io);
@@ -1104,7 +1107,7 @@ fn applyMsg(
     }
     trace(opts, .update_end);
 
-    return !app_ctx.redrawWasSuppressed();
+    return !app_ctx.requests.redrawWasSuppressed();
 }
 
 /// Deliver callbacks created on the runtime thread without routing them back
@@ -1221,8 +1224,8 @@ fn drainPendingEffects(
         startPendingFrame(Msg, app_ctx, io, loop, suspended, shutting_down, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
 
         const has_follow_up = runtime_completions.items.items.len > 0 or
-            app_ctx.hasPendingForegroundCommands() or
-            app_ctx.hasPendingClipboardCopies();
+            app_ctx.requests.hasPendingForegroundCommands() or
+            app_ctx.requests.hasPendingClipboardCopies();
         if (!has_follow_up) break;
         if (round + 1 == max_effect_drain_rounds) {
             try scheduleEffectDrainContinuation(Msg, loop, effect_drain_continuation_pending);
@@ -1259,7 +1262,7 @@ fn processPendingForegroundCommands(
 
         fn run(
             self: @This(),
-            entry: *const ctx_mod.Ctx(App.Msg).ForegroundCommandEntry,
+            entry: *const requests_mod.Requests(App.Msg).ForegroundCommandEntry,
         ) !foreground_command.ForegroundCommandOutcome {
             return runForegroundCommand(
                 self.vx,
@@ -1306,22 +1309,24 @@ fn processPendingForegroundCommandsWithRunner(
     opts: root.RunOptions,
     runner: anytype,
 ) !bool {
-    // The take API returns Ctx-backed storage. This is safe while the
-    // foreground queue capacity is 1. Copy each owner by value before a
-    // callback can queue into the same backing slot.
-    const pending_commands = app_ctx.takePendingForegroundCommands();
+    var pending_commands = app_ctx.requests.detachForegroundCommands();
+    // Abandon every unprocessed entry on an early error, before freeing inputs.
+    defer {
+        while (pending_commands.next()) |queued| {
+            var entry = queued;
+            var msg = entry.message(.runtime_abandoned);
+            root.runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
+            entry.deinit(allocator);
+        }
+    }
     var needs_render = false;
 
-    for (pending_commands) |queued_entry| {
+    while (pending_commands.next()) |queued_entry| {
         var entry = queued_entry;
-        defer entry.runtimeDeinit(allocator);
+        defer entry.deinit(allocator);
 
         const outcome = if (app_ctx.shouldQuit()) foreground_command.ForegroundCommandOutcome.runtime_abandoned else runner.run(&entry) catch |err| foreground_job.failure(.restore_tui, @errorName(err));
-        const result: foreground_command.ForegroundCommandResult = .{
-            .request_id = entry.request_id,
-            .outcome = outcome,
-        };
-        var msg = entry.finished(result);
+        var msg = entry.message(outcome);
         if (outcome.isFatal() or outcome == .runtime_abandoned) {
             root.runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
             if (outcome.isFatal()) return error.ForegroundRecoveryFailed;
@@ -1344,28 +1349,14 @@ fn processPendingClipboardCopies(
     stats: *?root.RuntimeStats,
     opts: root.RunOptions,
 ) !bool {
-    const ClipboardEntry = ctx_mod.Ctx(App.Msg).ClipboardCopyEntry;
-    const pending_copies = app_ctx.takePendingClipboardCopies();
-    if (pending_copies.len == 0) return false;
-
-    const entries = allocator.alloc(ClipboardEntry, pending_copies.len) catch |err| {
-        for (pending_copies) |entry| allocator.free(entry.text);
-        return err;
-    };
-    defer {
-        for (entries) |entry| allocator.free(entry.text);
-        allocator.free(entries);
-    }
-
-    @memcpy(entries, pending_copies);
-
+    var pending_copies = app_ctx.requests.detachClipboardCopies();
+    defer pending_copies.deinit();
     var needs_render = false;
-    for (entries) |entry| {
+    while (pending_copies.next()) |queued| {
+        var entry = queued;
+        defer entry.deinit(allocator);
         const outcome: ctx_mod.Ctx(App.Msg).ClipboardCopyOutcome = if (vx.*.copyToSystemClipboard(tty.writer(), entry.text, allocator)) |_| .sent else |err| .{ .write_failed = @errorName(err) };
-        needs_render = try applyMsg(App, app, entry.finished(.{
-            .request_id = entry.request_id,
-            .outcome = outcome,
-        }), app_ctx, io, stats, opts) or needs_render;
+        needs_render = try applyMsg(App, app, entry.message(outcome), app_ctx, io, stats, opts) or needs_render;
     }
 
     return needs_render;
@@ -1384,7 +1375,7 @@ fn runForegroundCommand(
 ) foreground_command.ForegroundCommandOutcome {
     if (!foreground_job.supported or builtin.is_test) return foreground_job.failure(.unsupported, "Unsupported");
     const terminal = foreground_job.Terminal.capture(tty.fd.handle) catch |err| return foreground_job.failure(.admission, @errorName(err));
-    var prepared = foreground_job.Prepared.init(allocator, entry.argv, entry.runtimeChildCwd(), entry.runtimeChildEnvironment()) catch |err| return foreground_job.failure(.prepare, @errorName(err));
+    var prepared = foreground_job.Prepared.init(allocator, entry.input.argv, entry.input.childCwd(), entry.input.childEnvironment()) catch |err| return foreground_job.failure(.prepare, @errorName(err));
     defer prepared.deinit();
     prepared.prepareLaunch(terminal.fd) catch |err| return foreground_job.failure(if (err == error.Unsupported) .unsupported else .prepare, @errorName(err));
     suspended.store(true, .seq_cst);
@@ -1405,7 +1396,7 @@ fn runForegroundCommand(
 
 fn appendTaskStartFailure(
     comptime Msg: type,
-    task: ctx_mod.Ctx(Msg).TaskEntry,
+    task: requests_mod.Requests(Msg).TaskEntry,
     failure: ctx_mod.TaskStartError,
     completions: *RuntimeCompletionBuffer(Msg),
     allocator: std.mem.Allocator,
@@ -1432,13 +1423,9 @@ fn spawnPendingTasks(
 ) !void {
     const Msg = App.Msg;
     reapCompletedTasks(Msg, pending_futures, allocator, io);
-    const tasks = app_ctx.takePendingTasks();
-    var consumed: usize = 0;
-    // Taking clears the queue. A completion-buffer error must still consume
-    // every later entry that never reached worker admission.
-    defer for (tasks[consumed..]) |task| task.discard(allocator);
-    for (tasks) |task| {
-        consumed += 1;
+    var tasks = app_ctx.requests.detachTasks();
+    defer tasks.deinit();
+    while (tasks.next()) |task| {
         if (task.canceled or app_ctx.shouldQuit() or shutting_down.load(.acquire)) {
             task.discard(allocator);
             continue;
@@ -1477,7 +1464,7 @@ fn startPendingFrame(
     last_frame_ns: u64,
     next_frame_index: u64,
 ) void {
-    if (!app_ctx.takeFrameRequest()) return;
+    if (!app_ctx.requests.takeFrameRequest()) return;
 
     if (frame_in_flight.*) return;
 
@@ -1503,9 +1490,10 @@ fn spawnPendingTicks(
     // Take ownership of queued copies before processing. Zeroing the queue
     // first keeps run()'s unwind cleanup from freeing ids after they have been
     // handed to running_timers.
-    const pending_ticks = app_ctx.takePendingTicks();
+    var pending_ticks = app_ctx.requests.detachTicks();
+    defer pending_ticks.deinit();
 
-    for (pending_ticks) |entry| {
+    while (pending_ticks.next()) |entry| {
         var owned_id: ?[]const u8 = entry.id;
         defer if (owned_id) |id| allocator.free(id);
 
@@ -1539,9 +1527,10 @@ fn spawnPendingEvery(
     // Take ownership of queued copies before processing. Zeroing the queue
     // first keeps run()'s unwind cleanup from freeing ids after they have been
     // handed to running_timers.
-    const pending_everys = app_ctx.takePendingEverys();
+    var pending_everys = app_ctx.requests.detachEverys();
+    defer pending_everys.deinit();
 
-    for (pending_everys) |entry| {
+    while (pending_everys.next()) |entry| {
         var owned_id: ?[]const u8 = entry.id;
         defer if (owned_id) |id| allocator.free(id);
 
@@ -1584,9 +1573,10 @@ fn processPendingCancels(
 ) void {
     // Take ownership of queued cancel ids before processing so unwind cleanup
     // only sees entries that have not reached the drain step.
-    const pending_cancels = app_ctx.takePendingCancels();
+    var pending_cancels = app_ctx.requests.detachCancels();
+    defer pending_cancels.deinit();
 
-    for (pending_cancels) |id| {
+    while (pending_cancels.next()) |id| {
         defer allocator.free(id);
         cancelRunningTimer(running_timers, allocator, id, io);
     }
@@ -1604,15 +1594,17 @@ fn processPendingTerminalImages(
 ) !void {
     // Take ownership of queued image effects before processing so unwind
     // cleanup only sees entries that have not reached the drain step.
-    const pending_unloads = app_ctx.takePendingTerminalImageUnloads();
+    var pending_unloads = app_ctx.requests.detachTerminalImageUnloads();
+    defer pending_unloads.deinit();
 
-    for (pending_unloads) |handle| {
+    while (pending_unloads.next()) |handle| {
         _ = registry.unload(vx.*, tty, handle);
     }
 
-    const pending_loads = app_ctx.takePendingTerminalImageLoads();
+    var pending_loads = app_ctx.requests.detachTerminalImageLoads();
+    defer pending_loads.deinit();
 
-    for (pending_loads) |entry| {
+    while (pending_loads.next()) |entry| {
         defer allocator.free(entry.path);
 
         switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
@@ -1867,7 +1859,8 @@ test "task reclamation bounds repeated plain and owned tasks results including e
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
-    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+    var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
     var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
     defer pending.deinit(allocator);
     try pending.ensureTotalCapacityPrecise(allocator, 1);
@@ -1883,7 +1876,9 @@ test "task reclamation bounds repeated plain and owned tasks results including e
     const early = try PendingTask(Msg).create(allocator, &pending);
     const task = try ReapingTestTask.create(&counts);
     early.id = try ctx.task().spawnOwned(task, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
-    const entry = ctx.takePendingTasks()[0];
+    var batch = ctx.requests.detachTasks();
+    defer batch.deinit();
+    const entry = batch.next().?;
     early.future = try io.concurrent(PendingTask(Msg).supervise, .{ early, io });
     const future = try io.concurrent(SpawnHelper(Msg).run, .{ entry, allocator, io, &loop, &shutting_down, early });
     early.wake.waitUncancelable(io);
@@ -1931,7 +1926,8 @@ test "task reclamation skips running work and shutdown owns only remaining full-
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
-    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+    var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
     var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
     var completions: RuntimeCompletionBuffer(Msg) = .{};
     try completions.init(allocator);
@@ -1979,7 +1975,8 @@ test "task reclamation start failures consume context and payload once" {
             defer threaded.deinit();
             const io = threaded.io();
             const Msg = OwnershipTestMsg;
-            var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+            var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+            var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
             var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
             defer pending.deinit(task_allocator);
             var completions: RuntimeCompletionBuffer(Msg) = .{};
@@ -2062,9 +2059,10 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |via_shutdown| {
-        var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+        var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+        var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
         var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
-        ctx._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
+        ctx.requests._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
         var completions: RuntimeCompletionBuffer(Msg) = .{};
         try completions.init(allocator);
         var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
@@ -2101,10 +2099,11 @@ test "task cancel and completion races preserve moved results on runtime includi
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
-    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+    var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
     var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
     defer pending.deinit(allocator);
-    ctx._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
+    ctx.requests._task_runtime = .{ .context = &pending, .request = PendingTask(Msg).requestFromRegistry };
     var completions: RuntimeCompletionBuffer(Msg) = .{};
     try completions.init(allocator);
     defer completions.deinitUndelivered(allocator);
@@ -2136,7 +2135,8 @@ test "task failure completion overflow discards all remaining taken contexts" {
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var ctx: ctx_mod.Ctx(Msg) = .{ ._allocator = allocator, ._io = io };
+    var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+    var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
     var pending: std.ArrayList(*PendingTask(Msg)) = .empty;
     defer pending.deinit(allocator);
     var completions: RuntimeCompletionBuffer(Msg) = .{};
@@ -2160,7 +2160,7 @@ test "task failure completion overflow discards all remaining taken contexts" {
     try std.testing.expectEqual(@as(usize, 1), counts.failures);
     try std.testing.expectEqual(@as(usize, 1), counts.payloads);
     try std.testing.expectEqual(@as(usize, 0), counts.runs.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.requests.detachTasks().len);
 }
 
 test "task delivery returns undelivered message after shutdown barrier" {
@@ -2446,10 +2446,8 @@ test "task start failure uses runtime completion buffer with full event queue" {
     };
     const Event = InternalEvent(TestMsg);
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
     _ = try app_ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed });
     var pending_futures: std.ArrayList(*PendingTask(TestMsg)) = .empty;
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
@@ -2524,10 +2522,8 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
     const Event = InternalEvent(TestMsg);
 
     var app: TestApp = .{};
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
     var pending_futures: std.ArrayList(*PendingTask(TestMsg)) = .empty;
     var running_timers: std.ArrayList(TimerHandle) = .empty;
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
@@ -2582,8 +2578,108 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
 
     try std.testing.expectEqual(@as(usize, 2), app.update_count);
     try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app_ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), app_ctx.requests.detachTasks().len);
     drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
+}
+
+test "clipboard detached suffix survives reentrant update and is freed on update error" {
+    const TestApp = struct {
+        fail_update: bool,
+        received: usize = 0,
+        pub const Msg = struct {
+            request_id: u64,
+            pub const undelivered_policy = .plain;
+        };
+        fn finished(result: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
+            std.debug.assert(result.outcome == .sent);
+            return .{ .request_id = result.request_id.id };
+        }
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.received += 1;
+            try std.testing.expectEqual(self.received, msg.request_id);
+            if (self.received == 1) {
+                _ = try ctx.terminal().copyToClipboard(.{ .text = "new", .finished = finished });
+                if (self.fail_update) return error.UpdateFailed;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |fail_update| {
+        var requests = requests_mod.Requests(TestApp.Msg).init(std.testing.allocator, std.testing.io);
+        defer requests.deinit();
+        var ctx = ctx_mod.Ctx(TestApp.Msg).init(&requests);
+        _ = try ctx.terminal().copyToClipboard(.{ .text = "first", .finished = TestApp.finished });
+        _ = try ctx.terminal().copyToClipboard(.{ .text = "second", .finished = TestApp.finished });
+        var env: std.process.Environ.Map = .init(std.testing.allocator);
+        defer env.deinit();
+        var buffer: [128]u8 = undefined;
+        var tty = try vaxis.Tty.init(std.testing.io, &buffer);
+        defer tty.deinit();
+        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+        defer vx.deinit(std.testing.allocator, tty.writer());
+        var app: TestApp = .{ .fail_update = fail_update };
+        var stats: ?root.RuntimeStats = null;
+        const result = processPendingClipboardCopies(TestApp, &app, &ctx, &vx, &tty, std.testing.allocator, std.testing.io, &stats, .{
+            .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .terminal = .{ .env_map = &env },
+        });
+        if (fail_update) {
+            try std.testing.expectError(error.UpdateFailed, result);
+        } else {
+            try std.testing.expect(try result);
+        }
+        try std.testing.expectEqual(@as(usize, if (fail_update) 1 else 2), app.received);
+        if (comptime builtin.os.tag == .linux) {
+            const wire = tty.tty_writer.written();
+            try std.testing.expect(std.mem.indexOf(u8, wire, "Zmlyc3Q=") != null);
+            try std.testing.expectEqual(!fail_update, std.mem.indexOf(u8, wire, "c2Vjb25k") != null);
+            try std.testing.expect(std.mem.indexOf(u8, wire, "bmV3") == null);
+        }
+        var remaining = requests.detachClipboardCopies();
+        defer remaining.deinit();
+        var new_entry = remaining.next().?;
+        defer new_entry.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("new", new_entry.text);
+        try std.testing.expectEqual(@as(u64, 3), new_entry.request_id.id);
+        try std.testing.expect(remaining.next() == null);
+    }
+}
+
+test "image batch overflow frees current and unconsumed paths" {
+    const Msg = struct {
+        pub const undelivered_policy = .plain;
+        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) @This() {
+            unreachable;
+        }
+        fn failed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) @This() {
+            return .{};
+        }
+    };
+    var requests = requests_mod.Requests(Msg).init(std.testing.allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(Msg).init(&requests);
+    for ([_][]const u8{ "one.png", "two.png", "three.png" }) |path| {
+        _ = try ctx.image().loadPath(path, Msg.loaded, Msg.failed);
+    }
+    var completions: RuntimeCompletionBuffer(Msg) = .{};
+    try completions.init(std.testing.allocator);
+    defer completions.deinitUndelivered(std.testing.allocator);
+    for (0..RuntimeCompletionBuffer(Msg).capacity - 1) |_| try completions.append(.{});
+    var registry: terminal_image.Registry = .{};
+    defer registry.deinit(std.testing.allocator);
+    try std.testing.expectError(error.RuntimeCompletionLimitExceeded, processPendingTerminalImages(
+        Msg,
+        &ctx,
+        &completions,
+        &registry,
+        undefined,
+        undefined,
+        std.testing.allocator,
+        .{ .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io }, .terminal = .{ .env_map = undefined } },
+    ));
+    try std.testing.expectEqual(@as(usize, RuntimeCompletionBuffer(Msg).capacity), completions.items.items.len);
+    var empty = requests.detachTerminalImageLoads();
+    defer empty.deinit();
+    try std.testing.expect(empty.next() == null);
 }
 
 test "terminal image failure callback uses runtime completion buffer" {
@@ -2616,10 +2712,8 @@ test "terminal image failure callback uses runtime completion buffer" {
         }
     };
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
     _ = try app_ctx.image().loadPath("missing.png", Callback.loaded, Callback.failed);
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
     try completions.init(std.testing.allocator);
@@ -2679,10 +2773,8 @@ test "runtime completion delivery transfers ownership to update" {
     var update_count: usize = 0;
     var deinit_count: usize = 0;
     var app: TestApp = .{ .update_count = &update_count };
-    var app_ctx: ctx_mod.Ctx(OwnershipTestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
+    var app_ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(OwnershipTestMsg).init(&app_ctx_requests);
     var completions: RuntimeCompletionBuffer(OwnershipTestMsg) = .{};
     try completions.init(std.testing.allocator);
     defer completions.deinitUndelivered(std.testing.allocator);
@@ -2728,10 +2820,8 @@ test "runtime completion update error remains app-owned" {
     var deinit_count: usize = 0;
     var app: TestApp = .{};
     defer if (app.retained) |owned| std.testing.allocator.free(owned.bytes);
-    var app_ctx: ctx_mod.Ctx(OwnershipTestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
+    var app_ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(OwnershipTestMsg).init(&app_ctx_requests);
     var completions: RuntimeCompletionBuffer(OwnershipTestMsg) = .{};
     try completions.init(std.testing.allocator);
     defer completions.deinitUndelivered(std.testing.allocator);
@@ -2784,10 +2874,11 @@ test "task pending cancel quit and unwind discard contexts without failure messa
         var cleanups: usize = 0;
         const capture = try std.testing.allocator.create(Capture);
         capture.* = .{ .bytes = try std.testing.allocator.dupe(u8, "pending context"), .cleanups = &cleanups };
-        var ctx: ctx_mod.Ctx(OwnershipTestMsg) = .{ ._allocator = std.testing.allocator };
+        var ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, std.testing.io);
+        var ctx = ctx_mod.Ctx(OwnershipTestMsg).init(&ctx_requests);
         const id = try ctx.task().spawnOwned(capture, .{ .run = Capture.run, .failed = Capture.failed, .cleanup = Capture.cleanup });
         if (terminal == .unwind) {
-            ctx.discardPendingTasks();
+            ctx.requests.discardPendingTasks();
         } else {
             if (terminal == .quit) ctx.quit() else ctx.task().requestCancel(id);
             const App = struct {
@@ -2805,7 +2896,7 @@ test "task pending cancel quit and unwind discard contexts without failure messa
             try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
         }
         try std.testing.expectEqual(@as(usize, 1), cleanups);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.requests.detachTasks().len);
     }
 }
 
@@ -3021,8 +3112,9 @@ fn foregroundCommandParentCanary(map: *const std.process.Environ.Map) ![]const u
 
 test "foreground command inherit cwd reaches child spawn" {
     const TestMsg = union(enum) { finished };
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{try foregroundCommandTestTruePath()},
         .finished = &struct {
@@ -3032,18 +3124,19 @@ test "foreground command inherit cwd reaches child spawn" {
         }.done,
     });
 
-    const pending = app_ctx.takePendingForegroundCommands();
-    var entry = pending[0];
-    defer entry.runtimeDeinit(std.testing.allocator);
-    switch (entry.runtimeChildCwd()) {
+    var pending = app_ctx.requests.detachForegroundCommands();
+    defer pending.deinit();
+    var entry = pending.next().?;
+    defer entry.deinit(std.testing.allocator);
+    switch (entry.input.childCwd()) {
         .inherit => {},
         else => return error.TestUnexpectedResult,
     }
     const outcome = foreground_job.testRun(
         std.testing.io,
-        entry.argv,
-        entry.runtimeChildCwd(),
-        entry.runtimeChildEnvironment(),
+        entry.input.argv,
+        entry.input.childCwd(),
+        entry.input.childEnvironment(),
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3084,8 +3177,9 @@ test "foreground environment replacement snapshot reaches child without parent l
         .{ printenv_path, parent_canary },
     );
     defer std.testing.allocator.free(caller_command);
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{ caller_argv0, "-c", caller_command },
         .cwd = .{ .dir = caller_dir },
@@ -3108,18 +3202,19 @@ test "foreground environment replacement snapshot reaches child without parent l
     try tmp.dir.rename("original", tmp.dir, "renamed", std.testing.io);
     try tmp.dir.createDir(std.testing.io, "original", .default_dir);
 
-    const pending = app_ctx.takePendingForegroundCommands();
-    var entry = pending[0];
-    defer entry.runtimeDeinit(std.testing.allocator);
-    switch (entry.runtimeChildCwd()) {
+    var pending = app_ctx.requests.detachForegroundCommands();
+    defer pending.deinit();
+    var entry = pending.next().?;
+    defer entry.deinit(std.testing.allocator);
+    switch (entry.input.childCwd()) {
         .dir => {},
         else => return error.TestUnexpectedResult,
     }
-    const queued_environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+    const queued_environment = entry.input.childEnvironment() orelse return error.TestUnexpectedResult;
     const outcome = foreground_job.testRun(
         std.testing.io,
-        entry.argv,
-        entry.runtimeChildCwd(),
+        entry.input.argv,
+        entry.input.childCwd(),
         queued_environment,
     );
     switch (outcome) {
@@ -3144,8 +3239,9 @@ test "foreground environment inherit and empty replacement remain distinct in ch
     defer parent_map.deinit();
     const parent_canary = try foregroundCommandParentCanary(&parent_map);
     const printenv_path = try foregroundCommandTestPrintenvPath();
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
 
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{ printenv_path, parent_canary },
@@ -3153,15 +3249,16 @@ test "foreground environment inherit and empty replacement remain distinct in ch
         .finished = finished,
     });
     {
-        const pending = app_ctx.takePendingForegroundCommands();
-        var entry = pending[0];
-        defer entry.runtimeDeinit(std.testing.allocator);
-        try std.testing.expect(entry.runtimeChildEnvironment() == null);
+        var pending = app_ctx.requests.detachForegroundCommands();
+        defer pending.deinit();
+        var entry = pending.next().?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expect(entry.input.childEnvironment() == null);
         const outcome = foreground_job.testRun(
             std.testing.io,
-            entry.argv,
-            entry.runtimeChildCwd(),
-            entry.runtimeChildEnvironment(),
+            entry.input.argv,
+            entry.input.childCwd(),
+            entry.input.childEnvironment(),
         );
         switch (outcome) {
             .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3177,15 +3274,16 @@ test "foreground environment inherit and empty replacement remain distinct in ch
         .finished = finished,
     });
     {
-        const pending = app_ctx.takePendingForegroundCommands();
-        var entry = pending[0];
-        defer entry.runtimeDeinit(std.testing.allocator);
-        const queued_empty = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+        var pending = app_ctx.requests.detachForegroundCommands();
+        defer pending.deinit();
+        var entry = pending.next().?;
+        defer entry.deinit(std.testing.allocator);
+        const queued_empty = entry.input.childEnvironment() orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 0), queued_empty.count());
         const outcome = foreground_job.testRun(
             std.testing.io,
-            entry.argv,
-            entry.runtimeChildCwd(),
+            entry.input.argv,
+            entry.input.childCwd(),
             queued_empty,
         );
         switch (outcome) {
@@ -3206,8 +3304,9 @@ test "foreground command directory cwd keeps identity across rename and caller c
     var caller_open = true;
     defer if (caller_open) caller_dir.close(std.testing.io);
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{ try foregroundCommandTestTouchPath(), "marker" },
         .cwd = .{ .dir = caller_dir },
@@ -3218,10 +3317,11 @@ test "foreground command directory cwd keeps identity across rename and caller c
         }.done,
     });
 
-    const pending = app_ctx.takePendingForegroundCommands();
-    var entry = pending[0];
-    defer entry.runtimeDeinit(std.testing.allocator);
-    const duplicate_fd = switch (entry.runtimeChildCwd()) {
+    var pending = app_ctx.requests.detachForegroundCommands();
+    defer pending.deinit();
+    var entry = pending.next().?;
+    defer entry.deinit(std.testing.allocator);
+    const duplicate_fd = switch (entry.input.childCwd()) {
         .dir => |dir| dir.handle,
         else => return error.TestUnexpectedResult,
     };
@@ -3233,9 +3333,9 @@ test "foreground command directory cwd keeps identity across rename and caller c
 
     const outcome = foreground_job.testRun(
         std.testing.io,
-        entry.argv,
-        entry.runtimeChildCwd(),
-        entry.runtimeChildEnvironment(),
+        entry.input.argv,
+        entry.input.childCwd(),
+        entry.input.childEnvironment(),
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3263,8 +3363,9 @@ test "foreground command path cwd copies bytes and resolves at spawn time" {
     const expected_path = try std.testing.allocator.dupe(u8, queued_path);
     defer std.testing.allocator.free(expected_path);
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{ try foregroundCommandTestTouchPath(), "marker" },
         .cwd = .{ .path = queued_path },
@@ -3276,10 +3377,11 @@ test "foreground command path cwd copies bytes and resolves at spawn time" {
     });
     @memset(queued_path, 'x');
 
-    const pending = app_ctx.takePendingForegroundCommands();
-    var entry = pending[0];
-    defer entry.runtimeDeinit(std.testing.allocator);
-    switch (entry.runtimeChildCwd()) {
+    var pending = app_ctx.requests.detachForegroundCommands();
+    defer pending.deinit();
+    var entry = pending.next().?;
+    defer entry.deinit(std.testing.allocator);
+    switch (entry.input.childCwd()) {
         .path => |path| try std.testing.expectEqualStrings(expected_path, path),
         else => return error.TestUnexpectedResult,
     }
@@ -3288,9 +3390,9 @@ test "foreground command path cwd copies bytes and resolves at spawn time" {
     try tmp.dir.createDir(std.testing.io, "original", .default_dir);
     const outcome = foreground_job.testRun(
         std.testing.io,
-        entry.argv,
-        entry.runtimeChildCwd(),
-        entry.runtimeChildEnvironment(),
+        entry.input.argv,
+        entry.input.childCwd(),
+        entry.input.childEnvironment(),
     );
     switch (outcome) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
@@ -3309,8 +3411,9 @@ test "foreground command accepts a duplicable non-directory and reports spawn fa
     var file = try tmp.dir.createFile(std.testing.io, "not-a-directory", .{});
     defer file.close(std.testing.io);
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{try foregroundCommandTestTouchPath()},
         .cwd = .{ .dir = .{ .handle = file.handle } },
@@ -3321,14 +3424,15 @@ test "foreground command accepts a duplicable non-directory and reports spawn fa
         }.done,
     });
 
-    const pending = app_ctx.takePendingForegroundCommands();
-    var entry = pending[0];
-    defer entry.runtimeDeinit(std.testing.allocator);
+    var pending = app_ctx.requests.detachForegroundCommands();
+    defer pending.deinit();
+    var entry = pending.next().?;
+    defer entry.deinit(std.testing.allocator);
     const outcome = foreground_job.testRun(
         std.testing.io,
-        entry.argv,
-        entry.runtimeChildCwd(),
-        entry.runtimeChildEnvironment(),
+        entry.input.argv,
+        entry.input.childCwd(),
+        entry.input.childEnvironment(),
     );
     switch (outcome) {
         .failed => |f| try std.testing.expectEqual(foreground_command.ForegroundCommandFailure.Stage.spawn, f.stage),
@@ -3380,13 +3484,13 @@ test "foreground command processing copies the taken owner before callback reque
 
         fn run(
             self: @This(),
-            entry: *const ctx_mod.Ctx(TestMsg).ForegroundCommandEntry,
+            entry: *const requests_mod.Requests(TestMsg).ForegroundCommandEntry,
         ) !foreground_command.ForegroundCommandOutcome {
-            self.first_duplicate.* = switch (entry.runtimeChildCwd()) {
+            self.first_duplicate.* = switch (entry.input.childCwd()) {
                 .dir => |dir| dir.handle,
                 else => return error.TestUnexpectedResult,
             };
-            const environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+            const environment = entry.input.childEnvironment() orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("first", environment.get("ISSUE55_OWNER").?);
             self.first_environment_observed.* = true;
             return .{ .exited = 0 };
@@ -3408,11 +3512,9 @@ test "foreground command processing copies the taken owner before callback reque
     defer second_environment.deinit();
     try second_environment.put("ISSUE55_OWNER", "second");
 
-    var app_ctx: ctx_mod.Ctx(TestMsg) = .{
-        ._allocator = std.testing.allocator,
-        ._io = std.testing.io,
-    };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{
         .argv = &.{"first"},
         .cwd = .{ .dir = first_dir },
@@ -3451,18 +3553,18 @@ test "foreground command processing copies the taken owner before callback reque
     try std.testing.expect(first_environment_observed);
     const first_fd = first_duplicate orelse return error.TestUnexpectedResult;
     try std.testing.expect(!foregroundCommandProgramTestFdOpen(first_fd));
-    try std.testing.expectEqual(@as(u8, 1), app_ctx._pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 1), app_ctx.requests._pending_foreground_commands_len);
 
-    const follow_up = app_ctx._pending_foreground_commands[0].runtimeChildCwd();
+    const follow_up = app_ctx.requests._pending_foreground_commands[0].input.childCwd();
     const second_fd = switch (follow_up) {
         .dir => |dir| dir.handle,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(foregroundCommandProgramTestFdOpen(second_fd));
-    const follow_up_environment = app_ctx._pending_foreground_commands[0].runtimeChildEnvironment() orelse
+    const follow_up_environment = app_ctx.requests._pending_foreground_commands[0].input.childEnvironment() orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("second", follow_up_environment.get("ISSUE55_OWNER").?);
-    app_ctx.runtimeClearPendingEffectCopies();
+    app_ctx.requests.discardPendingEffects();
     try std.testing.expect(!foregroundCommandProgramTestFdOpen(second_fd));
 }
 
@@ -3503,13 +3605,13 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
 
         fn run(
             self: @This(),
-            entry: *const ctx_mod.Ctx(TestMsg).ForegroundCommandEntry,
+            entry: *const requests_mod.Requests(TestMsg).ForegroundCommandEntry,
         ) !foreground_command.ForegroundCommandOutcome {
-            self.duplicate_fd.* = switch (entry.runtimeChildCwd()) {
+            self.duplicate_fd.* = switch (entry.input.childCwd()) {
                 .dir => |dir| dir.handle,
                 else => return error.TestUnexpectedResult,
             };
-            const environment = entry.runtimeChildEnvironment() orelse return error.TestUnexpectedResult;
+            const environment = entry.input.childEnvironment() orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("owned", environment.get("ISSUE55_TERMINAL").?);
             return switch (self.mode) {
                 .terminal_leave_error => error.InjectedTerminalLeave,
@@ -3542,11 +3644,9 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
             defer caller_environment.deinit();
             try caller_environment.put("ISSUE55_TERMINAL", "owned");
 
-            var app_ctx: ctx_mod.Ctx(TestMsg) = .{
-                ._allocator = std.testing.allocator,
-                ._io = std.testing.io,
-            };
-            defer app_ctx.runtimeClearPendingEffectCopies();
+            var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+            var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+            defer app_ctx.requests.discardPendingEffects();
             Completion.calls = 0;
             _ = try app_ctx.terminal().runForegroundCommand(.{
                 .argv = &.{"command"},
@@ -3585,7 +3685,7 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
             const owned_fd = duplicate_fd orelse return error.TestUnexpectedResult;
             try std.testing.expect(!foregroundCommandProgramTestFdOpen(owned_fd));
             try std.testing.expect(foregroundCommandProgramTestFdOpen(caller_dir.handle));
-            try std.testing.expectEqual(@as(u8, 0), app_ctx._pending_foreground_commands_len);
+            try std.testing.expectEqual(@as(u8, 0), app_ctx.requests._pending_foreground_commands_len);
         }
     };
 
@@ -3807,8 +3907,9 @@ test "foreground shutdown abandons queued command once and rejects followups" {
     };
     Harness.calls = 0;
     Harness.frees = 0;
-    var app_ctx: ctx_mod.Ctx(Harness.Msg) = .{ ._allocator = std.testing.allocator };
-    defer app_ctx.runtimeClearPendingEffectCopies();
+    var app_ctx_requests = requests_mod.Requests(Harness.Msg).init(std.testing.allocator, std.testing.io);
+    var app_ctx = ctx_mod.Ctx(Harness.Msg).init(&app_ctx_requests);
+    defer app_ctx.requests.discardPendingEffects();
     _ = try app_ctx.terminal().runForegroundCommand(.{ .argv = &.{"never-spawn"}, .finished = Harness.done });
     app_ctx.quit();
     discardQueuedForegroundCommands(Harness.Msg, &app_ctx, std.testing.allocator);

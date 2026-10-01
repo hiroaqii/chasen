@@ -1,8 +1,11 @@
+const std = @import("std");
 const runtime = @import("chasen_runtime");
 
-pub export fn chasen_runtime_compile_check() void {
+pub export fn chasen_runtime_compile_check(allocator: *const std.mem.Allocator, io: *const std.Io) void {
     const Msg = enum { done };
-    var ctx: runtime.Ctx(Msg) = .{};
+    var requests = runtime.Requests(Msg).init(allocator.*, io.*);
+    defer requests.deinit();
+    var ctx = runtime.Ctx(Msg).init(&requests);
     ctx.quit();
     ctx.redraw().skip();
     ctx.frame().request();

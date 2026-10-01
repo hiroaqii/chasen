@@ -222,5 +222,6 @@ test "TerminalOptions mouse coordinate protocol defaults to portable cell sgr" {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("program.zig");
+    _ = @import("requests.zig");
     _ = @import("state_store.zig");
 }

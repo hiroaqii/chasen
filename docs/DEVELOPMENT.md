@@ -119,7 +119,11 @@ The macOS job runs native unit/consumer tests and the example checks; the
 Linux-only PTY gates remain excluded there. CI does not currently run Windows
 or `check-runtime-wasm`.
 
-For unit tests that queue tasks without running the terminal, use
-`chasen.testing.discardPendingTasks` or `TestCtx.resetTransient` to clean up owned
-contexts. See [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md#tests-and-migration)
+For unit tests that queue effects without running the terminal, initialize
+`TestCtx` in place with `tc.init(std.testing.allocator, std.testing.io)` and defer
+`tc.deinit()`. Use observations for pending effects, `takeTask(index)` for an
+owned task handle, and `resetTransient()` for pending cleanup. Requests tests
+exercise production admission and batch ownership; Program tests cover reentrant
+clipboard draining and error cleanup, and the separate consumer test checks the
+public testing boundary. See [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md#tests-and-migration)
 and [Authoring Components](AUTHORING_COMPONENTS.md#testing-surface-drawing).
