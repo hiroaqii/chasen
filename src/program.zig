@@ -13,8 +13,13 @@ const TaskRuntime = @import("program/tasks.zig").TaskRuntime;
 const TimerRuntime = @import("program/timers.zig").TimerRuntime;
 const frame_mod = @import("program/frame.zig");
 const FrameRuntime = frame_mod.FrameRuntime;
-const timestampNs = frame_mod.timestampNs;
-const deltaNs = frame_mod.deltaNs;
+const events_mod = @import("program/events.zig");
+const Events = events_mod.Events;
+const dispatchAppEvent = events_mod.dispatchAppEvent;
+const applyMsg = events_mod.applyMsg;
+const timingStart = types.timingStart;
+const timingElapsed = types.timingElapsed;
+const trace = types.trace;
 const terminal_image = @import("terminal_image.zig");
 const terminal_mouse = @import("terminal_mouse.zig");
 const foreground_job = @import("foreground_job.zig");
@@ -149,114 +154,6 @@ fn ResizePollState(comptime Msg: type) type {
     };
 }
 
-/// Converts terminal bracketed-paste marker events into one public Event.paste.
-///
-/// vaxis exposes bracketed paste as `paste_start`, many ordinary `key_press`
-/// events, then `paste_end`. Apps should not have to know that transport detail:
-/// they should receive one paste payload and should never see the intermediate
-/// key events as normal typing.
-const BracketedPasteAccumulator = struct {
-    active: bool = false,
-    failed: bool = false,
-    bytes: std.ArrayListUnmanaged(u8) = .empty,
-
-    fn start(self: *BracketedPasteAccumulator) void {
-        self.cancel();
-        self.active = true;
-    }
-
-    fn appendKey(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator, key: vaxis.Key) !void {
-        if (!self.active) return;
-        if (self.failed) return;
-
-        // Prefer vaxis' decoded text. The slice is event-scoped, so copy it
-        // before the next parser event can reuse the backing buffer.
-        if (key.text) |text| {
-            try self.bytes.appendSlice(allocator, text);
-            return;
-        }
-
-        if (pasteControlText(key)) |text| {
-            try self.bytes.appendSlice(allocator, text);
-            return;
-        }
-
-        if (key.mods.ctrl) return;
-        if (!isPasteTextCodepoint(key.codepoint)) return;
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(key.codepoint, &buf) catch return;
-        try self.bytes.appendSlice(allocator, buf[0..len]);
-    }
-
-    fn finish(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) ?[]u8 {
-        if (!self.active) return null;
-        self.active = false;
-
-        if (self.failed) {
-            self.failed = false;
-            self.bytes.clearRetainingCapacity();
-            return null;
-        }
-        if (self.bytes.items.len == 0) {
-            self.bytes.clearRetainingCapacity();
-            return null;
-        }
-        if (!std.unicode.utf8ValidateSlice(self.bytes.items)) {
-            self.bytes.clearRetainingCapacity();
-            return null;
-        }
-
-        return self.bytes.toOwnedSlice(allocator) catch {
-            self.bytes.clearRetainingCapacity();
-            return null;
-        };
-    }
-
-    fn fail(self: *BracketedPasteAccumulator) void {
-        // Keep `active` true so the rest of this bracketed paste is swallowed
-        // until `paste_end`; otherwise a failed paste tail becomes key input.
-        self.active = true;
-        self.failed = true;
-        self.bytes.clearRetainingCapacity();
-    }
-
-    fn cancel(self: *BracketedPasteAccumulator) void {
-        self.active = false;
-        self.failed = false;
-        self.bytes.clearRetainingCapacity();
-    }
-
-    fn deinit(self: *BracketedPasteAccumulator, allocator: std.mem.Allocator) void {
-        self.bytes.deinit(allocator);
-        self.* = .{};
-    }
-};
-
-fn isPasteTextCodepoint(codepoint: u21) bool {
-    return switch (codepoint) {
-        '\n', vaxis.Key.tab, vaxis.Key.enter => true,
-        0x20...0xD7FF, 0xE000...0x10FFFF => codepoint < vaxis.Key.insert or codepoint > vaxis.Key.iso_level_5_shift,
-        else => false,
-    };
-}
-
-fn pasteControlText(key: vaxis.Key) ?[]const u8 {
-    if (!key.mods.ctrl) return null;
-    if (key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta) return null;
-    if (key.codepoint > std.math.maxInt(u8)) return null;
-
-    // Some terminals report pasted LF/TAB/CR through their legacy control-key
-    // encodings (Ctrl+J / Ctrl+I / Ctrl+M) without decoded `key.text`.
-    // Treat only those textual controls as paste bytes; other Ctrl keys are
-    // shortcuts/special input and must not become printable letters.
-    return switch (std.ascii.toLower(@as(u8, @intCast(key.codepoint)))) {
-        'i' => "\t",
-        'j' => "\n",
-        'm' => "\r",
-        else => null,
-    };
-}
-
 const RenderTimings = struct {
     view_ns: u64 = 0,
     render_ns: u64 = 0,
@@ -365,8 +262,8 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     var frames = FrameRuntime(Msg).init(io);
     var runtime_suspended: std.atomic.Value(bool) = .init(false);
     var runtime_shutting_down: std.atomic.Value(bool) = .init(false);
-    var bracketed_paste: BracketedPasteAccumulator = .{};
-    defer bracketed_paste.deinit(allocator);
+    var events = Events.init(allocator);
+    defer events.deinit();
     var event_count: u64 = 0;
     var frame_count: u64 = 0;
     const stats_enabled = opts.runtime.stats_fn != null;
@@ -458,23 +355,14 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         event_count += 1;
         var needs_render = false;
         var stats: ?runtime.RuntimeStats = if (stats_enabled) .{
-            .event_kind = eventKind(event),
+            .event_kind = events_mod.eventKind(event),
             .event_count = event_count,
             .frame_count = frame_count,
         } else null;
 
         switch (event) {
             .key_press => |key| {
-                if (bracketed_paste.active) {
-                    // These key events are paste payload bytes, not app input.
-                    // Swallow them and dispatch one Event.paste at paste_end.
-                    if (stats) |*s| s.event_kind = .paste;
-                    bracketed_paste.appendKey(allocator, key) catch {
-                        bracketed_paste.fail();
-                    };
-                } else {
-                    needs_render = try dispatchAppEvent(App, &app, .{ .key_press = key }, &app_ctx, io, &stats, opts);
-                }
+                needs_render = try events.keyPress(App, &app, key, &app_ctx, io, &stats, opts);
             },
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
@@ -495,15 +383,12 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
                 needs_render = try dispatchAppEvent(App, &app, .focus_out, &app_ctx, io, &stats, opts);
             },
             .paste_start => {
-                bracketed_paste.start();
+                events.startPaste();
                 if (stats) |*s| s.event_kind = .paste;
             },
             .paste_end => {
                 if (stats) |*s| s.event_kind = .paste;
-                if (bracketed_paste.finish(allocator)) |text| {
-                    defer allocator.free(text);
-                    needs_render = try dispatchAppEvent(App, &app, .{ .paste = text }, &app_ctx, io, &stats, opts);
-                }
+                needs_render = try events.endPaste(App, &app, &app_ctx, io, &stats, opts);
             },
             .frame => |frame| {
                 frame_count += 1;
@@ -533,7 +418,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         trace(opts, .effect_drain_start);
         const effect_drain_start = timingStart(stats_enabled, io);
         if (app_ctx.requests.hasPendingForegroundCommands()) {
-            bracketed_paste.cancel();
+            events.cancelPaste();
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
@@ -745,72 +630,6 @@ fn queryTerminal(
     modes.kitty_flags = @bitCast(vx.opts.kitty_keyboard_flags);
     if (kitty) try modes.setKitty(vx, writer, true);
     try loop.start();
-}
-
-/// Route an app-facing event through optional `handleEvent`, then apply the
-/// returned message if the app handled it.
-///
-/// This keeps the common handleEvent/update/stat timing path in one place.
-/// Event-specific runtime work, such as terminal resize or frame-future
-/// cleanup, stays in the switch branch before this helper is called.
-fn dispatchAppEvent(
-    comptime App: type,
-    app: *App,
-    event: types.Event,
-    app_ctx: *ctx_mod.Ctx(App.Msg),
-    io: std.Io,
-    stats: *?runtime.RuntimeStats,
-    opts: types.RunOptions,
-) !bool {
-    const measure = stats.* != null;
-    trace(opts, .handle_event_start);
-    const handle_start = timingStart(measure, io);
-    const maybe_msg: ?App.Msg = if (@hasDecl(App, "handleEvent"))
-        app.handleEvent(event)
-    else
-        null;
-
-    if (stats.*) |*s| {
-        s.handle_event_ns = timingElapsed(handle_start, io);
-    }
-    trace(opts, .handle_event_end);
-
-    if (maybe_msg) |msg| {
-        return try applyMsg(App, app, msg, app_ctx, io, stats, opts);
-    }
-
-    return false;
-}
-
-/// Apply one app message and return whether the app requested a redraw.
-///
-/// `ctx.redraw().skip()` is message-scoped, so the flag is reset immediately
-/// before each app update. The helper also owns update timing and the
-/// `did_update` stats flag, which avoids duplicating that bookkeeping across
-/// every event kind.
-fn applyMsg(
-    comptime App: type,
-    app: *App,
-    msg: App.Msg,
-    app_ctx: *ctx_mod.Ctx(App.Msg),
-    io: std.Io,
-    stats: *?runtime.RuntimeStats,
-    opts: types.RunOptions,
-) !bool {
-    const measure = stats.* != null;
-    app_ctx.requests.resetRedrawSuppressed();
-
-    trace(opts, .update_start);
-    const update_start = timingStart(measure, io);
-    try app.update(msg, app_ctx);
-
-    if (stats.*) |*s| {
-        s.update_ns = timingElapsed(update_start, io);
-        s.did_update = true;
-    }
-    trace(opts, .update_end);
-
-    return !app_ctx.requests.redrawWasSuppressed();
 }
 
 /// Deliver callbacks created on the runtime thread without routing them back
@@ -1162,41 +981,6 @@ fn loadTerminalImagePath(
         return .{ .failed = .registry_full };
     };
     return .{ .loaded = handle };
-}
-
-fn eventKind(event: anytype) runtime.RuntimeEventKind {
-    return switch (event) {
-        .key_press => .key_press,
-        .winsize => .winsize,
-        .user_msg => .user_msg,
-        .mouse => .mouse,
-        .focus_in => .focus_in,
-        .focus_out => .focus_out,
-        .paste_start => .paste,
-        .paste_end => .paste,
-        .frame => .frame,
-        .frame_canceled => .frame,
-        .resize_pending => .winsize,
-        .continue_effect_drain => .user_msg,
-    };
-}
-
-fn timingStart(enabled: bool, io: std.Io) u64 {
-    return if (enabled) timestampNs(io) else 0;
-}
-
-fn timingElapsed(start_ns: u64, io: std.Io) u64 {
-    return elapsedNs(start_ns, timestampNs(io));
-}
-
-fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
-    return deltaNs(start_ns, end_ns);
-}
-
-fn trace(opts: types.RunOptions, event: runtime.TraceEvent) void {
-    if (opts.runtime.trace_fn) |trace_fn| {
-        trace_fn(opts.runtime.trace_context, event);
-    }
 }
 
 fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
@@ -1602,77 +1386,84 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
     };
     const TestApp = struct {
         update_count: usize = 0,
+        skip: bool,
 
         pub const Msg = TestMsg;
 
         pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
             self.update_count += 1;
             switch (msg) {
-                .first => _ = try ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed }),
-                .second => {},
+                .first => {
+                    if (self.skip) ctx.redraw().skip();
+                    _ = try ctx.task().spawn(.{ .run = Task.run, .failed = Task.failed });
+                },
+                .second => ctx.redraw().skip(),
             }
         }
     };
     const Event = InternalEvent(TestMsg);
 
-    var app: TestApp = .{};
-    var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
-    var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
-    var tasks = TaskRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
-    defer tasks.join(app_ctx.requests);
-    var timers = TimerRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
-    defer timers.shutdown();
-    var completions: RuntimeCompletionBuffer(TestMsg) = .{};
-    try completions.init(std.testing.allocator);
-    defer completions.deinitUndelivered(std.testing.allocator);
-    try completions.append(.first);
-    var terminal_images: terminal_image.Registry = .{};
-    defer terminal_images.deinit(std.testing.allocator);
-    var tty_buffer: [64]u8 = undefined;
-    var tty = try vaxis.Tty.init(std.testing.io, &tty_buffer);
-    defer tty.deinit();
-    var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
-    while (try loop.tryPostEvent(.continue_effect_drain)) {}
-    var suspended: std.atomic.Value(bool) = .init(false);
-    var shutting_down: std.atomic.Value(bool) = .init(false);
-    var frames = FrameRuntime(TestMsg).init(std.testing.io);
-    defer frames.shutdown();
-    var continuation_pending = false;
-    var stats: ?runtime.RuntimeStats = null;
+    for ([_]bool{ false, true }) |skip| {
+        var app: TestApp = .{ .skip = skip };
+        var app_ctx_requests = requests_mod.Requests(TestMsg).init(std.testing.allocator, std.testing.io);
+        var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
+        var tasks = TaskRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
+        defer tasks.join(app_ctx.requests);
+        var timers = TimerRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
+        defer timers.shutdown();
+        var completions: RuntimeCompletionBuffer(TestMsg) = .{};
+        try completions.init(std.testing.allocator);
+        defer completions.deinitUndelivered(std.testing.allocator);
+        try completions.append(.first);
+        var terminal_images: terminal_image.Registry = .{};
+        defer terminal_images.deinit(std.testing.allocator);
+        var tty_buffer: [64]u8 = undefined;
+        var tty = try vaxis.Tty.init(std.testing.io, &tty_buffer);
+        defer tty.deinit();
+        var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
+        while (try loop.tryPostEvent(.continue_effect_drain)) {}
+        var suspended: std.atomic.Value(bool) = .init(false);
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var frames = FrameRuntime(TestMsg).init(std.testing.io);
+        defer frames.shutdown();
+        var continuation_pending = false;
+        var stats: ?runtime.RuntimeStats = null;
 
-    _ = try drainPendingEffects(
-        TestApp,
-        &app,
-        &app_ctx,
-        &tasks,
-        &timers,
-        &completions,
-        &terminal_images,
-        undefined,
-        &tty,
-        std.testing.failing_allocator,
-        std.testing.io,
-        &loop,
-        &suspended,
-        &shutting_down,
-        &frames,
-        &continuation_pending,
-        &stats,
-        .{
-            .enabled = false,
-            .coordinate_protocol = .cell_sgr,
-        },
-        undefined, // no foreground command is queued in this drain test
-        .{ .runtime = .{
-            .allocator = std.testing.allocator,
-            .io = std.testing.io,
-        }, .terminal = .{ .env_map = undefined } },
-    );
+        const result = try drainPendingEffects(
+            TestApp,
+            &app,
+            &app_ctx,
+            &tasks,
+            &timers,
+            &completions,
+            &terminal_images,
+            undefined,
+            &tty,
+            std.testing.failing_allocator,
+            std.testing.io,
+            &loop,
+            &suspended,
+            &shutting_down,
+            &frames,
+            &continuation_pending,
+            &stats,
+            .{
+                .enabled = false,
+                .coordinate_protocol = .cell_sgr,
+            },
+            undefined, // no foreground command is queued in this drain test
+            .{ .runtime = .{
+                .allocator = std.testing.allocator,
+                .io = std.testing.io,
+            }, .terminal = .{ .env_map = undefined } },
+        );
 
-    try std.testing.expectEqual(@as(usize, 2), app.update_count);
-    try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app_ctx.requests.detachTasks().len);
-    drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
+        try std.testing.expectEqual(!skip, result.needs_render);
+        try std.testing.expectEqual(@as(usize, 2), app.update_count);
+        try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app_ctx.requests.detachTasks().len);
+        drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
+    }
 }
 
 test "clipboard detached suffix survives reentrant update and is freed on update error" {
@@ -1944,116 +1735,6 @@ test "runtime completion update error remains app-owned" {
     try std.testing.expect(app.retained != null);
     try std.testing.expectEqual(@as(usize, 0), deinit_count);
     try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
-}
-
-test "BracketedPasteAccumulator combines pasted key text" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = "hello" });
-    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.enter });
-    try paste.appendKey(allocator, .{ .codepoint = '世', .text = "世界" });
-
-    const text = paste.finish(allocator).?;
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("hello\r世界", text);
-}
-
-test "BracketedPasteAccumulator restarts nested paste" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "old" });
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = 'n', .text = "new" });
-
-    const text = paste.finish(allocator).?;
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("new", text);
-}
-
-test "BracketedPasteAccumulator ignores non-text special keys" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.up });
-    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.left_shift });
-
-    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
-}
-
-test "BracketedPasteAccumulator drops invalid utf8" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    var invalid = [_]u8{0xff};
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = vaxis.Key.multicodepoint, .text = invalid[0..] });
-
-    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
-}
-
-test "BracketedPasteAccumulator failure swallows until paste end" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    paste.fail();
-    try paste.appendKey(allocator, .{ .codepoint = 't', .text = "tail" });
-
-    try std.testing.expect(paste.active);
-    try std.testing.expect(paste.failed);
-    try std.testing.expectEqual(@as(?[]u8, null), paste.finish(allocator));
-    try std.testing.expect(!paste.active);
-    try std.testing.expect(!paste.failed);
-}
-
-test "BracketedPasteAccumulator maps ctrl-j paste key to newline" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
-    try paste.appendKey(allocator, .{ .codepoint = 'j', .mods = .{ .ctrl = true } });
-    try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
-
-    const text = paste.finish(allocator).?;
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("aaaaa\nbbbbb", text);
-}
-
-test "BracketedPasteAccumulator preserves direct line-feed codepoint" {
-    const allocator = std.testing.allocator;
-    var paste: BracketedPasteAccumulator = .{};
-    defer paste.deinit(allocator);
-
-    paste.start();
-    try paste.appendKey(allocator, .{ .codepoint = 'a', .text = "aaaaa" });
-    try paste.appendKey(allocator, .{ .codepoint = '\n' });
-    try paste.appendKey(allocator, .{ .codepoint = 'b', .text = "bbbbb" });
-
-    const text = paste.finish(allocator).?;
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("aaaaa\nbbbbb", text);
-}
-
-test "elapsedNs uses deltaNs clamping" {
-    try std.testing.expectEqual(@as(u64, 5), elapsedNs(10, 15));
-    try std.testing.expectEqual(@as(u64, 0), elapsedNs(10, 9));
-}
-
-test "timingStart returns zero when timing is disabled" {
-    const io: std.Io = undefined;
-    try std.testing.expectEqual(@as(u64, 0), timingStart(false, io));
 }
 
 fn foregroundCommandProgramTestFdOpen(fd: std.Io.Dir.Handle) bool {
@@ -2968,4 +2649,5 @@ test "foreground restore failures at every byte never replay the kitty push" {
 test {
     _ = @import("program/timers.zig");
     _ = frame_mod;
+    _ = events_mod;
 }

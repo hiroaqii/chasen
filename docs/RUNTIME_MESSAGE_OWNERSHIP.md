@@ -98,6 +98,13 @@ markers and owns the temporary buffer for that one dispatch. Chasen pins a
 libvaxis revision whose parser also frees the decode buffer when malformed
 base64 fails before an event can be constructed.
 
+The internal `Events` owner retains bracketed-paste bytes until synchronous
+`handleEvent` and any resulting `update` return, including errors. An app must
+copy text it wants to keep beyond that dispatch. Failed accumulation swallows
+the remaining paste keys through the end marker; foreground handoff cancels
+an unfinished paste. The shared message-dispatch helper never destroys a Msg
+after transferring it to `update`.
+
 Clipboard writes have a separate correlation contract. `copyToClipboard`
 returns an opaque `ClipboardCopyRequestId`, and its completion repeats that id.
 The runtime copies and owns queued text until the OSC 52 write is drained, but it

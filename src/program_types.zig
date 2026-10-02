@@ -161,3 +161,38 @@ pub fn postPlainUntilShutdown(
         io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake) catch return;
     }
 }
+
+// Shared synchronous observation helpers; no runtime owner is borrowed.
+fn timestampNs(io: std.Io) u64 {
+    const ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    if (ns <= 0) return 0;
+    return std.math.lossyCast(u64, ns);
+}
+
+pub fn timingStart(enabled: bool, io: std.Io) u64 {
+    return if (enabled) timestampNs(io) else 0;
+}
+
+pub fn timingElapsed(start_ns: u64, io: std.Io) u64 {
+    return elapsedNs(start_ns, timestampNs(io));
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    return if (end_ns >= start_ns) end_ns - start_ns else 0;
+}
+
+pub fn trace(opts: RunOptions, event: runtime.TraceEvent) void {
+    if (opts.runtime.trace_fn) |trace_fn| {
+        trace_fn(opts.runtime.trace_context, event);
+    }
+}
+
+test "elapsedNs uses deltaNs clamping" {
+    try std.testing.expectEqual(@as(u64, 5), elapsedNs(10, 15));
+    try std.testing.expectEqual(@as(u64, 0), elapsedNs(10, 9));
+}
+
+test "timingStart returns zero when timing is disabled" {
+    const io: std.Io = undefined;
+    try std.testing.expectEqual(@as(u64, 0), timingStart(false, io));
+}

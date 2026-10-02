@@ -55,6 +55,10 @@ If `handleEvent` returns `null`, Chasen does not call `update` and does not
 redraw for that event. Resize is the exception: terminal resize always redraws
 so the screen buffer matches the new terminal size.
 
+Internally, `Events` owns bracketed-paste accumulation and the shared synchronous
+`handleEvent`/`update` path. Each message resets redraw suppression before update;
+an update error still leaves its message owned by the app.
+
 ## Input and Messages
 
 `handleEvent` separates raw terminal input from application state transitions.
