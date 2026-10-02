@@ -11,12 +11,15 @@ const InternalEvent = types.InternalEvent;
 const RuntimeCompletionBuffer = types.RuntimeCompletionBuffer;
 const TaskRuntime = @import("program/tasks.zig").TaskRuntime;
 const TimerRuntime = @import("program/timers.zig").TimerRuntime;
+const frame_mod = @import("program/frame.zig");
+const FrameRuntime = frame_mod.FrameRuntime;
+const timestampNs = frame_mod.timestampNs;
+const deltaNs = frame_mod.deltaNs;
 const terminal_image = @import("terminal_image.zig");
 const terminal_mouse = @import("terminal_mouse.zig");
 const foreground_job = @import("foreground_job.zig");
 const foreground_command = @import("foreground_command.zig");
 
-const frame_interval_ns: u64 = std.time.ns_per_s / 60;
 const resize_poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 const max_effect_drain_rounds: usize = 8;
 
@@ -254,34 +257,6 @@ fn pasteControlText(key: vaxis.Key) ?[]const u8 {
     };
 }
 
-/// Sleeps until the next frame slot then posts a frame event.
-fn FrameHelper(comptime Msg: type) type {
-    const Event = InternalEvent(Msg);
-    return struct {
-        fn run(
-            after_ns: u64,
-            last_frame_ns: u64,
-            index: u64,
-            frame_io: std.Io,
-            loop_ptr: *vaxis.Loop(Event),
-            suspended: *std.atomic.Value(bool),
-            shutting_down: *const std.atomic.Value(bool),
-        ) void {
-            frame_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
-            if (suspended.load(.seq_cst)) {
-                types.postPlainUntilShutdown(Msg, .frame_canceled, frame_io, loop_ptr, shutting_down);
-                return;
-            }
-            const now_ns = timestampNs(frame_io);
-            types.postPlainUntilShutdown(Msg, .{ .frame = .{
-                .now_ns = now_ns,
-                .delta_ns = deltaNs(last_frame_ns, now_ns),
-                .index = index,
-            } }, frame_io, loop_ptr, shutting_down);
-        }
-    };
-}
-
 const RenderTimings = struct {
     view_ns: u64 = 0,
     render_ns: u64 = 0,
@@ -387,10 +362,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     var app_ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
     defer app_ctx_requests.deinit();
     var app_ctx = ctx_mod.Ctx(Msg).init(&app_ctx_requests);
-    var frame_in_flight = false;
-    var frame_future: ?std.Io.Future(void) = null;
-    var last_frame_ns = timestampNs(io);
-    var next_frame_index: u64 = 0;
+    var frames = FrameRuntime(Msg).init(io);
     var runtime_suspended: std.atomic.Value(bool) = .init(false);
     var runtime_shutting_down: std.atomic.Value(bool) = .init(false);
     var bracketed_paste: BracketedPasteAccumulator = .{};
@@ -417,7 +389,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         &tasks,
         &timers,
         &runtime_completions,
-        &frame_future,
+        &frames,
         &loop,
         allocator,
         io,
@@ -449,7 +421,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
         var init_stats: ?runtime.RuntimeStats = null;
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &init_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -466,7 +438,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &initial_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -536,22 +508,10 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
             .frame => |frame| {
                 frame_count += 1;
                 if (stats) |*s| s.frame_count = frame_count;
-                if (frame_future) |*f| {
-                    _ = f.await(io);
-                    frame_future = null;
-                }
-                frame_in_flight = false;
-                last_frame_ns = frame.now_ns;
-                next_frame_index = frame.index + 1;
-                needs_render = try dispatchAppEvent(App, &app, .{ .frame = frame }, &app_ctx, io, &stats, opts);
+                needs_render = try dispatchAppEvent(App, &app, .{ .frame = frames.receiveFrame(frame) }, &app_ctx, io, &stats, opts);
             },
             .frame_canceled => {
-                if (frame_future) |*f| {
-                    _ = f.await(io);
-                    frame_future = null;
-                }
-                frame_in_flight = false;
-                app_ctx.frame().request();
+                frames.receiveCanceled(app_ctx.requests);
                 if (stats) |*s| s.event_kind = .frame;
             },
             .continue_effect_drain => {
@@ -577,7 +537,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, &terminal_modes, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &stats, mouse_policy, &terminal_modes, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -611,7 +571,7 @@ fn shutdownRuntime(
     tasks: *TaskRuntime(App.Msg),
     timers: *TimerRuntime(App.Msg),
     runtime_completions: *RuntimeCompletionBuffer(App.Msg),
-    frame_future: *?std.Io.Future(void),
+    frames: *FrameRuntime(App.Msg),
     loop: *vaxis.Loop(InternalEvent(App.Msg)),
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -629,10 +589,7 @@ fn shutdownRuntime(
     // existing reader future interrupts both tty reads and queue waits.
     stopLoopAndDrain(App.Msg, loop, allocator, io);
 
-    if (frame_future.*) |*future| {
-        _ = future.cancel(io);
-        frame_future.* = null;
-    }
+    frames.shutdown();
 
     timers.shutdown();
 
@@ -942,11 +899,8 @@ fn drainPendingEffects(
     loop: *vaxis.Loop(InternalEvent(App.Msg)),
     suspended: *std.atomic.Value(bool),
     shutting_down: *const std.atomic.Value(bool),
-    frame_in_flight: *bool,
-    frame_future: *?std.Io.Future(void),
+    frames: *FrameRuntime(App.Msg),
     effect_drain_continuation_pending: *bool,
-    last_frame_ns: u64,
-    next_frame_index: u64,
     stats: *?runtime.RuntimeStats,
     mouse_policy: terminal_mouse.Policy,
     terminal_modes: *TerminalModes,
@@ -967,7 +921,7 @@ fn drainPendingEffects(
         timers.startTicks(app_ctx.requests, loop, shutting_down);
         timers.startEvery(app_ctx.requests, loop, suspended, shutting_down);
         try processPendingTerminalImages(Msg, app_ctx, runtime_completions, terminal_images, vx, tty.writer(), allocator, opts);
-        startPendingFrame(Msg, app_ctx, io, loop, suspended, shutting_down, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
+        frames.startRequested(app_ctx.requests, loop, suspended, shutting_down);
 
         const has_follow_up = runtime_completions.items.items.len > 0 or
             app_ctx.requests.hasPendingForegroundCommands() or
@@ -1140,30 +1094,6 @@ fn runForegroundCommand(
     return outcome;
 }
 
-fn startPendingFrame(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    suspended: *std.atomic.Value(bool),
-    shutting_down: *const std.atomic.Value(bool),
-    frame_in_flight: *bool,
-    frame_future: *?std.Io.Future(void),
-    last_frame_ns: u64,
-    next_frame_index: u64,
-) void {
-    if (!app_ctx.requests.takeFrameRequest()) return;
-
-    if (frame_in_flight.*) return;
-
-    const after_ns = frameDelayNs(last_frame_ns, timestampNs(io));
-    frame_future.* = io.concurrent(
-        FrameHelper(Msg).run,
-        .{ after_ns, last_frame_ns, next_frame_index, io, loop, suspended, shutting_down },
-    ) catch return;
-    frame_in_flight.* = true;
-}
-
 fn processPendingTerminalImages(
     comptime Msg: type,
     app_ctx: *ctx_mod.Ctx(Msg),
@@ -1232,21 +1162,6 @@ fn loadTerminalImagePath(
         return .{ .failed = .registry_full };
     };
     return .{ .loaded = handle };
-}
-
-fn timestampNs(io: std.Io) u64 {
-    const ns = std.Io.Clock.now(.awake, io).nanoseconds;
-    if (ns <= 0) return 0;
-    return std.math.lossyCast(u64, ns);
-}
-
-fn deltaNs(previous_ns: u64, now_ns: u64) u64 {
-    if (now_ns <= previous_ns) return 0;
-    return now_ns - previous_ns;
-}
-
-fn frameDelayNs(last_frame_ns: u64, now_ns: u64) u64 {
-    return frame_interval_ns -| deltaNs(last_frame_ns, now_ns);
 }
 
 fn eventKind(event: anytype) runtime.RuntimeEventKind {
@@ -1428,7 +1343,7 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
             release.set(io);
         }
         var timers = TimerRuntime(Msg).init(allocator, io);
-        var frame: ?std.Io.Future(void) = null;
+        var frame = FrameRuntime(Msg).init(io);
         shutdownRuntime(Task.App, &ctx, &tasks, &timers, &completions, &frame, &loop, allocator, io, &shutting_down);
         try std.testing.expect(ctx.requests._task_runtime == null);
         try std.testing.expectEqual(@as(usize, 1), slow.count.load(.acquire));
@@ -1720,8 +1635,8 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
     while (try loop.tryPostEvent(.continue_effect_drain)) {}
     var suspended: std.atomic.Value(bool) = .init(false);
     var shutting_down: std.atomic.Value(bool) = .init(false);
-    var frame_in_flight = false;
-    var frame_future: ?std.Io.Future(void) = null;
+    var frames = FrameRuntime(TestMsg).init(std.testing.io);
+    defer frames.shutdown();
     var continuation_pending = false;
     var stats: ?runtime.RuntimeStats = null;
 
@@ -1740,11 +1655,8 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         &loop,
         &suspended,
         &shutting_down,
-        &frame_in_flight,
-        &frame_future,
+        &frames,
         &continuation_pending,
-        0,
-        0,
         &stats,
         .{
             .enabled = false,
@@ -2132,27 +2044,6 @@ test "BracketedPasteAccumulator preserves direct line-feed codepoint" {
     const text = paste.finish(allocator).?;
     defer allocator.free(text);
     try std.testing.expectEqualStrings("aaaaa\nbbbbb", text);
-}
-
-test "FrameHelper instantiation" {
-    const TestMsg = union(enum) { hello };
-    const Helper = FrameHelper(TestMsg);
-    const RunFn = @TypeOf(Helper.run);
-    try std.testing.expect(RunFn != void);
-}
-
-test "deltaNs clamps non-monotonic timestamps" {
-    try std.testing.expectEqual(@as(u64, 5), deltaNs(10, 15));
-    try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 10));
-    try std.testing.expectEqual(@as(u64, 0), deltaNs(10, 9));
-}
-
-test "frameDelayNs paces relative to last delivered frame" {
-    try std.testing.expectEqual(frame_interval_ns, frameDelayNs(100, 100));
-    try std.testing.expectEqual(frame_interval_ns - 5, frameDelayNs(100, 105));
-    try std.testing.expectEqual(@as(u64, 0), frameDelayNs(100, 100 + frame_interval_ns));
-    try std.testing.expectEqual(@as(u64, 0), frameDelayNs(100, 101 + frame_interval_ns));
-    try std.testing.expectEqual(frame_interval_ns, frameDelayNs(100, 99));
 }
 
 test "elapsedNs uses deltaNs clamping" {
@@ -3076,4 +2967,5 @@ test "foreground restore failures at every byte never replay the kitty push" {
 
 test {
     _ = @import("program/timers.zig");
+    _ = frame_mod;
 }

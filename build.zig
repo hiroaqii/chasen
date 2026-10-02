@@ -117,6 +117,8 @@ pub fn build(b: *std.Build) void {
 
         const anim_transition_exe = b.addExecutable(.{
             .name = "anim_transition",
+            .use_llvm = true,
+            .use_lld = if (target.result.os.tag == .linux) true else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("examples/anim_transition/main.zig"),
                 .target = target,

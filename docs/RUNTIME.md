@@ -196,6 +196,12 @@ instead of assuming an exact frame rate. If an app has been idle without
 frames, or if a foreground command interrupts a scheduled frame, the next
 delivered frame can include a large elapsed delta.
 
+Internally, `FrameRuntime` owns the single frame future and the delivered
+timestamp/index. Receiving a frame joins its producer before advancing that
+timeline. A frame canceled during foreground suspension is joined and requested
+again without advancing either value. Requests coalesce while a frame is in
+flight; start failure consumes the request, and shutdown cancels the producer.
+
 ## Clipboard
 
 Terminal clipboard writes use OSC 52 and are best-effort. A `.sent` result means
