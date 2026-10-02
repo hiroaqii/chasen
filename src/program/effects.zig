@@ -12,6 +12,7 @@ const FrameRuntime = @import("frame.zig").FrameRuntime;
 const TerminalSession = @import("terminal_session.zig").TerminalSession;
 const TerminalEffects = @import("terminal_effects.zig").TerminalEffects;
 const terminal_image = @import("../terminal_image.zig");
+const foreground_command = @import("../foreground_command.zig");
 const applyMsg = @import("events.zig").applyMsg;
 const drainInternalEventsForShutdown = @import("terminal_session.zig").drainInternalEventsForShutdown;
 
@@ -464,6 +465,7 @@ test "runtime completion update error remains app-owned" {
     };
 
     var deinit_count: usize = 0;
+    var suffix_deinit_count: usize = 0;
     var app: TestApp = .{};
     defer if (app.retained) |owned| std.testing.allocator.free(owned.bytes);
     var app_ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, std.testing.io);
@@ -473,6 +475,10 @@ test "runtime completion update error remains app-owned" {
     try effects.completions.append(.{ .owned = .{
         .bytes = try std.testing.allocator.dupe(u8, "update-error-completion"),
         .deinit_count = &deinit_count,
+    } });
+    try effects.completions.append(.{ .owned = .{
+        .bytes = try std.testing.allocator.dupe(u8, "unapplied-suffix"),
+        .deinit_count = &suffix_deinit_count,
     } });
     var stats: ?runtime.RuntimeStats = null;
 
@@ -492,5 +498,216 @@ test "runtime completion update error remains app-owned" {
 
     try std.testing.expect(app.retained != null);
     try std.testing.expectEqual(@as(usize, 0), deinit_count);
+    try std.testing.expectEqual(@as(usize, 1), suffix_deinit_count);
     try std.testing.expectEqual(@as(usize, 0), effects.completions.items.items.len);
+}
+
+test "effect coordination preserves stage order and callback admission" {
+    const Harness = struct {
+        const Stage = enum { completion, foreground, clipboard, task, cancel, tick, every, image, frame };
+        const Message = enum {
+            completion,
+            foreground,
+            clipboard,
+            noop,
+            pub const undelivered_policy = .plain;
+        };
+        const State = struct {
+            requests: *requests_mod.Requests(Message),
+            log: [9]Stage = undefined,
+            len: usize = 0,
+            fn record(self: *@This(), stage: Stage) void {
+                std.debug.assert(self.len < self.log.len);
+                self.log[self.len] = stage;
+                self.len += 1;
+            }
+        };
+        const App = struct {
+            pub const Msg = Message;
+            state: *State,
+            pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+                switch (msg) {
+                    .completion => {
+                        self.state.record(.completion);
+                        _ = try ctx.terminal().runForegroundCommand(.{ .argv = &.{"unused-in-test"}, .finished = foreground });
+                    },
+                    .foreground => {
+                        self.state.record(.foreground);
+                        _ = try ctx.terminal().copyToClipboard(.{ .text = "stage", .finished = clipboard });
+                    },
+                    .clipboard => {
+                        self.state.record(.clipboard);
+                        _ = try ctx.task().spawnOwned(self.state, .{ .run = taskRun, .failed = taskFailed, .cleanup = taskCleanup });
+                        try ctx.timer().cancel("old");
+                        try ctx.timer().tick("tick", 100, .noop);
+                        try ctx.timer().every("every", 200, .noop);
+                        _ = try ctx.image().loadPath("stage.png", imageLoaded, imageFailed);
+                        ctx.frame().request();
+                    },
+                    .noop => {},
+                }
+            }
+            fn foreground(_: foreground_command.ForegroundCommandResult) Msg {
+                return .foreground;
+            }
+            fn clipboard(_: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
+                return .clipboard;
+            }
+            fn taskRun(_: *State, _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!Msg {
+                unreachable;
+            }
+            fn taskFailed(state: *State, _: ctx_mod.TaskStartError, _: std.mem.Allocator) Msg {
+                state.record(.task);
+                return .noop;
+            }
+            fn taskCleanup(_: *State, _: std.mem.Allocator) void {}
+            fn imageLoaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) Msg {
+                unreachable;
+            }
+            fn imageFailed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) Msg {
+                return .noop;
+            }
+        };
+        // Exercise the real owners through std.Io's existing admission/cancel seam.
+        // No producers start; the old timer's synthetic Future records its join.
+        const Admission = struct {
+            state: *State,
+            frame: bool = false,
+            fn concurrent(userdata: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+                const self: *@This() = @ptrCast(@alignCast(userdata.?));
+                const requests = self.state.requests;
+                if (self.frame) {
+                    self.state.record(.frame);
+                } else {
+                    // The active stage must detach only its own batch. This
+                    // distinguishes tick/every even though both starts fail.
+                    std.debug.assert(requests._pending_ticks_len == 0);
+                    self.state.record(if (requests._pending_everys_len == 1) .tick else .every);
+                }
+                return error.ConcurrencyUnavailable;
+            }
+            fn cancel(userdata: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
+                const self: *@This() = @ptrCast(@alignCast(userdata.?));
+                self.state.record(.cancel);
+            }
+            fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                return .zero;
+            }
+        };
+        fn imageLoad(userdata: ?*anyopaque, _: *terminal_image.LoaderVaxis, _: *std.Io.Writer, _: std.mem.Allocator, _: []const u8) terminal_image.PathLoadError!terminal_image.LoaderImage {
+            const state: *State = @ptrCast(@alignCast(userdata.?));
+            state.record(.image);
+            return error.Unsupported;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const TestMsg = Harness.Message;
+    var requests = requests_mod.Requests(TestMsg).init(allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(TestMsg).init(&requests);
+    var state: Harness.State = .{ .requests = &requests };
+    var app: Harness.App = .{ .state = &state };
+    var timer_admission: Harness.Admission = .{ .state = &state };
+    var frame_admission: Harness.Admission = .{ .state = &state, .frame = true };
+    var vtable = std.testing.io.vtable.*;
+    vtable.concurrent = Harness.Admission.concurrent;
+    vtable.cancel = Harness.Admission.cancel;
+    vtable.now = Harness.Admission.now;
+    var timers = TimerRuntime(TestMsg).init(allocator, .{ .vtable = &vtable, .userdata = &timer_admission });
+    defer timers.shutdown();
+    try timers.running.append(allocator, .{
+        .id = try allocator.dupe(u8, "old"),
+        .future = .{ .any_future = @ptrCast(&timer_admission), .result = {} },
+    });
+    var frames = FrameRuntime(TestMsg).init(.{ .vtable = &vtable, .userdata = &frame_admission });
+    defer frames.shutdown();
+    var tasks = TaskRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
+    defer tasks.join(&requests);
+    var effects = try Effects(TestMsg).init(allocator);
+    defer effects.deinit(allocator);
+    try effects.completions.append(.completion);
+    var env: std.process.Environ.Map = .init(allocator);
+    defer env.deinit();
+    var terminal: TerminalSession(TestMsg) = undefined;
+    try terminal.init(allocator, std.testing.io, .{ .env_map = &env });
+    defer terminal.deinit();
+    var terminal_effects: TerminalEffects = .{};
+    defer terminal_effects.deinit(&terminal);
+    var shutting_down: std.atomic.Value(bool) = .init(false);
+    var stats: ?runtime.RuntimeStats = null;
+    _ = try effects.drain(Harness.App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutting_down, &frames, &stats, .{
+        .runtime = .{ .allocator = allocator, .io = std.testing.io },
+        .terminal = .{ .env_map = &env, .image_path_loader = Harness.imageLoad, .image_loader_context = &state },
+    });
+    try std.testing.expectEqualSlices(Harness.Stage, &.{ .completion, .foreground, .clipboard, .task, .cancel, .tick, .every, .image, .frame }, state.log[0..state.len]);
+    try std.testing.expectEqual(@as(usize, 0), effects.completions.items.items.len);
+    try std.testing.expect(!effects.continuation_pending);
+}
+
+test "effect coordination yields after eight rounds and coalesces wakes on empty or full queue" {
+    const App = struct {
+        count: usize = 0,
+        pub const Msg = enum {
+            copied,
+            pub const undelivered_policy = .plain;
+        };
+        fn finished(_: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
+            return .copied;
+        }
+        pub fn update(self: *@This(), _: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.count += 1;
+            ctx.redraw().skip();
+            if (self.count < 17) _ = try ctx.terminal().copyToClipboard(.{ .text = "follow-up", .finished = finished });
+        }
+    };
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |full_queue| {
+        var requests = requests_mod.Requests(App.Msg).init(allocator, std.testing.io);
+        defer requests.deinit();
+        var ctx = ctx_mod.Ctx(App.Msg).init(&requests);
+        _ = try ctx.terminal().copyToClipboard(.{ .text = "first", .finished = App.finished });
+        var effects = try Effects(App.Msg).init(allocator);
+        defer effects.deinit(allocator);
+        var tasks = TaskRuntime(App.Msg).init(allocator, std.testing.io);
+        defer tasks.join(&requests);
+        var timers = TimerRuntime(App.Msg).init(allocator, std.testing.io);
+        defer timers.shutdown();
+        var frames = FrameRuntime(App.Msg).init(std.testing.io);
+        defer frames.shutdown();
+        var env: std.process.Environ.Map = .init(allocator);
+        defer env.deinit();
+        var terminal: TerminalSession(App.Msg) = undefined;
+        try terminal.init(allocator, std.testing.io, .{ .env_map = &env });
+        defer terminal.deinit();
+        var terminal_effects: TerminalEffects = .{};
+        defer terminal_effects.deinit(&terminal);
+        if (full_queue) while (try terminal.loop.tryPostEvent(.focus_in)) {};
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var stats: ?runtime.RuntimeStats = null;
+        var app: App = .{};
+        const opts: types.RunOptions = .{ .runtime = .{ .allocator = allocator, .io = std.testing.io }, .terminal = .{ .env_map = &env } };
+        const first = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutting_down, &frames, &stats, opts);
+        try std.testing.expect(!first.needs_render);
+        try std.testing.expectEqual(@as(usize, 8), app.count);
+        try std.testing.expect(requests.hasPendingClipboardCopies());
+        try std.testing.expectEqual(!full_queue, effects.continuation_pending);
+        if (full_queue) {
+            // Queued input itself guarantees another turn. A subsequent pass
+            // can enqueue a wake after this queue drains.
+            try std.testing.expect((try terminal.loop.tryEvent()).? == .focus_in);
+            drainInternalEventsForShutdown(App.Msg, &terminal.loop, allocator);
+        }
+        _ = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutting_down, &frames, &stats, opts);
+        try std.testing.expectEqual(@as(usize, 16), app.count);
+        try std.testing.expect(effects.continuation_pending);
+        try std.testing.expect((try terminal.loop.tryEvent()).? == .continue_effect_drain);
+        try std.testing.expectEqual(@as(?InternalEvent(App.Msg), null), try terminal.loop.tryEvent());
+        effects.receiveContinuation();
+        try std.testing.expect(!effects.continuation_pending);
+        _ = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutting_down, &frames, &stats, opts);
+        try std.testing.expectEqual(@as(usize, 17), app.count);
+        try std.testing.expect(!requests.hasPendingClipboardCopies());
+        try std.testing.expect(!effects.continuation_pending);
+        try std.testing.expectEqual(@as(?InternalEvent(App.Msg), null), try terminal.loop.tryEvent());
+    }
 }

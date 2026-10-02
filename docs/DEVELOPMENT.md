@@ -137,6 +137,8 @@ and [Authoring Components](AUTHORING_COMPONENTS.md#testing-surface-drawing).
 
 Live-task ownership tests live alongside `TaskRuntime` in `src/program/tasks.zig`.
 The root test entry imports that module and `program_types.zig` explicitly.
-Program retains the integration tests for shutdown notification before joining
-and task-start completions in bounded effect draining. The OSC 52 executable
+`program/effects.zig` contains completion ownership, stage ordering, and bounded
+drain tests, including coalesced wakes on full queues. Program imports these tests
+and retains integration coverage for shutdown notification before joining and
+init/effect error cleanup before App deinit. The OSC 52 executable
 imports the same `InternalEvent` from `program_types.zig` as the terminal runner.

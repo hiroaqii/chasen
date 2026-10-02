@@ -547,3 +547,71 @@ test "event resize forces render and Renderer keeps view paint trace order" {
     }
     try std.testing.expectEqual(@as(usize, 2), evidence.views);
 }
+
+test "Program init and effect errors clean pending owners before App deinit" {
+    const State = struct {
+        task_cleaned: usize = 0,
+        app_cleaned: usize = 0,
+        updates: usize = 0,
+    };
+    const App = struct {
+        state: *State,
+        fail_init: bool,
+        pub const Msg = enum {
+            copied,
+            pub const undelivered_policy = .plain;
+        };
+        pub fn init(self: *@This(), ctx: *ctx_mod.Ctx(Msg)) !void {
+            _ = try ctx.task().spawnOwned(self.state, .{ .run = taskRun, .failed = taskFailed, .cleanup = taskCleanup });
+            _ = try ctx.terminal().copyToClipboard(.{ .text = "old first", .finished = copied });
+            _ = try ctx.terminal().copyToClipboard(.{ .text = "old suffix", .finished = copied });
+            try ctx.timer().tick("pending", std.time.ns_per_s, .copied);
+            _ = try ctx.image().loadPath("pending.png", imageLoaded, imageFailed);
+            if (self.fail_init) return error.ExpectedInitFailure;
+        }
+        pub fn update(self: *@This(), _: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.state.updates += 1;
+            // Reentry uses fresh pending storage. The interrupted clipboard
+            // stage still owns its old suffix; shutdown owns this new request.
+            _ = try ctx.terminal().copyToClipboard(.{ .text = "new pending", .finished = copied });
+            return error.ExpectedEffectFailure;
+        }
+        pub fn view(_: *const @This(), _: *Surface) !void {
+            unreachable;
+        }
+        pub fn deinit(self: *@This(), _: runtime.AppDeinitContext) void {
+            std.debug.assert(self.state.task_cleaned == 1);
+            self.state.app_cleaned += 1;
+        }
+        fn copied(_: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
+            return .copied;
+        }
+        fn taskRun(_: *State, _: std.mem.Allocator, _: std.Io) std.Io.Cancelable!Msg {
+            unreachable;
+        }
+        fn taskFailed(_: *State, _: ctx_mod.TaskStartError, _: std.mem.Allocator) Msg {
+            unreachable;
+        }
+        fn taskCleanup(state: *State, _: std.mem.Allocator) void {
+            state.task_cleaned += 1;
+        }
+        fn imageLoaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) Msg {
+            unreachable;
+        }
+        fn imageFailed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) Msg {
+            unreachable;
+        }
+    };
+    for ([_]bool{ false, true }) |fail_init| {
+        var state: State = .{};
+        var env: std.process.Environ.Map = .init(std.testing.allocator);
+        defer env.deinit();
+        try std.testing.expectError(if (fail_init) error.ExpectedInitFailure else error.ExpectedEffectFailure, run(App, .{
+            .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .terminal = .{ .env_map = &env },
+        }, .{ .state = &state, .fail_init = fail_init }));
+        try std.testing.expectEqual(@as(usize, 1), state.task_cleaned);
+        try std.testing.expectEqual(@as(usize, 1), state.app_cleaned);
+        try std.testing.expectEqual(@as(usize, if (fail_init) 0 else 1), state.updates);
+    }
+}
