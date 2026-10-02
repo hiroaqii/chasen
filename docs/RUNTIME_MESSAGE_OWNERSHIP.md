@@ -88,6 +88,13 @@ before `App.deinit`:
 6. Clean remaining foreground/clipboard effects and run `App.deinit`, followed
    by terminal and image-registry cleanup.
 
+`TerminalSession` keeps the TTY, Vaxis, reader, resize thread, and suspension
+atomic at stable addresses. Setup errors stop the reader and release only
+initialized resources. Program retains the ordering of producer cancellation,
+queue drains, App cleanup, image cleanup, and terminal cleanup. Foreground
+effects map results into Msgs outside the session; a fatal terminal restore
+disposes the callback Msg as undelivered before unwinding the runtime.
+
 OSC 52 clipboard responses are a separate terminal-internal ownership case.
 Chasen exposes clipboard writes, not clipboard-read requests, and deliberately
 omits libvaxis' allocator-owning `.paste` field from its internal event union.

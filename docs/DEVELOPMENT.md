@@ -28,6 +28,13 @@ zig build check-anim_transition -Dchasen-anim-path=../chasen-anim
 
 ## OSC 52 Ownership Check
 
+Terminal lifecycle tests live in `src/program/terminal_session.zig`; foreground,
+clipboard, and image-effect tests remain alongside TerminalEffects in Program.
+Program imports the session test module. The session tests inject allocation failures
+and reuse the reader protocol to fail initial start, query restart, and mouse
+restart, checking cleanup and queued-message ownership. These unit tests do not
+replace the production OSC 52 check, Linux PTY gates, or native macOS tests.
+
 On Linux and macOS, `zig build test` includes an OSC 52 ownership regression
 check. It can also run independently without a terminal or `TMPDIR`:
 
@@ -123,8 +130,8 @@ For unit tests that queue effects without running the terminal, initialize
 `TestCtx` in place with `tc.init(std.testing.allocator, std.testing.io)` and defer
 `tc.deinit()`. Use observations for pending effects, `takeTask(index)` for an
 owned task handle, and `resetTransient()` for pending cleanup. Requests tests
-exercise production admission and batch ownership; Program tests cover reentrant
-clipboard draining and error cleanup, and the separate consumer test checks the
+exercise production admission and batch ownership; TerminalEffects tests cover
+reentrant clipboard draining and error cleanup, and the separate consumer test checks the
 public testing boundary. See [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md#tests-and-migration)
 and [Authoring Components](AUTHORING_COMPONENTS.md#testing-surface-drawing).
 

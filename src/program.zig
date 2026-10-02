@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const foreground_job = @import("foreground_job.zig");
+const foreground_command = @import("foreground_command.zig");
 const vaxis = @import("vaxis");
 const surface_mod = @import("surface.zig");
 const Surface = surface_mod.Surface;
@@ -21,138 +23,15 @@ const timingStart = types.timingStart;
 const timingElapsed = types.timingElapsed;
 const trace = types.trace;
 const terminal_image = @import("terminal_image.zig");
-const terminal_mouse = @import("terminal_mouse.zig");
-const foreground_job = @import("foreground_job.zig");
-const foreground_command = @import("foreground_command.zig");
+const terminal_session = @import("program/terminal_session.zig");
+const TerminalSession = terminal_session.TerminalSession;
+const drainInternalEventsForShutdown = terminal_session.drainInternalEventsForShutdown;
 
-const resize_poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 const max_effect_drain_rounds: usize = 8;
 
 const EffectDrainResult = struct {
     needs_render: bool = false,
 };
-
-fn ResizePollState(comptime Msg: type) type {
-    return struct {
-        const Self = @This();
-
-        tty: *vaxis.Tty,
-        loop: *vaxis.Loop(InternalEvent(Msg)),
-        sequence: std.atomic.Value(u32) = .init(0),
-        cells: std.atomic.Value(u32) = .init(0),
-        pixels: std.atomic.Value(u32) = .init(0),
-        pending: std.atomic.Value(bool) = .init(false),
-        stopping: std.atomic.Value(bool) = .init(false),
-        initial: ?vaxis.Winsize = null,
-
-        fn init(tty: *vaxis.Tty, loop: *vaxis.Loop(InternalEvent(Msg))) Self {
-            return .{ .tty = tty, .loop = loop };
-        }
-
-        fn seed(self: *Self, winsize: vaxis.Winsize) void {
-            self.initial = winsize;
-        }
-
-        /// Poll outside std.Io's bounded concurrency pool. This preserves the
-        /// supported concurrency-limit-1 configuration, where the vaxis tty
-        /// reader already owns the only std.Io concurrent slot.
-        fn run(self: *Self) void {
-            var last = self.initial;
-            while (!self.stopping.load(.acquire)) {
-                if (!sleepInterval()) return;
-                if (self.stopping.load(.acquire)) return;
-                const winsize = self.tty.getWinsize() catch continue;
-                if (last) |previous| {
-                    if (winsizeEqual(previous, winsize)) continue;
-                }
-                last = winsize;
-                self.publish(winsize);
-            }
-        }
-
-        fn stop(self: *Self) void {
-            self.stopping.store(true, .release);
-        }
-
-        /// Publish the latest dimensions from an ordinary polling thread.
-        ///
-        /// A small sequence lock gives the runtime a consistent pair of 32-bit
-        /// snapshots even on targets where atomic u64 is unavailable. The wake
-        /// does not wait for queue capacity: if the queue is full, an existing
-        /// event wakes the consumer, which checks `pending` before dispatch.
-        fn publish(self: *Self, winsize: vaxis.Winsize) void {
-            _ = self.sequence.fetchAdd(1, .acq_rel);
-            self.cells.store(packPair(winsize.rows, winsize.cols), .unordered);
-            self.pixels.store(packPair(winsize.x_pixel, winsize.y_pixel), .unordered);
-            _ = self.sequence.fetchAdd(1, .release);
-            self.pending.store(true, .release);
-            _ = self.loop.tryPostEvent(.resize_pending) catch false;
-        }
-
-        /// Consume one coalesced snapshot. A concurrent later signal either
-        /// becomes this snapshot or leaves `pending` set for the next turn.
-        fn takeLatest(self: *Self) ?vaxis.Winsize {
-            if (!self.pending.swap(false, .acquire)) return null;
-
-            while (true) {
-                const before = self.sequence.load(.acquire);
-                if (before & 1 != 0) {
-                    std.atomic.spinLoopHint();
-                    continue;
-                }
-                const cells = self.cells.load(.unordered);
-                const pixels = self.pixels.load(.unordered);
-                const after = self.sequence.load(.acquire);
-                if (before == after) {
-                    return .{
-                        .rows = unpackLow(cells),
-                        .cols = unpackHigh(cells),
-                        .x_pixel = unpackLow(pixels),
-                        .y_pixel = unpackHigh(pixels),
-                    };
-                }
-            }
-        }
-
-        fn packPair(low: u16, high: u16) u32 {
-            return @as(u32, low) | (@as(u32, high) << 16);
-        }
-
-        fn unpackLow(value: u32) u16 {
-            return @truncate(value);
-        }
-
-        fn unpackHigh(value: u32) u16 {
-            return @truncate(value >> 16);
-        }
-
-        fn winsizeEqual(lhs: vaxis.Winsize, rhs: vaxis.Winsize) bool {
-            return lhs.rows == rhs.rows and
-                lhs.cols == rhs.cols and
-                lhs.x_pixel == rhs.x_pixel and
-                lhs.y_pixel == rhs.y_pixel;
-        }
-
-        fn sleepInterval() bool {
-            switch (builtin.os.tag) {
-                .windows => return false,
-                else => {
-                    var duration: std.posix.timespec = .{
-                        .sec = 0,
-                        .nsec = @intCast(resize_poll_interval_ns),
-                    };
-                    while (true) {
-                        switch (std.posix.errno(std.posix.system.nanosleep(&duration, &duration))) {
-                            .SUCCESS => return true,
-                            .INTR => continue,
-                            else => return false,
-                        }
-                    }
-                },
-            }
-        }
-    };
-}
 
 const RenderTimings = struct {
     view_ns: u64 = 0,
@@ -210,85 +89,16 @@ const Renderer = struct {
 
 pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
-    const Event = InternalEvent(Msg);
     const allocator = opts.runtime.allocator;
     const io = opts.runtime.io;
 
-    // A fatal TTY restore may leave this thread in a background group. Keep
-    // final output/termios cleanup under one scoped SIGTTOU mask, including
-    // terminals whose original settings enable TOSTOP.
-    var teardown_mask = if (comptime foreground_job.supported) @as(?foreground_job.TtouMask, null) else {};
-    defer if (comptime foreground_job.supported) {
-        if (teardown_mask) |*mask| mask.restore() catch {};
-    };
-
-    // --- Terminal setup ---
-    var tty_buf: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(io, &tty_buf);
-    defer {
-        // Fatal handoff/restore can leave us in a background group. Final
-        // termios cleanup must not suspend the parent with SIGTTOU.
-        if (comptime foreground_job.supported) {
-            if (foreground_job.TtouMask.init()) |value| {
-                var mask = value;
-                tty.deinit();
-                mask.restore() catch {};
-            } else |_| tty.fd.close(io);
-        } else tty.deinit();
-    }
-
-    var vx = try vaxis.Vaxis.init(io, allocator, opts.terminal.env_map, .{
-        // libvaxis requires an allocator to decode OSC 52 responses. The
-        // InternalEvent type intentionally omits its `.paste` field, so
-        // libvaxis frees decoded text synchronously instead of queueing it.
-        .system_clipboard_allocator = allocator,
-    });
-    useUnicodeWidth(&vx);
-    var terminal_modes: TerminalModes = .{};
-    defer {
-        terminal_modes.cleanup(&vx, tty.writer());
-        vx.deinit(allocator, tty.writer());
-    }
-
-    var terminal_images: terminal_image.Registry = .{};
-    defer {
-        terminal_images.freeAll(vx, tty.writer());
-        terminal_images.deinit(allocator);
-    }
-
-    // --- Event loop setup ---
-    // Start the loop before querying the terminal. queryTerminal waits for
-    // terminal capability responses, which are read and processed by the loop.
-    var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
-    var mouse_reader = loopReader(&loop, io);
-    const mouse_policy: terminal_mouse.Policy = .{
-        .enabled = opts.terminal.mouse,
-        .coordinate_protocol = opts.terminal.mouse_coordinate_protocol,
-    };
-    try loop.start();
-    // Setup unwind uses the same cancellation-based reader stop as normal
-    // shutdown. It must not depend on allocating an additional worker after
-    // the tty producer has already started.
-    errdefer stopLoopAndDrain(Msg, &loop, allocator, io);
-
-    try vx.enterAltScreen(tty.writer());
-    try queryTerminal(&vx, tty.writer(), io, .fromSeconds(1), opts.terminal.keyboard_protocol, &terminal_modes, &loop);
-
-    // Bracketed paste belongs to Chasen's terminal ownership. It is enabled
-    // by default so apps can receive Event.paste instead of raw paste markers.
-    try vx.setBracketedPaste(tty.writer(), true);
-    defer {
-        _ = vx.setBracketedPaste(tty.writer(), false) catch {};
-    }
-
-    defer {
-        // This also covers setup errors before shutdownRuntime owns the loop.
-        // The reader must be stopped before every best-effort reset.
-        _ = mouse_policy.leaveWithReader(&vx, tty.writer(), &mouse_reader) catch {};
-    }
-    if (mouse_policy.enabled) {
-        try mouse_policy.enterWithReader(&vx, tty.writer(), &mouse_reader);
-    }
+    var terminal: TerminalSession(Msg) = undefined;
+    try terminal.init(allocator, io, opts.terminal);
+    defer terminal.deinit();
+    var terminal_effects: TerminalEffects = .{};
+    defer terminal_effects.deinit(&terminal);
+    try terminal.start();
+    defer terminal.stopInput();
 
     // --- Frame arena ---
     var renderer = Renderer.init(allocator);
@@ -309,7 +119,6 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     defer app_ctx_requests.deinit();
     var app_ctx = ctx_mod.Ctx(Msg).init(&app_ctx_requests);
     var frames = FrameRuntime(Msg).init(io);
-    var runtime_suspended: std.atomic.Value(bool) = .init(false);
     var runtime_shutting_down: std.atomic.Value(bool) = .init(false);
     var events = Events.init(allocator);
     defer events.deinit();
@@ -336,29 +145,14 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         &timers,
         &runtime_completions,
         &frames,
-        &loop,
+        &terminal,
         allocator,
-        io,
         &runtime_shutting_down,
     );
 
-    // POSIX signal callbacks cannot safely enter libvaxis' std.Io-mutex queue,
-    // even through tryPostEvent. For terminals without in-band resize, poll
-    // from an ordinary bounded-stack thread instead. It is intentionally not a
-    // std.Io concurrent task: the supported concurrency-limit-1 configuration
-    // already spends its only slot on the vaxis tty reader.
-    var resize_poll = ResizePollState(Msg).init(&tty, &loop);
-    const use_resize_poll = builtin.os.tag != .windows and !vx.state.in_band_resize;
-    var resize_thread: ?std.Thread = null;
-    defer if (resize_thread) |thread| {
-        resize_poll.stop();
-        thread.join();
-        resize_thread = null;
-    };
-
-    defer if (comptime foreground_job.supported) {
-        teardown_mask = foreground_job.TtouMask.init() catch null;
-    };
+    // Preserve the shutdown order: mask, polling join, producer barrier.
+    defer terminal.stopResizePolling();
+    defer terminal.beginTeardown();
 
     trace(opts, .startup);
 
@@ -367,39 +161,34 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
         var init_stats: ?runtime.RuntimeStats = null;
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &init_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_effects, &terminal, allocator, io, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &init_stats, opts);
         trace(opts, .effect_drain_end);
     }
 
     // Deliver the initial terminal size before the first render. Resize events
     // only arrive after the terminal changes, but apps often need the current
     // size for first-frame layout and scroll bounds.
-    if (tty.getWinsize()) |ws| {
-        resize_poll.seed(ws);
+    if (terminal.getWinsize()) |ws| {
+        terminal.seedResize(ws);
         var initial_stats: ?runtime.RuntimeStats = null;
         // Keep the vaxis screen size in sync before the first render. The app
         // also receives the winsize event below to initialize layout state.
-        try vx.resize(allocator, tty.writer(), ws);
-        useUnicodeWidth(&vx);
+        try terminal.resize(ws);
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &initial_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_effects, &terminal, allocator, io, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &initial_stats, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
     // Initial render
-    _ = try renderer.render(App, &vx, &terminal_images, &app, tty.writer(), io, false, opts);
+    _ = try renderer.render(App, &terminal.vx, &terminal_effects.images, &app, terminal.writer(), io, false, opts);
 
-    if (use_resize_poll) {
-        resize_thread = try std.Thread.spawn(.{
-            .allocator = allocator,
-        }, ResizePollState(Msg).run, .{&resize_poll});
-    }
+    try terminal.startResizePolling();
 
     // --- Main loop ---
     while (!app_ctx.shouldQuit()) {
-        const event = try loop.nextEvent();
+        const event = try terminal.loop.nextEvent();
         trace(opts, .event_received);
         event_count += 1;
         var needs_render = false;
@@ -416,7 +205,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
                 // terminal size; redraw().skip() only applies to app-driven messages.
-                needs_render = try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
+                needs_render = try applyTerminalResize(App, &terminal, &app, &app_ctx, io, &stats, opts, ws);
             },
             .user_msg => |msg| {
                 needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats, opts);
@@ -457,8 +246,8 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         // Polled updates are coalesced outside the bounded event queue. A
         // full queue can drop the wake but not the latest dimensions: popping
         // any existing event creates this opportunity to apply them.
-        if (resize_poll.takeLatest()) |ws| {
-            needs_render = try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
+        if (terminal.takeResize()) |ws| {
+            needs_render = try applyTerminalResize(App, &terminal, &app, &app_ctx, io, &stats, opts, ws);
         }
 
         // Process tasks, ticks, and everys spawned during update
@@ -469,13 +258,13 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &stats, mouse_policy, &terminal_modes, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_effects, &terminal, allocator, io, &runtime_shutting_down, &frames, &effect_drain_continuation_pending, &stats, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
 
         if (needs_render) {
-            const timings = try renderer.render(App, &vx, &terminal_images, &app, tty.writer(), io, stats_enabled, opts);
+            const timings = try renderer.render(App, &terminal.vx, &terminal_effects.images, &app, terminal.writer(), io, stats_enabled, opts);
             if (stats) |*s| {
                 s.view_ns = timings.view_ns;
                 s.render_ns = timings.render_ns;
@@ -504,9 +293,8 @@ fn shutdownRuntime(
     timers: *TimerRuntime(App.Msg),
     runtime_completions: *RuntimeCompletionBuffer(App.Msg),
     frames: *FrameRuntime(App.Msg),
-    loop: *vaxis.Loop(InternalEvent(App.Msg)),
+    terminal: *TerminalSession(App.Msg),
     allocator: std.mem.Allocator,
-    io: std.Io,
     shutting_down: *std.atomic.Value(bool),
 ) void {
     shutting_down.store(true, .seq_cst);
@@ -519,7 +307,8 @@ fn shutdownRuntime(
     // Do not call Loop.stop here: its DSR wake + await can block behind a full
     // queue or a terminal that does not answer the query. Canceling the
     // existing reader future interrupts both tty reads and queue waits.
-    stopLoopAndDrain(App.Msg, loop, allocator, io);
+    terminal.stopReader();
+    drainInternalEventsForShutdown(App.Msg, &terminal.loop, allocator);
 
     frames.shutdown();
 
@@ -530,88 +319,9 @@ fn shutdownRuntime(
     // futures settle so every `.posted` outcome reaches typed cleanup too.
     tasks.join(app_ctx.requests);
 
-    drainInternalEventsForShutdown(App.Msg, loop, allocator);
+    drainInternalEventsForShutdown(App.Msg, &terminal.loop, allocator);
     runtime_completions.deinitUndelivered(allocator);
     discardQueuedForegroundCommands(App.Msg, app_ctx, allocator);
-}
-
-/// Stop the input producer without allocating another concurrent task, then
-/// dispose every event that will no longer enter ordinary app dispatch.
-fn stopLoopAndDrain(
-    comptime Msg: type,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) void {
-    stopLoopReader(loop, io);
-    drainInternalEventsForShutdown(Msg, loop, allocator);
-}
-
-fn LoopReader(comptime Loop: type) type {
-    return struct {
-        loop: *Loop,
-        io: std.Io,
-
-        pub fn stop(self: *@This()) void {
-            stopLoopReader(self.loop, self.io);
-        }
-
-        pub fn start(self: *@This()) !void {
-            try self.loop.start();
-        }
-    };
-}
-
-fn loopReader(loop: anytype, io: std.Io) LoopReader(@TypeOf(loop.*)) {
-    return .{
-        .loop = loop,
-        .io = io,
-    };
-}
-
-/// Cancel the already-started vaxis reader future in place.
-///
-/// `vaxis.Loop.stop` wakes the tty with a device-status query and then awaits
-/// the reader. Chasen cannot use that blocking sequence when the reader may be
-/// waiting to push into a full event queue, and allocating a helper future at
-/// shutdown is not total for bounded or non-concurrent `std.Io` instances.
-/// `Future.cancel` instead interrupts both tty reads and queue condition waits,
-/// which are cancellation points in the supported concurrent Io contract.
-/// No second concurrency slot and no terminal DSR response are required.
-fn stopLoopReader(loop: anytype, io: std.Io) void {
-    loop.should_quit = true;
-    if (loop.thread) |*future| {
-        _ = future.cancel(io);
-        loop.thread = null;
-    }
-    loop.should_quit = false;
-}
-
-fn drainInternalEventsForShutdown(
-    comptime Msg: type,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    allocator: std.mem.Allocator,
-) void {
-    while (loop.tryEvent() catch null) |event| {
-        switch (event) {
-            .user_msg => |value| {
-                var msg = value;
-                runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-            },
-            else => {},
-        }
-    }
-}
-
-fn discardQueuedForegroundCommands(comptime Msg: type, app_ctx: *ctx_mod.Ctx(Msg), allocator: std.mem.Allocator) void {
-    var batch = app_ctx.requests.detachForegroundCommands();
-    defer batch.deinit();
-    while (batch.next()) |queued| {
-        var entry = queued;
-        var msg = entry.finished(.{ .request_id = entry.request_id, .outcome = .runtime_abandoned });
-        runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-        entry.deinit(allocator);
-    }
 }
 
 /// Apply one terminal-size snapshot and notify the application.
@@ -621,64 +331,18 @@ fn discardQueuedForegroundCommands(comptime Msg: type, app_ctx: *ctx_mod.Ctx(Msg
 /// code itself.
 fn applyTerminalResize(
     comptime App: type,
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
+    terminal: *TerminalSession(App.Msg),
     app: *App,
     app_ctx: *ctx_mod.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
     io: std.Io,
     stats: *?runtime.RuntimeStats,
     opts: types.RunOptions,
     winsize: vaxis.Winsize,
 ) !bool {
-    try vx.resize(allocator, tty.writer(), winsize);
-    useUnicodeWidth(vx);
+    try terminal.resize(winsize);
     _ = try dispatchAppEvent(App, app, .{ .winsize = winsize }, app_ctx, io, stats, opts);
     // Screen geometry changed even if update suppresses its own redraw.
     return true;
-}
-
-fn queryTerminal(
-    vx: *vaxis.Vaxis,
-    writer: *std.Io.Writer,
-    io: std.Io,
-    timeout: std.Io.Duration,
-    keyboard_protocol: types.KeyboardProtocol,
-    modes: *TerminalModes,
-    loop: anytype,
-) !void {
-    // Split vaxis' query/wait/enable flow so Chasen can keep enhanced
-    // keyboard reporting opt-in while still using the other detected features.
-    modes.in_band_resize = true; // query emits 2048 even without a response
-    errdefer modes.poison(vx, writer);
-    try vx.queryTerminalSend(writer);
-    try std.Io.futexWaitTimeout(
-        io,
-        std.atomic.Value(u32),
-        &vx.query_futex,
-        .init(0),
-        .{
-            .duration = .{
-                .clock = .real,
-                .raw = timeout,
-            },
-        },
-    );
-
-    vx.queries_done.store(true, .unordered);
-    if (keyboard_protocol == .legacy) {
-        vx.caps.kitty_keyboard = false;
-    }
-    stopLoopReader(loop, io);
-    const kitty = vx.caps.kitty_keyboard and vx.env_map.get("VHS_RECORD") == null;
-    vx.caps.kitty_keyboard = false; // Own the non-idempotent push separately.
-    modes.unicode = true; // Conservative cleanup ownership if enable fails.
-    try vx.enableDetectedFeatures(writer);
-    modes.unicode = vx.caps.unicode == .unicode and !vx.caps.explicit_width;
-    vx.caps.kitty_keyboard = kitty;
-    modes.kitty_flags = @bitCast(vx.opts.kitty_keyboard_flags);
-    if (kitty) try modes.setKitty(vx, writer, true);
-    try loop.start();
 }
 
 /// Deliver callbacks created on the runtime thread without routing them back
@@ -759,19 +423,14 @@ fn drainPendingEffects(
     tasks: *TaskRuntime(App.Msg),
     timers: *TimerRuntime(App.Msg),
     runtime_completions: *RuntimeCompletionBuffer(App.Msg),
-    terminal_images: *terminal_image.Registry,
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
+    terminal_effects: *TerminalEffects,
+    terminal: *TerminalSession(App.Msg),
     allocator: std.mem.Allocator,
     io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(App.Msg)),
-    suspended: *std.atomic.Value(bool),
     shutting_down: *const std.atomic.Value(bool),
     frames: *FrameRuntime(App.Msg),
     effect_drain_continuation_pending: *bool,
     stats: *?runtime.RuntimeStats,
-    mouse_policy: terminal_mouse.Policy,
-    terminal_modes: *TerminalModes,
     opts: types.RunOptions,
 ) !EffectDrainResult {
     var result: EffectDrainResult = .{};
@@ -780,262 +439,27 @@ fn drainPendingEffects(
     for (0..max_effect_drain_rounds) |round| {
         const completion_result = try applyRuntimeCompletions(App, app, app_ctx, runtime_completions, allocator, io, stats, opts);
         result.needs_render = result.needs_render or completion_result.needs_render;
-        const foreground_needs_render = try processPendingForegroundCommands(App, app, app_ctx, vx, tty, allocator, io, loop, suspended, mouse_policy, terminal_modes, stats, opts);
+        const foreground_needs_render = try terminal_effects.processForeground(App, app, app_ctx, terminal, stats, opts);
         result.needs_render = result.needs_render or foreground_needs_render;
-        const clipboard_needs_render = try processPendingClipboardCopies(App, app, app_ctx, vx, tty, allocator, io, stats, opts);
+        const clipboard_needs_render = try terminal_effects.processClipboard(App, app, app_ctx, terminal, stats, opts);
         result.needs_render = result.needs_render or clipboard_needs_render;
-        try tasks.startPending(app_ctx.requests, runtime_completions, loop, shutting_down);
+        try tasks.startPending(app_ctx.requests, runtime_completions, &terminal.loop, shutting_down);
         timers.cancelPending(app_ctx.requests);
-        timers.startTicks(app_ctx.requests, loop, shutting_down);
-        timers.startEvery(app_ctx.requests, loop, suspended, shutting_down);
-        try processPendingTerminalImages(Msg, app_ctx, runtime_completions, terminal_images, vx, tty.writer(), allocator, opts);
-        frames.startRequested(app_ctx.requests, loop, suspended, shutting_down);
+        timers.startTicks(app_ctx.requests, &terminal.loop, shutting_down);
+        timers.startEvery(app_ctx.requests, &terminal.loop, &terminal.suspended, shutting_down);
+        try terminal_effects.processImages(Msg, app_ctx, runtime_completions, terminal, opts);
+        frames.startRequested(app_ctx.requests, &terminal.loop, &terminal.suspended, shutting_down);
 
         const has_follow_up = runtime_completions.items.items.len > 0 or
             app_ctx.requests.hasPendingForegroundCommands() or
             app_ctx.requests.hasPendingClipboardCopies();
         if (!has_follow_up) break;
         if (round + 1 == max_effect_drain_rounds) {
-            try scheduleEffectDrainContinuation(Msg, loop, effect_drain_continuation_pending);
+            try scheduleEffectDrainContinuation(Msg, &terminal.loop, effect_drain_continuation_pending);
         }
     }
 
     return result;
-}
-
-fn processPendingForegroundCommands(
-    comptime App: type,
-    app: *App,
-    app_ctx: *ctx_mod.Ctx(App.Msg),
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(App.Msg)),
-    suspended: *std.atomic.Value(bool),
-    mouse_policy: terminal_mouse.Policy,
-    modes: *TerminalModes,
-    stats: *?runtime.RuntimeStats,
-    opts: types.RunOptions,
-) !bool {
-    const Runner = struct {
-        vx: *vaxis.Vaxis,
-        tty: *vaxis.Tty,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        loop: *vaxis.Loop(InternalEvent(App.Msg)),
-        suspended: *std.atomic.Value(bool),
-        mouse_policy: terminal_mouse.Policy,
-        modes: *TerminalModes,
-
-        fn run(
-            self: @This(),
-            entry: *const requests_mod.Requests(App.Msg).ForegroundCommandEntry,
-        ) !foreground_command.ForegroundCommandOutcome {
-            return runForegroundCommand(
-                self.vx,
-                self.tty,
-                self.allocator,
-                self.io,
-                self.loop,
-                self.suspended,
-                self.mouse_policy,
-                self.modes,
-                entry,
-            );
-        }
-    };
-
-    return processPendingForegroundCommandsWithRunner(
-        App,
-        app,
-        app_ctx,
-        allocator,
-        io,
-        stats,
-        opts,
-        Runner{
-            .vx = vx,
-            .tty = tty,
-            .allocator = allocator,
-            .io = io,
-            .loop = loop,
-            .suspended = suspended,
-            .mouse_policy = mouse_policy,
-            .modes = modes,
-        },
-    );
-}
-
-fn processPendingForegroundCommandsWithRunner(
-    comptime App: type,
-    app: *App,
-    app_ctx: *ctx_mod.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    stats: *?runtime.RuntimeStats,
-    opts: types.RunOptions,
-    runner: anytype,
-) !bool {
-    var pending_commands = app_ctx.requests.detachForegroundCommands();
-    // Abandon every unprocessed entry on an early error, before freeing inputs.
-    defer {
-        while (pending_commands.next()) |queued| {
-            var entry = queued;
-            var msg = entry.message(.runtime_abandoned);
-            runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
-            entry.deinit(allocator);
-        }
-    }
-    var needs_render = false;
-
-    while (pending_commands.next()) |queued_entry| {
-        var entry = queued_entry;
-        defer entry.deinit(allocator);
-
-        const outcome = if (app_ctx.shouldQuit()) foreground_command.ForegroundCommandOutcome.runtime_abandoned else runner.run(&entry) catch |err| foreground_job.failure(.restore_tui, @errorName(err));
-        var msg = entry.message(outcome);
-        if (outcome.isFatal() or outcome == .runtime_abandoned) {
-            runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
-            if (outcome.isFatal()) return error.ForegroundRecoveryFailed;
-        } else {
-            needs_render = try applyMsg(App, app, msg, app_ctx, io, stats, opts) or needs_render;
-        }
-    }
-
-    return needs_render;
-}
-
-fn processPendingClipboardCopies(
-    comptime App: type,
-    app: *App,
-    app_ctx: *ctx_mod.Ctx(App.Msg),
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    stats: *?runtime.RuntimeStats,
-    opts: types.RunOptions,
-) !bool {
-    var pending_copies = app_ctx.requests.detachClipboardCopies();
-    defer pending_copies.deinit();
-    var needs_render = false;
-    while (pending_copies.next()) |queued| {
-        var entry = queued;
-        defer entry.deinit(allocator);
-        const outcome: ctx_mod.Ctx(App.Msg).ClipboardCopyOutcome = if (vx.*.copyToSystemClipboard(tty.writer(), entry.text, allocator)) |_| .sent else |err| .{ .write_failed = @errorName(err) };
-        needs_render = try applyMsg(App, app, entry.message(outcome), app_ctx, io, stats, opts) or needs_render;
-    }
-
-    return needs_render;
-}
-
-fn runForegroundCommand(
-    vx: *vaxis.Vaxis,
-    tty: *vaxis.Tty,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    loop: anytype,
-    suspended: *std.atomic.Value(bool),
-    mouse_policy: terminal_mouse.Policy,
-    modes: *TerminalModes,
-    entry: anytype,
-) foreground_command.ForegroundCommandOutcome {
-    if (!foreground_job.supported or builtin.is_test) return foreground_job.failure(.unsupported, "Unsupported");
-    const terminal = foreground_job.Terminal.capture(tty.fd.handle) catch |err| return foreground_job.failure(.admission, @errorName(err));
-    var prepared = foreground_job.Prepared.init(allocator, entry.input.argv, entry.input.childCwd(), entry.input.childEnvironment()) catch |err| return foreground_job.failure(.prepare, @errorName(err));
-    defer prepared.deinit();
-    prepared.prepareLaunch(terminal.fd) catch |err| return foreground_job.failure(if (err == error.Unsupported) .unsupported else .prepare, @errorName(err));
-    suspended.store(true, .seq_cst);
-    defer suspended.store(false, .seq_cst);
-    stopLoopReader(loop, io);
-    const saved = modes.snapshot(vx);
-    modes.leave(vx, tty.writer(), mouse_policy) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
-    const outcome = foreground_job.run(&prepared, terminal, &tty.termios);
-    if (outcome.isFatal()) return outcome;
-    modes.restore(saved, vx, tty.writer(), mouse_policy) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
-    const size = tty.getWinsize() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
-    vx.resize(allocator, tty.writer(), size) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
-    useUnicodeWidth(vx);
-    loop.start() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
-    vx.queueRefresh();
-    return outcome;
-}
-
-fn processPendingTerminalImages(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    runtime_completions: *RuntimeCompletionBuffer(Msg),
-    registry: *terminal_image.Registry,
-    vx: *vaxis.Vaxis,
-    tty: *std.Io.Writer,
-    allocator: std.mem.Allocator,
-    opts: types.RunOptions,
-) !void {
-    // Take ownership of queued image effects before processing so unwind
-    // cleanup only sees entries that have not reached the drain step.
-    var pending_unloads = app_ctx.requests.detachTerminalImageUnloads();
-    defer pending_unloads.deinit();
-
-    while (pending_unloads.next()) |handle| {
-        _ = registry.unload(vx.*, tty, handle);
-    }
-
-    var pending_loads = app_ctx.requests.detachTerminalImageLoads();
-    defer pending_loads.deinit();
-
-    while (pending_loads.next()) |entry| {
-        defer allocator.free(entry.path);
-
-        switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
-            .loaded => |handle| {
-                var msg = entry.loaded(entry.request_id, handle);
-                runtime_completions.append(msg) catch |err| {
-                    runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                    _ = registry.unload(vx.*, tty, handle);
-                    return err;
-                };
-            },
-            .failed => |reason| {
-                var msg = entry.failed(entry.request_id, reason);
-                runtime_completions.append(msg) catch |err| {
-                    runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
-                    return err;
-                };
-            },
-        }
-    }
-}
-
-const TerminalImageLoadResult = union(enum) {
-    loaded: terminal_image.TerminalImageHandle,
-    failed: terminal_image.LoadError,
-};
-
-fn loadTerminalImagePath(
-    registry: *terminal_image.Registry,
-    vx: *vaxis.Vaxis,
-    tty: *std.Io.Writer,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    opts: types.RunOptions,
-) TerminalImageLoadResult {
-    const loader = opts.terminal.image_path_loader orelse terminal_image.unsupportedPathLoader;
-    const image = loader(opts.terminal.image_loader_context, vx, tty, allocator, path) catch |err| {
-        if (err == error.Unsupported) return .{ .failed = .unsupported };
-        return .{ .failed = .load_failed };
-    };
-    const handle = registry.add(allocator, image) catch {
-        vx.freeImage(tty, image.id);
-        return .{ .failed = .registry_full };
-    };
-    return .{ .loaded = handle };
-}
-
-fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
-    // Keep the runtime surface width policy aligned with chasen.text.displayWidth.
-    vx.caps.unicode = .unicode;
-    vx.screen.width_method = .unicode;
 }
 
 const OwnershipTestPayload = struct {
@@ -1118,14 +542,18 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
         tasks.bind(ctx.requests);
         var completions: RuntimeCompletionBuffer(Msg) = .{};
         try completions.init(allocator);
-        var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
+        var env: std.process.Environ.Map = .init(allocator);
+        defer env.deinit();
+        var terminal: TerminalSession(Msg) = undefined;
+        try terminal.init(allocator, io, .{ .env_map = &env });
+        defer terminal.deinit();
         var shutting_down: std.atomic.Value(bool) = .init(false);
         var slow: Task.State = .{};
         var fast: Task.State = .{};
         var release: std.Io.Event = .unset;
         const slow_id = try Task.submit(&ctx, &slow, io, if (via_shutdown) &fast.cleaned else &release);
         const fast_id = try Task.submit(&ctx, &fast, io, null);
-        try tasks.startPending(ctx.requests, &completions, &loop, &shutting_down);
+        try tasks.startPending(ctx.requests, &completions, &terminal.loop, &shutting_down);
         slow.started.waitUncancelable(io);
         fast.started.waitUncancelable(io);
         if (!via_shutdown) {
@@ -1140,148 +568,13 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
         }
         var timers = TimerRuntime(Msg).init(allocator, io);
         var frame = FrameRuntime(Msg).init(io);
-        shutdownRuntime(Task.App, &ctx, &tasks, &timers, &completions, &frame, &loop, allocator, io, &shutting_down);
+        shutdownRuntime(Task.App, &ctx, &tasks, &timers, &completions, &frame, &terminal, allocator, &shutting_down);
         try std.testing.expect(ctx.requests._task_runtime == null);
         try std.testing.expectEqual(@as(usize, 1), slow.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), fast.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), tasks.pending.items.len);
-        try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try loop.tryEvent());
+        try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try terminal.loop.tryEvent());
     }
-}
-
-test "resize poll coalesces latest size without waiting for queue capacity" {
-    const TestMsg = union(enum) {
-        noop,
-
-        pub const undelivered_policy = .plain;
-    };
-    const Event = InternalEvent(TestMsg);
-
-    var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
-    while (try loop.tryPostEvent(.continue_effect_drain)) {}
-    var resize_poll = ResizePollState(TestMsg).init(undefined, &loop);
-
-    // publish runs on the ordinary polling thread. A full queue can reject its
-    // wake without losing the latest dimensions.
-    resize_poll.publish(.{ .rows = 20, .cols = 80, .x_pixel = 800, .y_pixel = 400 });
-    resize_poll.publish(.{ .rows = 40, .cols = 120, .x_pixel = 1200, .y_pixel = 800 });
-
-    const latest = resize_poll.takeLatest().?;
-    try std.testing.expectEqual(@as(u16, 40), latest.rows);
-    try std.testing.expectEqual(@as(u16, 120), latest.cols);
-    try std.testing.expectEqual(@as(u16, 1200), latest.x_pixel);
-    try std.testing.expectEqual(@as(u16, 800), latest.y_pixel);
-    try std.testing.expectEqual(@as(?vaxis.Winsize, null), resize_poll.takeLatest());
-
-    drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
-}
-
-test "resize poll survives a stopped reader until the next loop turn" {
-    const TestMsg = union(enum) {
-        noop,
-
-        pub const undelivered_policy = .plain;
-    };
-    const Event = InternalEvent(TestMsg);
-
-    // A foreground handoff stops only the tty reader; the queue and coalesced
-    // state remain live. Publishing while thread is null models a poll during
-    // the child process, before restoreTerminalAfterForeground restarts it.
-    var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
-    var resize_poll = ResizePollState(TestMsg).init(undefined, &loop);
-    try std.testing.expect(loop.thread == null);
-
-    resize_poll.publish(.{ .rows = 50, .cols = 160, .x_pixel = 1600, .y_pixel = 1000 });
-    const wake = (try loop.tryEvent()).?;
-    try std.testing.expect(wake == .resize_pending);
-
-    const latest = resize_poll.takeLatest().?;
-    try std.testing.expectEqual(@as(u16, 50), latest.rows);
-    try std.testing.expectEqual(@as(u16, 160), latest.cols);
-    try std.testing.expectEqual(@as(u16, 1600), latest.x_pixel);
-    try std.testing.expectEqual(@as(u16, 1000), latest.y_pixel);
-}
-
-test "resize poll thread wakes an empty event queue" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const TestMsg = union(enum) {
-        noop,
-
-        pub const undelivered_policy = .plain;
-    };
-    const Event = InternalEvent(TestMsg);
-
-    var tty_buf: [64]u8 = undefined;
-    var tty = try vaxis.Tty.init(std.testing.io, &tty_buf);
-    defer tty.deinit();
-    var loop = vaxis.Loop(Event).init(std.testing.io, &tty, undefined);
-    var resize_poll = ResizePollState(TestMsg).init(&tty, &loop);
-    resize_poll.seed(.{ .rows = 1, .cols = 1, .x_pixel = 1, .y_pixel = 1 });
-
-    const thread = try std.Thread.spawn(.{
-        .allocator = std.testing.allocator,
-    }, ResizePollState(TestMsg).run, .{&resize_poll});
-    defer {
-        resize_poll.stop();
-        thread.join();
-    }
-
-    var wake: ?Event = null;
-    for (0..100) |_| {
-        if (try loop.tryEvent()) |event| {
-            wake = event;
-            break;
-        }
-        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
-    }
-
-    try std.testing.expect(wake != null);
-    try std.testing.expect(wake.? == .resize_pending);
-    const latest = resize_poll.takeLatest().?;
-    try std.testing.expectEqual(@as(u16, 40), latest.rows);
-    try std.testing.expectEqual(@as(u16, 80), latest.cols);
-}
-
-test "loop reader stop needs no extra concurrency slot on full queue" {
-    const TestMsg = union(enum) {
-        noop,
-
-        pub const undelivered_policy = .plain;
-    };
-    const Event = InternalEvent(TestMsg);
-    const BlockedProducer = struct {
-        fn run(
-            loop: *vaxis.Loop(Event),
-            started: *std.atomic.Value(bool),
-        ) void {
-            started.store(true, .seq_cst);
-            loop.postEvent(.continue_effect_drain) catch {};
-        }
-    };
-    const Probe = struct {
-        fn run() void {}
-    };
-
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{
-        .concurrent_limit = .limited(1),
-    });
-    defer threaded.deinit();
-    const io = threaded.io();
-    var loop = vaxis.Loop(Event).init(io, undefined, undefined);
-    while (try loop.tryPostEvent(.continue_effect_drain)) {}
-
-    var started: std.atomic.Value(bool) = .init(false);
-    loop.thread = try io.concurrent(BlockedProducer.run, .{ &loop, &started });
-    while (!started.load(.seq_cst)) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expectError(error.ConcurrencyUnavailable, io.concurrent(Probe.run, .{}));
-
-    stopLoopReader(&loop, io);
-
-    try std.testing.expect(loop.thread == null);
-    drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
 }
 
 test "shutdown queue drain deinitializes owned messages" {
@@ -1413,7 +706,6 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
             }
         }
     };
-    const Event = InternalEvent(TestMsg);
 
     for ([_]bool{ false, true }) |skip| {
         var app: TestApp = .{ .skip = skip };
@@ -1427,14 +719,14 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         try completions.init(std.testing.allocator);
         defer completions.deinitUndelivered(std.testing.allocator);
         try completions.append(.first);
-        var terminal_images: terminal_image.Registry = .{};
-        defer terminal_images.deinit(std.testing.allocator);
-        var tty_buffer: [64]u8 = undefined;
-        var tty = try vaxis.Tty.init(std.testing.io, &tty_buffer);
-        defer tty.deinit();
-        var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
-        while (try loop.tryPostEvent(.continue_effect_drain)) {}
-        var suspended: std.atomic.Value(bool) = .init(false);
+        var env: std.process.Environ.Map = .init(std.testing.allocator);
+        defer env.deinit();
+        var terminal: TerminalSession(TestMsg) = undefined;
+        try terminal.init(std.testing.allocator, std.testing.io, .{ .env_map = &env });
+        defer terminal.deinit();
+        var terminal_effects: TerminalEffects = .{};
+        defer terminal_effects.deinit(&terminal);
+        while (try terminal.loop.tryPostEvent(.continue_effect_drain)) {}
         var shutting_down: std.atomic.Value(bool) = .init(false);
         var frames = FrameRuntime(TestMsg).init(std.testing.io);
         defer frames.shutdown();
@@ -1448,22 +740,14 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
             &tasks,
             &timers,
             &completions,
-            &terminal_images,
-            undefined,
-            &tty,
+            &terminal_effects,
+            &terminal,
             std.testing.failing_allocator,
             std.testing.io,
-            &loop,
-            &suspended,
             &shutting_down,
             &frames,
             &continuation_pending,
             &stats,
-            .{
-                .enabled = false,
-                .coordinate_protocol = .cell_sgr,
-            },
-            undefined, // no foreground command is queued in this drain test
             .{ .runtime = .{
                 .allocator = std.testing.allocator,
                 .io = std.testing.io,
@@ -1474,108 +758,8 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         try std.testing.expectEqual(@as(usize, 2), app.update_count);
         try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
         try std.testing.expectEqual(@as(usize, 0), app_ctx.requests.detachTasks().len);
-        drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
+        drainInternalEventsForShutdown(TestMsg, &terminal.loop, std.testing.allocator);
     }
-}
-
-test "clipboard detached suffix survives reentrant update and is freed on update error" {
-    const TestApp = struct {
-        fail_update: bool,
-        received: usize = 0,
-        pub const Msg = struct {
-            request_id: u64,
-            pub const undelivered_policy = .plain;
-        };
-        fn finished(result: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
-            std.debug.assert(result.outcome == .sent);
-            return .{ .request_id = result.request_id.id };
-        }
-        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
-            self.received += 1;
-            try std.testing.expectEqual(self.received, msg.request_id);
-            if (self.received == 1) {
-                _ = try ctx.terminal().copyToClipboard(.{ .text = "new", .finished = finished });
-                if (self.fail_update) return error.UpdateFailed;
-            }
-        }
-    };
-    for ([_]bool{ false, true }) |fail_update| {
-        var requests = requests_mod.Requests(TestApp.Msg).init(std.testing.allocator, std.testing.io);
-        defer requests.deinit();
-        var ctx = ctx_mod.Ctx(TestApp.Msg).init(&requests);
-        _ = try ctx.terminal().copyToClipboard(.{ .text = "first", .finished = TestApp.finished });
-        _ = try ctx.terminal().copyToClipboard(.{ .text = "second", .finished = TestApp.finished });
-        var env: std.process.Environ.Map = .init(std.testing.allocator);
-        defer env.deinit();
-        var buffer: [128]u8 = undefined;
-        var tty = try vaxis.Tty.init(std.testing.io, &buffer);
-        defer tty.deinit();
-        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
-        defer vx.deinit(std.testing.allocator, tty.writer());
-        var app: TestApp = .{ .fail_update = fail_update };
-        var stats: ?runtime.RuntimeStats = null;
-        const result = processPendingClipboardCopies(TestApp, &app, &ctx, &vx, &tty, std.testing.allocator, std.testing.io, &stats, .{
-            .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io },
-            .terminal = .{ .env_map = &env },
-        });
-        if (fail_update) {
-            try std.testing.expectError(error.UpdateFailed, result);
-        } else {
-            try std.testing.expect(try result);
-        }
-        try std.testing.expectEqual(@as(usize, if (fail_update) 1 else 2), app.received);
-        if (comptime builtin.os.tag == .linux) {
-            const wire = tty.tty_writer.written();
-            try std.testing.expect(std.mem.indexOf(u8, wire, "Zmlyc3Q=") != null);
-            try std.testing.expectEqual(!fail_update, std.mem.indexOf(u8, wire, "c2Vjb25k") != null);
-            try std.testing.expect(std.mem.indexOf(u8, wire, "bmV3") == null);
-        }
-        var remaining = requests.detachClipboardCopies();
-        defer remaining.deinit();
-        var new_entry = remaining.next().?;
-        defer new_entry.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("new", new_entry.text);
-        try std.testing.expectEqual(@as(u64, 3), new_entry.request_id.id);
-        try std.testing.expect(remaining.next() == null);
-    }
-}
-
-test "image batch overflow frees current and unconsumed paths" {
-    const Msg = struct {
-        pub const undelivered_policy = .plain;
-        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) @This() {
-            unreachable;
-        }
-        fn failed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) @This() {
-            return .{};
-        }
-    };
-    var requests = requests_mod.Requests(Msg).init(std.testing.allocator, std.testing.io);
-    defer requests.deinit();
-    var ctx = ctx_mod.Ctx(Msg).init(&requests);
-    for ([_][]const u8{ "one.png", "two.png", "three.png" }) |path| {
-        _ = try ctx.image().loadPath(path, Msg.loaded, Msg.failed);
-    }
-    var completions: RuntimeCompletionBuffer(Msg) = .{};
-    try completions.init(std.testing.allocator);
-    defer completions.deinitUndelivered(std.testing.allocator);
-    for (0..RuntimeCompletionBuffer(Msg).capacity - 1) |_| try completions.append(.{});
-    var registry: terminal_image.Registry = .{};
-    defer registry.deinit(std.testing.allocator);
-    try std.testing.expectError(error.RuntimeCompletionLimitExceeded, processPendingTerminalImages(
-        Msg,
-        &ctx,
-        &completions,
-        &registry,
-        undefined,
-        undefined,
-        std.testing.allocator,
-        .{ .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io }, .terminal = .{ .env_map = undefined } },
-    ));
-    try std.testing.expectEqual(@as(usize, RuntimeCompletionBuffer(Msg).capacity), completions.items.items.len);
-    var empty = requests.detachTerminalImageLoads();
-    defer empty.deinit();
-    try std.testing.expect(empty.next() == null);
 }
 
 test "terminal image failure callback uses runtime completion buffer" {
@@ -1614,17 +798,19 @@ test "terminal image failure callback uses runtime completion buffer" {
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
     try completions.init(std.testing.allocator);
     defer completions.deinitUndelivered(std.testing.allocator);
-    var registry: terminal_image.Registry = .{};
-    defer registry.deinit(std.testing.allocator);
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var terminal: TerminalSession(TestMsg) = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, .{ .env_map = &env });
+    defer terminal.deinit();
+    var effects: TerminalEffects = .{};
+    defer effects.deinit(&terminal);
 
-    try processPendingTerminalImages(
+    try effects.processImages(
         TestMsg,
         &app_ctx,
         &completions,
-        &registry,
-        undefined,
-        undefined,
-        std.testing.allocator,
+        &terminal,
         .{ .runtime = .{
             .allocator = std.testing.allocator,
             .io = std.testing.io,
@@ -1747,6 +933,354 @@ test "runtime completion update error remains app-owned" {
     try std.testing.expect(app.retained != null);
     try std.testing.expectEqual(@as(usize, 0), deinit_count);
     try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
+}
+
+test {
+    _ = @import("program/timers.zig");
+    _ = frame_mod;
+    _ = events_mod;
+    _ = terminal_session;
+}
+
+test "event resize forces render and Renderer keeps view paint trace order" {
+    const Evidence = struct {
+        entries: std.ArrayList(runtime.TraceEvent) = .empty,
+        views: usize = 0,
+        fn record(context: ?*anyopaque, event: runtime.TraceEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.entries.append(std.testing.allocator, event) catch unreachable;
+        }
+    };
+    const App = struct {
+        evidence: *Evidence,
+        size: vaxis.Winsize = .{ .rows = 0, .cols = 0, .x_pixel = 0, .y_pixel = 0 },
+        pub const Msg = struct {
+            size: vaxis.Winsize,
+            pub const undelivered_policy = .plain;
+        };
+        pub fn handleEvent(_: *@This(), event: types.Event) ?Msg {
+            return .{ .size = event.winsize };
+        }
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.size = msg.size;
+            ctx.redraw().skip();
+        }
+        pub fn view(self: *const @This(), sfc: *Surface) !void {
+            try std.testing.expectEqual(self.size.cols, sfc.size().width);
+            try std.testing.expectEqual(self.size.rows, sfc.size().height);
+            try std.testing.expectEqual(runtime.TraceEvent.view_start, self.evidence.entries.getLast());
+            self.evidence.views += 1;
+            // Exercise the renderer-owned scratch allocator on both renders.
+            const text = try sfc.arena.dupe(u8, "redraw");
+            _ = sfc.borrowTextAt(0, 0, text, .{});
+        }
+    };
+    var evidence: Evidence = .{};
+    defer evidence.entries.deinit(std.testing.allocator);
+    var app: App = .{ .evidence = &evidence };
+    var requests = requests_mod.Requests(App.Msg).init(std.testing.allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(App.Msg).init(&requests);
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var terminal: TerminalSession(App.Msg) = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, .{ .env_map = &env });
+    defer terminal.deinit();
+    var images: terminal_image.Registry = .{};
+    defer images.deinit(std.testing.allocator);
+    var renderer = Renderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    const opts: types.RunOptions = .{
+        .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io, .trace_fn = Evidence.record, .trace_context = &evidence },
+        .terminal = .{ .env_map = &env },
+    };
+    for ([_]bool{ false, true }) |measure| {
+        evidence.entries.clearRetainingCapacity();
+        var stats: ?runtime.RuntimeStats = if (measure) .{ .event_kind = .winsize, .event_count = 2, .frame_count = 1 } else null;
+        const ws: vaxis.Winsize = .{ .rows = 3, .cols = if (measure) 12 else 8, .x_pixel = 0, .y_pixel = 0 };
+        try std.testing.expect(try applyTerminalResize(App, &terminal, &app, &ctx, std.testing.io, &stats, opts, ws));
+        try std.testing.expect(requests.redrawWasSuppressed());
+        const timings = try renderer.render(App, &terminal.vx, &images, &app, terminal.writer(), std.testing.io, measure, opts);
+        if (!measure) {
+            try std.testing.expectEqual(@as(u64, 0), timings.view_ns);
+            try std.testing.expectEqual(@as(u64, 0), timings.render_ns);
+        }
+        try std.testing.expectEqualSlices(runtime.TraceEvent, &.{ .handle_event_start, .handle_event_end, .update_start, .update_end, .view_start, .view_end, .render_start, .render_end }, evidence.entries.items);
+    }
+    try std.testing.expectEqual(@as(usize, 2), evidence.views);
+}
+
+pub const TerminalEffects = struct {
+    images: terminal_image.Registry = .{},
+
+    pub fn deinit(self: *TerminalEffects, session: anytype) void {
+        self.images.freeAll(session.vx, session.writer());
+        self.images.deinit(session.allocator);
+    }
+
+    pub fn processForeground(self: *TerminalEffects, comptime App: type, app: *App, ctx: *ctx_mod.Ctx(App.Msg), session: *TerminalSession(App.Msg), stats: *?runtime.RuntimeStats, opts: types.RunOptions) !bool {
+        _ = self;
+        const Runner = struct {
+            session: *TerminalSession(App.Msg),
+            fn run(runner: @This(), entry: *const requests_mod.Requests(App.Msg).ForegroundCommandEntry) !foreground_command.ForegroundCommandOutcome {
+                return runner.session.runForeground(entry);
+            }
+        };
+        return processPendingForegroundCommandsWithRunner(App, app, ctx, session.allocator, session.io, stats, opts, Runner{ .session = session });
+    }
+
+    pub fn processClipboard(self: *TerminalEffects, comptime App: type, app: *App, ctx: *ctx_mod.Ctx(App.Msg), session: *TerminalSession(App.Msg), stats: *?runtime.RuntimeStats, opts: types.RunOptions) !bool {
+        _ = self;
+        return processPendingClipboardCopies(App, app, ctx, &session.vx, &session.tty, session.allocator, session.io, stats, opts);
+    }
+
+    pub fn processImages(self: *TerminalEffects, comptime Msg: type, ctx: *ctx_mod.Ctx(Msg), completions: *RuntimeCompletionBuffer(Msg), session: *TerminalSession(Msg), opts: types.RunOptions) !void {
+        try processPendingTerminalImages(Msg, ctx, completions, &self.images, &session.vx, session.writer(), session.allocator, opts);
+    }
+};
+
+fn processPendingForegroundCommandsWithRunner(
+    comptime App: type,
+    app: *App,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stats: *?runtime.RuntimeStats,
+    opts: types.RunOptions,
+    runner: anytype,
+) !bool {
+    var pending_commands = app_ctx.requests.detachForegroundCommands();
+    // Abandon every unprocessed entry on an early error, before freeing inputs.
+    defer {
+        while (pending_commands.next()) |queued| {
+            var entry = queued;
+            var msg = entry.message(.runtime_abandoned);
+            runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
+            entry.deinit(allocator);
+        }
+    }
+    var needs_render = false;
+
+    while (pending_commands.next()) |queued_entry| {
+        var entry = queued_entry;
+        defer entry.deinit(allocator);
+
+        const outcome = if (app_ctx.shouldQuit()) foreground_command.ForegroundCommandOutcome.runtime_abandoned else runner.run(&entry) catch |err| foreground_job.failure(.restore_tui, @errorName(err));
+        var msg = entry.message(outcome);
+        if (outcome.isFatal() or outcome == .runtime_abandoned) {
+            runtime.deinitUndeliveredMessage(App.Msg, &msg, allocator);
+            if (outcome.isFatal()) return error.ForegroundRecoveryFailed;
+        } else {
+            needs_render = try applyMsg(App, app, msg, app_ctx, io, stats, opts) or needs_render;
+        }
+    }
+
+    return needs_render;
+}
+
+fn processPendingClipboardCopies(
+    comptime App: type,
+    app: *App,
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stats: *?runtime.RuntimeStats,
+    opts: types.RunOptions,
+) !bool {
+    var pending_copies = app_ctx.requests.detachClipboardCopies();
+    defer pending_copies.deinit();
+    var needs_render = false;
+    while (pending_copies.next()) |queued| {
+        var entry = queued;
+        defer entry.deinit(allocator);
+        const outcome: ctx_mod.Ctx(App.Msg).ClipboardCopyOutcome = if (vx.*.copyToSystemClipboard(tty.writer(), entry.text, allocator)) |_| .sent else |err| .{ .write_failed = @errorName(err) };
+        needs_render = try applyMsg(App, app, entry.message(outcome), app_ctx, io, stats, opts) or needs_render;
+    }
+
+    return needs_render;
+}
+
+fn processPendingTerminalImages(
+    comptime Msg: type,
+    app_ctx: *ctx_mod.Ctx(Msg),
+    runtime_completions: *RuntimeCompletionBuffer(Msg),
+    registry: *terminal_image.Registry,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    opts: types.RunOptions,
+) !void {
+    // Take ownership of queued image effects before processing so unwind
+    // cleanup only sees entries that have not reached the drain step.
+    var pending_unloads = app_ctx.requests.detachTerminalImageUnloads();
+    defer pending_unloads.deinit();
+
+    while (pending_unloads.next()) |handle| {
+        _ = registry.unload(vx.*, tty, handle);
+    }
+
+    var pending_loads = app_ctx.requests.detachTerminalImageLoads();
+    defer pending_loads.deinit();
+
+    while (pending_loads.next()) |entry| {
+        defer allocator.free(entry.path);
+
+        switch (loadTerminalImagePath(registry, vx, tty, allocator, entry.path, opts)) {
+            .loaded => |handle| {
+                var msg = entry.loaded(entry.request_id, handle);
+                runtime_completions.append(msg) catch |err| {
+                    runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
+                    _ = registry.unload(vx.*, tty, handle);
+                    return err;
+                };
+            },
+            .failed => |reason| {
+                var msg = entry.failed(entry.request_id, reason);
+                runtime_completions.append(msg) catch |err| {
+                    runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
+                    return err;
+                };
+            },
+        }
+    }
+}
+
+const TerminalImageLoadResult = union(enum) {
+    loaded: terminal_image.TerminalImageHandle,
+    failed: terminal_image.LoadError,
+};
+
+fn loadTerminalImagePath(
+    registry: *terminal_image.Registry,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    opts: types.RunOptions,
+) TerminalImageLoadResult {
+    const loader = opts.terminal.image_path_loader orelse terminal_image.unsupportedPathLoader;
+    const image = loader(opts.terminal.image_loader_context, vx, tty, allocator, path) catch |err| {
+        if (err == error.Unsupported) return .{ .failed = .unsupported };
+        return .{ .failed = .load_failed };
+    };
+    const handle = registry.add(allocator, image) catch {
+        vx.freeImage(tty, image.id);
+        return .{ .failed = .registry_full };
+    };
+    return .{ .loaded = handle };
+}
+
+pub fn discardQueuedForegroundCommands(comptime Msg: type, app_ctx: *ctx_mod.Ctx(Msg), allocator: std.mem.Allocator) void {
+    var batch = app_ctx.requests.detachForegroundCommands();
+    defer batch.deinit();
+    while (batch.next()) |queued| {
+        var entry = queued;
+        var msg = entry.finished(.{ .request_id = entry.request_id, .outcome = .runtime_abandoned });
+        runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
+        entry.deinit(allocator);
+    }
+}
+
+test "clipboard detached suffix survives reentrant update and is freed on update error" {
+    const TestApp = struct {
+        fail_update: bool,
+        received: usize = 0,
+        pub const Msg = struct {
+            request_id: u64,
+            pub const undelivered_policy = .plain;
+        };
+        fn finished(result: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
+            std.debug.assert(result.outcome == .sent);
+            return .{ .request_id = result.request_id.id };
+        }
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.received += 1;
+            try std.testing.expectEqual(self.received, msg.request_id);
+            if (self.received == 1) {
+                _ = try ctx.terminal().copyToClipboard(.{ .text = "new", .finished = finished });
+                if (self.fail_update) return error.UpdateFailed;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |fail_update| {
+        var requests = requests_mod.Requests(TestApp.Msg).init(std.testing.allocator, std.testing.io);
+        defer requests.deinit();
+        var ctx = ctx_mod.Ctx(TestApp.Msg).init(&requests);
+        _ = try ctx.terminal().copyToClipboard(.{ .text = "first", .finished = TestApp.finished });
+        _ = try ctx.terminal().copyToClipboard(.{ .text = "second", .finished = TestApp.finished });
+        var env: std.process.Environ.Map = .init(std.testing.allocator);
+        defer env.deinit();
+        var buffer: [128]u8 = undefined;
+        var tty = try vaxis.Tty.init(std.testing.io, &buffer);
+        defer tty.deinit();
+        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+        defer vx.deinit(std.testing.allocator, tty.writer());
+        var app: TestApp = .{ .fail_update = fail_update };
+        var stats: ?runtime.RuntimeStats = null;
+        const result = processPendingClipboardCopies(TestApp, &app, &ctx, &vx, &tty, std.testing.allocator, std.testing.io, &stats, .{
+            .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .terminal = .{ .env_map = &env },
+        });
+        if (fail_update) {
+            try std.testing.expectError(error.UpdateFailed, result);
+        } else {
+            try std.testing.expect(try result);
+        }
+        try std.testing.expectEqual(@as(usize, if (fail_update) 1 else 2), app.received);
+        if (comptime builtin.os.tag == .linux) {
+            const wire = tty.tty_writer.written();
+            try std.testing.expect(std.mem.indexOf(u8, wire, "Zmlyc3Q=") != null);
+            try std.testing.expectEqual(!fail_update, std.mem.indexOf(u8, wire, "c2Vjb25k") != null);
+            try std.testing.expect(std.mem.indexOf(u8, wire, "bmV3") == null);
+        }
+        var remaining = requests.detachClipboardCopies();
+        defer remaining.deinit();
+        var new_entry = remaining.next().?;
+        defer new_entry.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("new", new_entry.text);
+        try std.testing.expectEqual(@as(u64, 3), new_entry.request_id.id);
+        try std.testing.expect(remaining.next() == null);
+    }
+}
+
+test "image batch overflow frees current and unconsumed paths" {
+    const Msg = struct {
+        pub const undelivered_policy = .plain;
+        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) @This() {
+            unreachable;
+        }
+        fn failed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) @This() {
+            return .{};
+        }
+    };
+    var requests = requests_mod.Requests(Msg).init(std.testing.allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(Msg).init(&requests);
+    for ([_][]const u8{ "one.png", "two.png", "three.png" }) |path| {
+        _ = try ctx.image().loadPath(path, Msg.loaded, Msg.failed);
+    }
+    var completions: RuntimeCompletionBuffer(Msg) = .{};
+    try completions.init(std.testing.allocator);
+    defer completions.deinitUndelivered(std.testing.allocator);
+    for (0..RuntimeCompletionBuffer(Msg).capacity - 1) |_| try completions.append(.{});
+    var registry: terminal_image.Registry = .{};
+    defer registry.deinit(std.testing.allocator);
+    try std.testing.expectError(error.RuntimeCompletionLimitExceeded, processPendingTerminalImages(
+        Msg,
+        &ctx,
+        &completions,
+        &registry,
+        undefined,
+        undefined,
+        std.testing.allocator,
+        .{ .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io }, .terminal = .{ .env_map = undefined } },
+    ));
+    try std.testing.expectEqual(@as(usize, RuntimeCompletionBuffer(Msg).capacity), completions.items.items.len);
+    var empty = requests.detachTerminalImageLoads();
+    defer empty.deinit();
+    try std.testing.expect(empty.next() == null);
 }
 
 fn foregroundCommandProgramTestFdOpen(fd: std.Io.Dir.Handle) bool {
@@ -2414,189 +1948,6 @@ test "foreground cleanup covers runner outcome and delivery terminals with repla
     for (cases) |case| try Harness.run(case.mode, case.expected_error);
 }
 
-/// Wire ownership, distinct from capability responses in vx.state. This record
-/// owns one kitty layer and only the modes enabled by this runtime invocation.
-const TerminalModes = struct {
-    in_band_resize: bool = false,
-    unicode: bool = false,
-    kitty: bool = false,
-    kitty_flags: u5 = 0,
-    kitty_uncertain: bool = false,
-    poisoned: bool = false,
-    const Saved = struct { modes: TerminalModes, alt: bool, paste: bool, mouse: bool, pixels: bool };
-    fn snapshot(self: TerminalModes, vx: *vaxis.Vaxis) Saved {
-        return .{ .modes = self, .alt = vx.state.alt_screen, .paste = vx.state.bracketed_paste, .mouse = vx.state.mouse, .pixels = vx.state.pixel_mouse };
-    }
-    fn poison(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
-        // Failed File.Writer flush retains its pending bytes. Never allow a
-        // later reset/flush to replay a partially transmitted stack operation.
-        _ = writer.consumeAll();
-        self.poisoned = true;
-        if (self.kitty_uncertain) {
-            self.kitty = false;
-            vx.state.kitty_keyboard = false;
-        }
-    }
-    fn setKitty(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer, enable: bool) !void {
-        self.kitty_uncertain = true;
-        errdefer self.poison(vx, writer);
-        if (enable) try writer.print("\x1b[>{d}u", .{self.kitty_flags}) else try writer.writeAll("\x1b[<u");
-        try writer.flush();
-        self.kitty_uncertain = false;
-        self.kitty = enable;
-        vx.state.kitty_keyboard = enable;
-    }
-    fn leave(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer, mouse: terminal_mouse.Policy) !void {
-        errdefer self.poison(vx, writer);
-        try mouse.leave(vx, writer);
-        try vx.setBracketedPaste(writer, false);
-        if (self.in_band_resize) {
-            try writer.writeAll("\x1b[?2048l");
-            try writer.flush();
-            self.in_band_resize = false;
-        }
-        vx.state.in_band_resize = false;
-        if (self.unicode) {
-            try writer.writeAll("\x1b[?2027l");
-            try writer.flush();
-            self.unicode = false;
-        }
-        if (self.kitty) try self.setKitty(vx, writer, false);
-        try writer.writeAll("\x1b[?25h\x1b[0m\x1b[0 q");
-        try writer.flush();
-        if (vx.state.alt_screen) try vx.exitAltScreen(writer);
-    }
-    fn restore(self: *TerminalModes, saved: Saved, vx: *vaxis.Vaxis, writer: *std.Io.Writer, mouse: terminal_mouse.Policy) !void {
-        errdefer self.poison(vx, writer);
-        if (saved.alt) try vx.enterAltScreen(writer);
-        if (saved.modes.unicode) {
-            self.unicode = true;
-            try writer.writeAll("\x1b[?2027h");
-            try writer.flush();
-        }
-        self.kitty_flags = saved.modes.kitty_flags;
-        if (saved.modes.kitty) try self.setKitty(vx, writer, true);
-        if (saved.modes.in_band_resize) {
-            self.in_band_resize = true;
-            try writer.writeAll("\x1b[?2048h");
-            try writer.flush();
-        }
-        if (saved.paste) try vx.setBracketedPaste(writer, true);
-        if (saved.mouse) try mouse.enterCoordinates(vx, writer, saved.pixels);
-    }
-    fn cleanup(self: *TerminalModes, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
-        // Idempotent final resets use only a clean buffer. The one known kitty
-        // layer is popped at most once; an uncertain stack is never retried.
-        if (self.poisoned) _ = writer.consumeAll();
-        if (self.kitty and !self.kitty_uncertain) self.setKitty(vx, writer, false) catch {};
-        vx.state.kitty_keyboard = false;
-        if (self.in_band_resize) writer.writeAll("\x1b[?2048l") catch {
-            _ = writer.consumeAll();
-        };
-        if (self.unicode) writer.writeAll("\x1b[?2027l") catch {
-            _ = writer.consumeAll();
-        };
-        writer.flush() catch {
-            _ = writer.consumeAll();
-        };
-        vx.state.in_band_resize = false;
-        self.in_band_resize = false;
-        self.unicode = false;
-    }
-};
-
-const ForegroundWireWriter = struct {
-    writer: std.Io.Writer,
-    output: [1024]u8 = undefined,
-    used: usize = 0,
-    remaining: usize,
-    fn init(buffer: []u8, budget: usize) ForegroundWireWriter {
-        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer }, .remaining = budget };
-    }
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *ForegroundWireWriter = @alignCast(@fieldParentPtr("writer", writer));
-        if (self.remaining == 0) return error.WriteFailed;
-        const header = writer.buffered();
-        if (header.len > 0) {
-            const n = @min(header.len, self.remaining);
-            @memcpy(self.output[self.used..][0..n], header[0..n]);
-            self.used += n;
-            self.remaining -= n;
-            return writer.consume(n);
-        }
-        var consumed: usize = 0;
-        for (data[0 .. data.len - 1]) |chunk| {
-            const n = @min(chunk.len, self.remaining);
-            @memcpy(self.output[self.used..][0..n], chunk[0..n]);
-            self.used += n;
-            self.remaining -= n;
-            consumed += n;
-            if (n != chunk.len) return consumed;
-        }
-        for (0..splat) |_| {
-            const chunk = data[data.len - 1];
-            const n = @min(chunk.len, self.remaining);
-            @memcpy(self.output[self.used..][0..n], chunk[0..n]);
-            self.used += n;
-            self.remaining -= n;
-            consumed += n;
-            if (n != chunk.len) return consumed;
-        }
-        return consumed;
-    }
-};
-
-test "foreground uncertain buffered kitty bytes cannot replay during final cleanup" {
-    for ([_]bool{ false, true }) |enable| {
-        var env = try std.testing.environ.createMap(std.testing.allocator);
-        defer env.deinit();
-        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
-        var buffer: [64]u8 = undefined;
-        var writer = ForegroundWireWriter.init(&buffer, 2);
-        var modes: TerminalModes = .{ .kitty = !enable, .kitty_flags = 1, .in_band_resize = true };
-        vx.state.kitty_keyboard = !enable;
-        // Two bytes reach the simulated terminal, the remaining stack bytes
-        // stay buffered when the next native drain fails.
-        try std.testing.expectError(error.WriteFailed, modes.setKitty(&vx, &writer.writer, enable));
-        try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
-        try std.testing.expect(modes.kitty_uncertain);
-        try std.testing.expect(!vx.state.kitty_keyboard);
-        writer.remaining = 900;
-        modes.cleanup(&vx, &writer.writer);
-        vx.deinit(std.testing.allocator, &writer.writer);
-        const output = writer.output[0..writer.used];
-        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[>1u") == null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[<u") == null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2048l") != null);
-    }
-}
-
-test "foreground leave failures at every byte prevent duplicate kitty cleanup" {
-    // One real buffered writer, not a mock operation counter: exercise all
-    // partial boundaries of the finite leave sequence including its flushes.
-    for (0..90) |budget| {
-        var env = try std.testing.environ.createMap(std.testing.allocator);
-        defer env.deinit();
-        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
-        vx.state.kitty_keyboard = true;
-        vx.state.alt_screen = true;
-        vx.state.bracketed_paste = true;
-        vx.state.mouse = true;
-        var buffer: [64]u8 = undefined;
-        var writer = ForegroundWireWriter.init(&buffer, budget);
-        var modes: TerminalModes = .{ .kitty = true, .kitty_flags = 1, .in_band_resize = true, .unicode = true };
-        const mouse: terminal_mouse.Policy = .{ .enabled = true, .coordinate_protocol = .cell_sgr };
-        modes.leave(&vx, &writer.writer, mouse) catch {
-            try std.testing.expect(modes.poisoned);
-            try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
-        };
-        writer.remaining = 900;
-        modes.cleanup(&vx, &writer.writer);
-        vx.deinit(std.testing.allocator, &writer.writer);
-        try std.testing.expect(std.mem.count(u8, writer.output[0..writer.used], "\x1b[<u") <= 1);
-    }
-}
-
 test "foreground shutdown abandons queued command once and rejects followups" {
     const Harness = struct {
         var calls: usize = 0;
@@ -2627,106 +1978,4 @@ test "foreground shutdown abandons queued command once and rejects followups" {
     try std.testing.expectEqual(@as(usize, 1), Harness.calls);
     try std.testing.expectEqual(@as(usize, 1), Harness.frees);
     try std.testing.expectError(error.ForegroundCommandRuntimeStopped, app_ctx.terminal().runForegroundCommand(.{ .argv = &.{"never-spawn"}, .finished = Harness.done }));
-}
-
-test "foreground restore failures at every byte never replay the kitty push" {
-    for (0..90) |budget| {
-        var env = try std.testing.environ.createMap(std.testing.allocator);
-        defer env.deinit();
-        var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
-        var buffer: [64]u8 = undefined;
-        var writer = ForegroundWireWriter.init(&buffer, budget);
-        var modes: TerminalModes = .{};
-        const saved: TerminalModes.Saved = .{
-            .modes = .{ .kitty = true, .kitty_flags = 1, .in_band_resize = true, .unicode = true },
-            .alt = true,
-            .paste = true,
-            .mouse = true,
-            .pixels = true,
-        };
-        const mouse: terminal_mouse.Policy = .{ .enabled = true, .coordinate_protocol = .auto };
-        modes.restore(saved, &vx, &writer.writer, mouse) catch {
-            try std.testing.expect(modes.poisoned);
-            try std.testing.expectEqual(@as(usize, 0), writer.writer.end);
-        };
-        writer.remaining = 900;
-        modes.cleanup(&vx, &writer.writer);
-        vx.deinit(std.testing.allocator, &writer.writer);
-        const output = writer.output[0..writer.used];
-        try std.testing.expect(std.mem.count(u8, output, "\x1b[>1u") <= 1);
-        try std.testing.expect(std.mem.count(u8, output, "\x1b[<u") <= 1);
-    }
-}
-
-test {
-    _ = @import("program/timers.zig");
-    _ = frame_mod;
-    _ = events_mod;
-}
-
-test "event resize forces render and Renderer keeps view paint trace order" {
-    const Evidence = struct {
-        entries: std.ArrayList(runtime.TraceEvent) = .empty,
-        views: usize = 0,
-        fn record(context: ?*anyopaque, event: runtime.TraceEvent) void {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            self.entries.append(std.testing.allocator, event) catch unreachable;
-        }
-    };
-    const App = struct {
-        evidence: *Evidence,
-        size: vaxis.Winsize = .{ .rows = 0, .cols = 0, .x_pixel = 0, .y_pixel = 0 },
-        pub const Msg = vaxis.Winsize;
-        pub fn handleEvent(_: *@This(), event: types.Event) ?Msg {
-            return event.winsize;
-        }
-        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
-            self.size = msg;
-            ctx.redraw().skip();
-        }
-        pub fn view(self: *const @This(), sfc: *Surface) !void {
-            try std.testing.expectEqual(self.size.cols, sfc.size().width);
-            try std.testing.expectEqual(self.size.rows, sfc.size().height);
-            try std.testing.expectEqual(runtime.TraceEvent.view_start, self.evidence.entries.getLast());
-            self.evidence.views += 1;
-            // Exercise the renderer-owned scratch allocator on both renders.
-            const text = try sfc.arena.dupe(u8, "redraw");
-            _ = sfc.borrowTextAt(0, 0, text, .{});
-        }
-    };
-    var evidence: Evidence = .{};
-    defer evidence.entries.deinit(std.testing.allocator);
-    var app: App = .{ .evidence = &evidence };
-    var requests = requests_mod.Requests(App.Msg).init(std.testing.allocator, std.testing.io);
-    defer requests.deinit();
-    var ctx = ctx_mod.Ctx(App.Msg).init(&requests);
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    var buffer: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(std.testing.io, &buffer);
-    defer tty.deinit();
-    var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
-    defer vx.deinit(std.testing.allocator, tty.writer());
-    var images: terminal_image.Registry = .{};
-    defer images.deinit(std.testing.allocator);
-    var renderer = Renderer.init(std.testing.allocator);
-    defer renderer.deinit();
-    const opts: types.RunOptions = .{
-        .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io, .trace_fn = Evidence.record, .trace_context = &evidence },
-        .terminal = .{ .env_map = &env },
-    };
-    for ([_]bool{ false, true }) |measure| {
-        evidence.entries.clearRetainingCapacity();
-        var stats: ?runtime.RuntimeStats = if (measure) .{ .event_kind = .winsize, .event_count = 2, .frame_count = 1 } else null;
-        const ws: vaxis.Winsize = .{ .rows = 3, .cols = if (measure) 12 else 8, .x_pixel = 0, .y_pixel = 0 };
-        try std.testing.expect(try applyTerminalResize(App, &vx, &tty, &app, &ctx, std.testing.allocator, std.testing.io, &stats, opts, ws));
-        try std.testing.expect(requests.redrawWasSuppressed());
-        const timings = try renderer.render(App, &vx, &images, &app, tty.writer(), std.testing.io, measure, opts);
-        if (!measure) {
-            try std.testing.expectEqual(@as(u64, 0), timings.view_ns);
-            try std.testing.expectEqual(@as(u64, 0), timings.render_ns);
-        }
-        try std.testing.expectEqualSlices(runtime.TraceEvent, &.{ .handle_event_start, .handle_event_end, .update_start, .update_end, .view_start, .view_end, .render_start, .render_end }, evidence.entries.items);
-    }
-    try std.testing.expectEqual(@as(usize, 2), evidence.views);
 }

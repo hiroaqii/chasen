@@ -64,6 +64,15 @@ forced resize redraws, and the final stats callback for each turn.
 
 ## Input and Messages
 
+The internal `TerminalSession` is initialized in its final storage and owns the
+TTY buffer, Tty, Vaxis, input loop, terminal modes, resize polling, and suspension
+flag. It coordinates reader stop/restart around feature changes and foreground
+handoff. Program joins resize polling before the producer shutdown barrier;
+reader cancellation needs neither another concurrency slot nor a DSR response.
+`TerminalEffects` owns the image registry and processes foreground, clipboard,
+and image requests at their existing separate effect stages. App dispatch stays
+outside the session, and foreground restore does not emit a new resize event.
+
 `handleEvent` separates raw terminal input from application state transitions.
 
 A terminal key press is not always an application action. The same key event
