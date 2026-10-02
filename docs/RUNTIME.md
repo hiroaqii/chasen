@@ -131,6 +131,13 @@ thread. Headless tests use an explicitly initialized
 Task cancellation is an immediate notification; it still leaves joining and
 result cleanup to the runtime.
 
+`TaskRuntime(Msg)` owns live task nodes, starts workers, reaps completed
+supervisors, and handles cancellation and joining. Program binds it to Requests
+only in its final storage and unbinds it after joining. Shared terminal event
+and completion-buffer types live in `program_types.zig`; backend-independent
+frame timing lives in `runtime.zig`. The public root keeps the same event and
+option exports.
+
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct
 accessors because they are not runtime effects.

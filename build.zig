@@ -220,8 +220,8 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "vaxis", .module = vaxis.module("vaxis") },
-                    .{ .name = "chasen_program", .module = b.createModule(.{
-                        .root_source_file = b.path("src/program.zig"),
+                    .{ .name = "chasen_program_types", .module = b.createModule(.{
+                        .root_source_file = b.path("src/program_types.zig"),
                         .target = target,
                         .optimize = optimize,
                         .imports = &.{.{ .name = "vaxis", .module = vaxis.module("vaxis") }},

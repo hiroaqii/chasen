@@ -20,6 +20,16 @@ pub const RuntimeEffectKind = runtime_effect.RuntimeEffectKind;
 pub const EffectSupport = runtime_effect.EffectSupport;
 pub const BrowserInitialEffects = runtime_effect.BrowserInitialEffects;
 
+/// Frame timing delivered by `Event.frame`.
+pub const Frame = struct {
+    /// Monotonic timestamp for this frame, in nanoseconds.
+    now_ns: u64,
+    /// Nanoseconds since the previous frame timestamp.
+    delta_ns: u64,
+    /// Monotonic frame counter starting at 0.
+    index: u64,
+};
+
 /// Declares how an app root message is disposed when the runtime can no longer
 /// deliver it to `App.update`.
 ///

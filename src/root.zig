@@ -1,6 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const terminal_mouse = @import("terminal_mouse.zig");
+const program_types = @import("program_types.zig");
 
 pub const runtime = @import("runtime.zig");
 
@@ -78,78 +78,19 @@ const program = @import("program.zig");
 pub const Key = vaxis.Key;
 
 /// Frame timing delivered by `Event.frame`.
-pub const Frame = struct {
-    /// Monotonic timestamp for this frame, in nanoseconds.
-    now_ns: u64,
-    /// Nanoseconds since the previous frame timestamp.
-    delta_ns: u64,
-    /// Monotonic frame counter starting at 0.
-    index: u64,
-};
+pub const Frame = runtime.Frame;
 
 /// Terminal event type passed to `handleEvent`.
-pub const Event = union(enum) {
-    key_press: vaxis.Key,
-    mouse: vaxis.Mouse,
-    winsize: vaxis.Winsize,
-    /// Bracketed-paste content. Only valid during the current event dispatch.
-    /// OSC 52 clipboard-read responses are not exposed as application events.
-    paste: []const u8,
-    focus_in,
-    focus_out,
-    /// Requested animation/media frame.
-    frame: Frame,
-};
+pub const Event = program_types.Event;
 
 pub const AppDeinitContext = runtime.AppDeinitContext;
 
 pub const RuntimeOptions = runtime.RuntimeOptions;
 
-pub const KeyboardProtocol = enum {
-    /// Do not enable enhanced keyboard protocols. This is the most compatible
-    /// mode for IME composition and language toggles.
-    legacy,
-    /// Enable Kitty keyboard protocol when the terminal reports support.
-    ///
-    /// This can improve modified-key reporting, but some terminal/IME
-    /// combinations deliver language toggle keys to the app instead of the
-    /// input method while this mode is active.
-    kitty,
-};
-
-/// Coordinate protocol used for terminal mouse reports.
-pub const MouseCoordinateProtocol = terminal_mouse.CoordinateProtocol;
-
-/// Terminal-backend options for `runWith`.
-pub const TerminalOptions = struct {
-    env_map: *std.process.Environ.Map,
-    /// Optional terminal image path loader.
-    ///
-    /// Leave null when the app does not load terminal images. Terminal-only
-    /// runners can provide an adapter outside core when image decode/transmit
-    /// support is needed.
-    image_path_loader: ?TerminalImagePathLoaderFn = null,
-    /// Optional caller-owned context passed to `image_path_loader`.
-    image_loader_context: ?*anyopaque = null,
-    /// Enable terminal mouse reporting for apps that handle `Event.mouse`.
-    ///
-    /// This is opt-in because terminal mouse reporting can interfere with
-    /// normal text selection/copy in many terminal emulators.
-    mouse: bool = false,
-    /// Coordinate protocol used when mouse reporting is enabled.
-    ///
-    /// Cell SGR is the portable default across terminals and multiplexers.
-    /// Use `.auto` only when the complete terminal path preserves pixel SGR.
-    mouse_coordinate_protocol: MouseCoordinateProtocol = .cell_sgr,
-    /// Keyboard protocol used by the terminal backend.
-    keyboard_protocol: KeyboardProtocol = .legacy,
-};
-
-/// Options for the low-level `runWith` entry point.
-pub const RunOptions = struct {
-    runtime: RuntimeOptions,
-    terminal: TerminalOptions,
-};
+pub const KeyboardProtocol = program_types.KeyboardProtocol;
+pub const MouseCoordinateProtocol = program_types.MouseCoordinateProtocol;
+pub const TerminalOptions = program_types.TerminalOptions;
+pub const RunOptions = program_types.RunOptions;
 
 /// Run the application (Juicy Main API).
 ///
@@ -222,6 +163,8 @@ test "TerminalOptions mouse coordinate protocol defaults to portable cell sgr" {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("program.zig");
+    _ = @import("program_types.zig");
+    _ = @import("program/tasks.zig");
     _ = @import("requests.zig");
     _ = @import("state_store.zig");
 }

@@ -82,7 +82,8 @@ before `App.deinit`:
 2. Cancel the existing tty reader without allocating a helper and drain events.
 3. Cancel frame and timer futures.
 4. Await task supervisors, each the sole owner of its worker Future; deinitialize
-   undelivered results on runtime, after worker-side context cleanup completes.
+   undelivered results on runtime, after worker-side context cleanup completes,
+   then unbind the task cancellation connection from Requests.
 5. Drain already-posted messages and unapplied runtime-thread completions.
 6. Clean remaining foreground/clipboard effects and run `App.deinit`, followed
    by terminal and image-registry cleanup.
@@ -139,6 +140,12 @@ stop, undo effects, guarantee an exit deadline, or determine staleness. Keep
 application generations/identity checks. Cancellation during full-queue result
 transfer returns the owned Msg for runtime destruction. Non-cooperative tasks
 can still delay shutdown.
+
+The internal `TaskRuntime(Msg)` owns the stable nodes and supervisor Futures.
+Requests owns only pending entries and the borrowed cancellation connection;
+it does not store the live-task registry. Program requests shutdown before any
+producer join and keeps this owner in place until joining has removed the
+connection.
 
 A supervisor waits for publication of its optional worker Future, then for
 completion or a cancellation request, and alone awaits/cancels that Future.

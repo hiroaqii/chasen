@@ -127,3 +127,9 @@ exercise production admission and batch ownership; Program tests cover reentrant
 clipboard draining and error cleanup, and the separate consumer test checks the
 public testing boundary. See [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md#tests-and-migration)
 and [Authoring Components](AUTHORING_COMPONENTS.md#testing-surface-drawing).
+
+Live-task ownership tests live alongside `TaskRuntime` in `src/program/tasks.zig`.
+The root test entry imports that module and `program_types.zig` explicitly.
+Program retains the integration tests for shutdown notification before joining
+and task-start completions in bounded effect draining. The OSC 52 executable
+imports the same `InternalEvent` from `program_types.zig` as the terminal runner.

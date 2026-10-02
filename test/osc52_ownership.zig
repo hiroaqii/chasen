@@ -1,13 +1,13 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const program = @import("chasen_program");
+const program_types = @import("chasen_program_types");
 
 const TestMsg = union(enum) {
     noop,
 
     pub const undelivered_policy = .plain;
 };
-const Event = program.InternalEvent(TestMsg);
+const Event = program_types.InternalEvent(TestMsg);
 
 // Build as an executable, not a Zig test artifact: the pinned libvaxis TestTty
 // lacks resetSignalHandler on macOS. Its production Tty has that method. This

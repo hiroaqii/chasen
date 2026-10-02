@@ -1,0 +1,147 @@
+const std = @import("std");
+const vaxis = @import("vaxis");
+const runtime = @import("runtime.zig");
+const runtime_limits = @import("runtime_limits.zig");
+const terminal_image = @import("terminal_image.zig");
+const terminal_mouse = @import("terminal_mouse.zig");
+
+/// Terminal event type passed to `handleEvent`.
+pub const Event = union(enum) {
+    key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
+    winsize: vaxis.Winsize,
+    /// Bracketed-paste content. Only valid during the current event dispatch.
+    /// OSC 52 clipboard-read responses are not exposed as application events.
+    paste: []const u8,
+    focus_in,
+    focus_out,
+    /// Requested animation/media frame.
+    frame: runtime.Frame,
+};
+
+pub const KeyboardProtocol = enum {
+    /// Do not enable enhanced keyboard protocols. This is the most compatible
+    /// mode for IME composition and language toggles.
+    legacy,
+    /// Enable Kitty keyboard protocol when the terminal reports support.
+    ///
+    /// This can improve modified-key reporting, but some terminal/IME
+    /// combinations deliver language toggle keys to the app instead of the
+    /// input method while this mode is active.
+    kitty,
+};
+
+/// Coordinate protocol used for terminal mouse reports.
+pub const MouseCoordinateProtocol = terminal_mouse.CoordinateProtocol;
+
+/// Terminal-backend options for `runWith`.
+pub const TerminalOptions = struct {
+    env_map: *std.process.Environ.Map,
+    /// Optional terminal image path loader.
+    ///
+    /// Leave null when the app does not load terminal images. Terminal-only
+    /// runners can provide an adapter outside core when image decode/transmit
+    /// support is needed.
+    image_path_loader: ?terminal_image.PathLoaderFn = null,
+    /// Optional caller-owned context passed to `image_path_loader`.
+    image_loader_context: ?*anyopaque = null,
+    /// Enable terminal mouse reporting for apps that handle `Event.mouse`.
+    ///
+    /// This is opt-in because terminal mouse reporting can interfere with
+    /// normal text selection/copy in many terminal emulators.
+    mouse: bool = false,
+    /// Coordinate protocol used when mouse reporting is enabled.
+    ///
+    /// Cell SGR is the portable default across terminals and multiplexers.
+    /// Use `.auto` only when the complete terminal path preserves pixel SGR.
+    mouse_coordinate_protocol: MouseCoordinateProtocol = .cell_sgr,
+    /// Keyboard protocol used by the terminal backend.
+    keyboard_protocol: KeyboardProtocol = .legacy,
+};
+
+/// Options for the low-level `runWith` entry point.
+pub const RunOptions = struct {
+    runtime: runtime.RuntimeOptions,
+    terminal: TerminalOptions,
+};
+
+// Shared with the OSC 52 regression executable so it uses the runtime's exact
+// event type. This is internal to Chasen and is not re-exported by root.zig.
+pub fn InternalEvent(comptime Msg: type) type {
+    return union(enum) {
+        key_press: vaxis.Key,
+        winsize: vaxis.Winsize,
+        mouse: vaxis.Mouse,
+        focus_in,
+        focus_out,
+        // Deliberately no libvaxis `.paste` field. Chasen does not expose an
+        // OSC 52 clipboard-read request; ordinary user paste is assembled from
+        // the bracketed-paste markers below. Without this field libvaxis frees
+        // an unsolicited OSC 52 response immediately instead of transferring
+        // allocator-owned text through its blocking event-queue post.
+        paste_start,
+        paste_end,
+        frame: runtime.Frame,
+        frame_canceled,
+        /// Non-owning wake for a coalesced resize poll. The latest size is
+        /// stored outside the bounded queue so a full queue never loses the
+        /// final resize.
+        resize_pending,
+        /// Wakes the main loop when a bounded synchronous effect drain leaves
+        /// work for another pass. It carries no app-owned payload.
+        continue_effect_drain,
+
+        /// Async task result injected via postEvent.
+        user_msg: Msg,
+    };
+}
+
+pub fn RuntimeCompletionBuffer(comptime Msg: type) type {
+    return struct {
+        const Self = @This();
+        // A single drain pass can manufacture at most one completion per
+        // queued task start failure and terminal image load. Preallocating the
+        // sum keeps runtime-thread callbacks allocation-free, which avoids an
+        // error path that would otherwise need another callback transport.
+        pub const capacity = runtime_limits.max_tasks + runtime_limits.max_terminal_image_loads;
+
+        items: std.ArrayList(Msg) = .empty,
+
+        pub fn init(self: *Self, allocator: std.mem.Allocator) !void {
+            try self.items.ensureTotalCapacityPrecise(allocator, capacity);
+        }
+
+        pub fn append(self: *Self, msg: Msg) error{RuntimeCompletionLimitExceeded}!void {
+            if (self.items.items.len >= capacity) return error.RuntimeCompletionLimitExceeded;
+            self.items.appendAssumeCapacity(msg);
+        }
+
+        pub fn deinitUndelivered(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.items.items) |*msg| {
+                runtime.deinitUndeliveredMessage(Msg, msg, allocator);
+            }
+            self.items.deinit(allocator);
+            self.* = .{};
+        }
+    };
+}
+
+test "InternalEvent instantiation" {
+    const TestMsg = union(enum) { hello, value: u32 };
+    const TestEvent = InternalEvent(TestMsg);
+
+    const ev: TestEvent = .{ .user_msg = .hello };
+    try std.testing.expect(ev == .user_msg);
+
+    const key_ev: TestEvent = .{ .key_press = .{ .codepoint = 'a' } };
+    try std.testing.expect(key_ev == .key_press);
+
+    const paste_start_ev: TestEvent = .paste_start;
+    try std.testing.expect(paste_start_ev == .paste_start);
+
+    const paste_end_ev: TestEvent = .paste_end;
+    try std.testing.expect(paste_end_ev == .paste_end);
+
+    const frame_ev: TestEvent = .{ .frame = .{ .now_ns = 100, .delta_ns = 16, .index = 2 } };
+    try std.testing.expect(frame_ev == .frame);
+}
