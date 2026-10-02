@@ -59,7 +59,7 @@ Internally, `Events` owns bracketed-paste accumulation and the shared synchronou
 `handleEvent`/`update` path. Each message resets redraw suppression before update;
 an update error still leaves its message owned by the app. The small `Renderer`
 inside Program owns the reusable frame arena and keeps view and terminal paint
-timings separate. Program retains event/frame counters, effect-drain order,
+timings separate. Program retains event/frame counters, effect-drain boundaries,
 forced resize redraws, and the final stats callback for each turn.
 
 ## Input and Messages
@@ -154,9 +154,9 @@ and completion-buffer types live in `program_types.zig`; backend-independent
 frame timing lives in `runtime.zig`. The public root keeps the same event and
 option exports.
 
-`TimerRuntime(Msg)` owns each running timer's copied ID and Future. Program
-calls its cancel, tick, and every stages in that order and shuts it down before
-joining tasks. Same-ID replacement cancels and joins the old Future before
+`TimerRuntime(Msg)` owns each running timer's copied ID and Future. The effect
+coordinator calls its cancel, tick, and every stages in that order; Program shuts
+it down before joining tasks. Same-ID replacement cancels and joins the old Future before
 starting the replacement. It shares the non-owning queue-post helper in
 `program_types.zig` with frames; completed one-shot retention is unchanged.
 
@@ -168,10 +168,15 @@ accessors because they are not runtime effects.
 is reset before each `update`; queued effects still drain. Resize redraws even
 when the app suppresses redraw.
 
+The internal `Effects(Msg)` owns the runtime-thread completion buffer and the
+continuation-wake flag. It borrows the request and live owners during each drain;
+Program keeps startup, event turns, rendering, and shutdown order explicit.
 Each effect-drain pass processes runtime-thread completions, foreground commands,
 clipboard writes, tasks, timer cancels, one-shot timers, repeating timers, images,
 and frame requests in that order. Follow-up synchronous effects are processed
-in bounded rounds; remaining work is continued on a later event-loop turn.
+in at most eight rounds. Remaining work schedules one coalesced continuation
+event. If the queue is full, its existing events already guarantee another turn;
+the flag stays clear so a later drain can enqueue a wake.
 
 Each stage detaches its own fixed-capacity value batch immediately before use.
 Follow-up requests occupy separate pending storage, so an update cannot overwrite

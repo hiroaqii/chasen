@@ -84,7 +84,8 @@ before `App.deinit`:
 4. Await task supervisors, each the sole owner of its worker Future; deinitialize
    undelivered results on runtime, after worker-side context cleanup completes,
    then unbind the task cancellation connection from Requests.
-5. Drain already-posted messages and unapplied runtime-thread completions.
+5. Drain already-posted messages, then release unapplied runtime-thread
+   completions through their `Effects` owner.
 6. Clean remaining foreground/clipboard effects and run `App.deinit`, followed
    by terminal and image-registry cleanup.
 
@@ -295,9 +296,11 @@ TaskId. Runtime ownership entry points live on Requests, not the app facade.
 Task start failures and terminal image load callbacks are produced on the
 runtime thread. They must not be posted back into the same bounded queue that
 the runtime thread consumes: a full queue would self-deadlock. Chasen stores
-them in a preallocated bounded completion buffer and applies them at the start
-of the next effect-drain round. A continuation event schedules another main
-loop turn when the bounded synchronous drain limit is reached.
+them in the `Effects` owner's preallocated bounded completion buffer and applies
+them at the start of the next effect-drain round. On update error, the delivered
+message stays app-owned and the unapplied suffix is destroyed once. A coalesced
+continuation event schedules another main loop turn after eight synchronous
+rounds; a full queue already guarantees another turn.
 
 Terminal image callback messages carry registry handles, not independent image
 allocations. `deinitUndelivered` must not unload such a handle during shutdown;
