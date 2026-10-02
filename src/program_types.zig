@@ -145,3 +145,19 @@ test "InternalEvent instantiation" {
     const frame_ev: TestEvent = .{ .frame = .{ .now_ns = 100, .delta_ns = 16, .index = 2 } };
     try std.testing.expect(frame_ev == .frame);
 }
+
+/// Post a plain/copy-safe internal event without blocking shutdown behind a
+/// full queue. Timer templates are documented as non-owning in the current API.
+pub fn postPlainUntilShutdown(
+    comptime Msg: type,
+    event: InternalEvent(Msg),
+    io: std.Io,
+    loop: *vaxis.Loop(InternalEvent(Msg)),
+    shutting_down: *const std.atomic.Value(bool),
+) void {
+    while (!shutting_down.load(.seq_cst)) {
+        const posted = loop.tryPostEvent(event) catch return;
+        if (posted) return;
+        io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake) catch return;
+    }
+}

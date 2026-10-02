@@ -138,6 +138,12 @@ and completion-buffer types live in `program_types.zig`; backend-independent
 frame timing lives in `runtime.zig`. The public root keeps the same event and
 option exports.
 
+`TimerRuntime(Msg)` owns each running timer's copied ID and Future. Program
+calls its cancel, tick, and every stages in that order and shuts it down before
+joining tasks. Same-ID replacement cancels and joins the old Future before
+starting the replacement. It shares the non-owning queue-post helper in
+`program_types.zig` with frames; completed one-shot retention is unchanged.
+
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct
 accessors because they are not runtime effects.

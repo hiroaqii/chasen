@@ -10,6 +10,7 @@ const types = @import("program_types.zig");
 const InternalEvent = types.InternalEvent;
 const RuntimeCompletionBuffer = types.RuntimeCompletionBuffer;
 const TaskRuntime = @import("program/tasks.zig").TaskRuntime;
+const TimerRuntime = @import("program/timers.zig").TimerRuntime;
 const terminal_image = @import("terminal_image.zig");
 const terminal_mouse = @import("terminal_mouse.zig");
 const foreground_job = @import("foreground_job.zig");
@@ -18,7 +19,6 @@ const foreground_command = @import("foreground_command.zig");
 const frame_interval_ns: u64 = std.time.ns_per_s / 60;
 const resize_poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 const max_effect_drain_rounds: usize = 8;
-const delivery_retry_ns: u64 = 100 * std.time.ns_per_us;
 
 const EffectDrainResult = struct {
     needs_render: bool = false,
@@ -146,22 +146,6 @@ fn ResizePollState(comptime Msg: type) type {
     };
 }
 
-/// Post a plain/copy-safe internal event without blocking shutdown behind a
-/// full queue. Timer templates are documented as non-owning in the current API.
-fn postPlainUntilShutdown(
-    comptime Msg: type,
-    event: InternalEvent(Msg),
-    io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    shutting_down: *const std.atomic.Value(bool),
-) void {
-    while (!shutting_down.load(.seq_cst)) {
-        const posted = loop.tryPostEvent(event) catch return;
-        if (posted) return;
-        io.sleep(.fromNanoseconds(delivery_retry_ns), .awake) catch return;
-    }
-}
-
 /// Converts terminal bracketed-paste marker events into one public Event.paste.
 ///
 /// vaxis exposes bracketed paste as `paste_start`, many ordinary `key_press`
@@ -270,45 +254,6 @@ fn pasteControlText(key: vaxis.Key) ?[]const u8 {
     };
 }
 
-/// Sleeps for `after_ns` then posts `msg` once.
-fn TickHelper(comptime Msg: type) type {
-    const Event = InternalEvent(Msg);
-    return struct {
-        fn run(
-            after_ns: u64,
-            msg: Msg,
-            tick_io: std.Io,
-            loop_ptr: *vaxis.Loop(Event),
-            shutting_down: *const std.atomic.Value(bool),
-        ) void {
-            tick_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
-            postPlainUntilShutdown(Msg, .{ .user_msg = msg }, tick_io, loop_ptr, shutting_down);
-        }
-    };
-}
-
-/// Repeating timer: sleeps for `interval_ns`, posts `msg`, and loops forever.
-/// Stops when the future is cancelled (sleep returns error).
-fn EveryHelper(comptime Msg: type) type {
-    const Event = InternalEvent(Msg);
-    return struct {
-        fn run(
-            interval_ns: u64,
-            msg: Msg,
-            every_io: std.Io,
-            loop_ptr: *vaxis.Loop(Event),
-            suspended: *std.atomic.Value(bool),
-            shutting_down: *const std.atomic.Value(bool),
-        ) void {
-            while (!shutting_down.load(.seq_cst)) {
-                every_io.sleep(.fromNanoseconds(@intCast(interval_ns)), .awake) catch return;
-                if (suspended.load(.seq_cst)) continue;
-                postPlainUntilShutdown(Msg, .{ .user_msg = msg }, every_io, loop_ptr, shutting_down);
-            }
-        }
-    };
-}
-
 /// Sleeps until the next frame slot then posts a frame event.
 fn FrameHelper(comptime Msg: type) type {
     const Event = InternalEvent(Msg);
@@ -324,11 +269,11 @@ fn FrameHelper(comptime Msg: type) type {
         ) void {
             frame_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
             if (suspended.load(.seq_cst)) {
-                postPlainUntilShutdown(Msg, .frame_canceled, frame_io, loop_ptr, shutting_down);
+                types.postPlainUntilShutdown(Msg, .frame_canceled, frame_io, loop_ptr, shutting_down);
                 return;
             }
             const now_ns = timestampNs(frame_io);
-            postPlainUntilShutdown(Msg, .{ .frame = .{
+            types.postPlainUntilShutdown(Msg, .{ .frame = .{
                 .now_ns = now_ns,
                 .delta_ns = deltaNs(last_frame_ns, now_ns),
                 .index = index,
@@ -336,12 +281,6 @@ fn FrameHelper(comptime Msg: type) type {
         }
     };
 }
-
-/// A running timer tracked by id so it can be cancelled.
-const TimerHandle = struct {
-    id: []const u8,
-    future: std.Io.Future(void),
-};
 
 const RenderTimings = struct {
     view_ns: u64 = 0,
@@ -463,11 +402,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     // Bind the live-task owner only after its final stack placement.
     var tasks = TaskRuntime(Msg).init(allocator, io);
 
-    // --- Running timers (id-tracked for cancel support) ---
-    // Completed one-shot ticks remain here until shutdown because std.Io.Future
-    // has no non-blocking completion check. This is not a leak, but apps should
-    // avoid creating unbounded unique timer ids in long-lived sessions.
-    var running_timers: std.ArrayList(TimerHandle) = .empty;
+    var timers = TimerRuntime(Msg).init(allocator, io);
     var runtime_completions: RuntimeCompletionBuffer(Msg) = .{};
     try runtime_completions.init(allocator);
     tasks.bind(app_ctx.requests);
@@ -480,7 +415,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         App,
         &app_ctx,
         &tasks,
-        &running_timers,
+        &timers,
         &runtime_completions,
         &frame_future,
         &loop,
@@ -514,7 +449,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         // Process tasks, ticks, and everys spawned during init
         trace(opts, .effect_drain_start);
         var init_stats: ?runtime.RuntimeStats = null;
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &init_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     }
 
@@ -531,7 +466,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         trace(opts, .event_received);
         _ = try dispatchAppEvent(App, &app, .{ .winsize = ws }, &app_ctx, io, &initial_stats, opts);
         trace(opts, .effect_drain_start);
-        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, &terminal_modes, opts);
+        _ = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &initial_stats, mouse_policy, &terminal_modes, opts);
         trace(opts, .effect_drain_end);
     } else |_| {}
 
@@ -642,7 +577,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         }
         // Drain effects even when the app already requested a redraw; using
         // short-circuit `or` here would delay queued effects until the next event.
-        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &running_timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, &terminal_modes, opts);
+        const effect_result = try drainPendingEffects(App, &app, &app_ctx, &tasks, &timers, &runtime_completions, &terminal_images, &vx, &tty, allocator, io, &loop, &runtime_suspended, &runtime_shutting_down, &frame_in_flight, &frame_future, &effect_drain_continuation_pending, last_frame_ns, next_frame_index, &stats, mouse_policy, &terminal_modes, opts);
         needs_render = needs_render or effect_result.needs_render;
         if (stats) |*s| s.effect_drain_ns = timingElapsed(effect_drain_start, io);
         trace(opts, .effect_drain_end);
@@ -674,7 +609,7 @@ fn shutdownRuntime(
     comptime App: type,
     app_ctx: *ctx_mod.Ctx(App.Msg),
     tasks: *TaskRuntime(App.Msg),
-    running_timers: *std.ArrayList(TimerHandle),
+    timers: *TimerRuntime(App.Msg),
     runtime_completions: *RuntimeCompletionBuffer(App.Msg),
     frame_future: *?std.Io.Future(void),
     loop: *vaxis.Loop(InternalEvent(App.Msg)),
@@ -699,12 +634,7 @@ fn shutdownRuntime(
         frame_future.* = null;
     }
 
-    for (running_timers.items) |*handle| {
-        _ = handle.future.cancel(io);
-        allocator.free(handle.id);
-    }
-    running_timers.deinit(allocator);
-    running_timers.* = .empty;
+    timers.shutdown();
 
     // A worker outcome is exclusive: `.posted` means the queue owns the Msg;
     // `.undelivered` means the future still owns it. Drain once more after all
@@ -1002,7 +932,7 @@ fn drainPendingEffects(
     app: *App,
     app_ctx: *ctx_mod.Ctx(App.Msg),
     tasks: *TaskRuntime(App.Msg),
-    running_timers: *std.ArrayList(TimerHandle),
+    timers: *TimerRuntime(App.Msg),
     runtime_completions: *RuntimeCompletionBuffer(App.Msg),
     terminal_images: *terminal_image.Registry,
     vx: *vaxis.Vaxis,
@@ -1033,9 +963,9 @@ fn drainPendingEffects(
         const clipboard_needs_render = try processPendingClipboardCopies(App, app, app_ctx, vx, tty, allocator, io, stats, opts);
         result.needs_render = result.needs_render or clipboard_needs_render;
         try tasks.startPending(app_ctx.requests, runtime_completions, loop, shutting_down);
-        processPendingCancels(Msg, app_ctx, running_timers, allocator, io);
-        try spawnPendingTicks(Msg, app_ctx, running_timers, allocator, io, loop, shutting_down);
-        try spawnPendingEvery(Msg, app_ctx, running_timers, allocator, io, loop, suspended, shutting_down);
+        timers.cancelPending(app_ctx.requests);
+        timers.startTicks(app_ctx.requests, loop, shutting_down);
+        timers.startEvery(app_ctx.requests, loop, suspended, shutting_down);
         try processPendingTerminalImages(Msg, app_ctx, runtime_completions, terminal_images, vx, tty.writer(), allocator, opts);
         startPendingFrame(Msg, app_ctx, io, loop, suspended, shutting_down, frame_in_flight, frame_future, last_frame_ns, next_frame_index);
 
@@ -1232,112 +1162,6 @@ fn startPendingFrame(
         .{ after_ns, last_frame_ns, next_frame_index, io, loop, suspended, shutting_down },
     ) catch return;
     frame_in_flight.* = true;
-}
-
-/// Starts tick timers queued in Ctx and tracks their futures for shutdown.
-/// If a running timer with the same id exists, it is cancelled first.
-fn spawnPendingTicks(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    running_timers: *std.ArrayList(TimerHandle),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    shutting_down: *const std.atomic.Value(bool),
-) !void {
-    // Take ownership of queued copies before processing. Zeroing the queue
-    // first keeps run()'s unwind cleanup from freeing ids after they have been
-    // handed to running_timers.
-    var pending_ticks = app_ctx.requests.detachTicks();
-    defer pending_ticks.deinit();
-
-    while (pending_ticks.next()) |entry| {
-        var owned_id: ?[]const u8 = entry.id;
-        defer if (owned_id) |id| allocator.free(id);
-
-        // Cancel existing timer with the same id.
-        cancelRunningTimer(running_timers, allocator, entry.id, io);
-
-        var future = io.concurrent(
-            TickHelper(Msg).run,
-            .{ entry.after_ns, entry.msg, io, loop, shutting_down },
-        ) catch continue;
-        running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
-            _ = future.cancel(io);
-            continue;
-        };
-        owned_id = null;
-    }
-}
-
-/// Starts repeating timers queued in Ctx and tracks their futures for shutdown.
-/// If a running timer with the same id exists, it is cancelled first.
-fn spawnPendingEvery(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    running_timers: *std.ArrayList(TimerHandle),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    loop: *vaxis.Loop(InternalEvent(Msg)),
-    suspended: *std.atomic.Value(bool),
-    shutting_down: *const std.atomic.Value(bool),
-) !void {
-    // Take ownership of queued copies before processing. Zeroing the queue
-    // first keeps run()'s unwind cleanup from freeing ids after they have been
-    // handed to running_timers.
-    var pending_everys = app_ctx.requests.detachEverys();
-    defer pending_everys.deinit();
-
-    while (pending_everys.next()) |entry| {
-        var owned_id: ?[]const u8 = entry.id;
-        defer if (owned_id) |id| allocator.free(id);
-
-        // Cancel existing timer with the same id.
-        cancelRunningTimer(running_timers, allocator, entry.id, io);
-
-        var future = io.concurrent(
-            EveryHelper(Msg).run,
-            .{ entry.interval_ns, entry.msg, io, loop, suspended, shutting_down },
-        ) catch continue;
-        running_timers.append(allocator, .{ .id = entry.id, .future = future }) catch {
-            _ = future.cancel(io);
-            continue;
-        };
-        owned_id = null;
-    }
-}
-
-/// Cancel a running timer by id (swap-remove).
-fn cancelRunningTimer(running_timers: *std.ArrayList(TimerHandle), allocator: std.mem.Allocator, id: []const u8, io: std.Io) void {
-    var i: usize = 0;
-    while (i < running_timers.items.len) {
-        if (std.mem.eql(u8, running_timers.items[i].id, id)) {
-            _ = running_timers.items[i].future.cancel(io);
-            allocator.free(running_timers.items[i].id);
-            _ = running_timers.swapRemove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Process pending cancel requests from Ctx.
-fn processPendingCancels(
-    comptime Msg: type,
-    app_ctx: *ctx_mod.Ctx(Msg),
-    running_timers: *std.ArrayList(TimerHandle),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) void {
-    // Take ownership of queued cancel ids before processing so unwind cleanup
-    // only sees entries that have not reached the drain step.
-    var pending_cancels = app_ctx.requests.detachCancels();
-    defer pending_cancels.deinit();
-
-    while (pending_cancels.next()) |id| {
-        defer allocator.free(id);
-        cancelRunningTimer(running_timers, allocator, id, io);
-    }
 }
 
 fn processPendingTerminalImages(
@@ -1603,7 +1427,7 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
             try std.testing.expectEqual(@as(usize, 0), slow.count.load(.acquire));
             release.set(io);
         }
-        var timers: std.ArrayList(TimerHandle) = .empty;
+        var timers = TimerRuntime(Msg).init(allocator, io);
         var frame: ?std.Io.Future(void) = null;
         shutdownRuntime(Task.App, &ctx, &tasks, &timers, &completions, &frame, &loop, allocator, io, &shutting_down);
         try std.testing.expect(ctx.requests._task_runtime == null);
@@ -1881,7 +1705,8 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
     var app_ctx = ctx_mod.Ctx(TestMsg).init(&app_ctx_requests);
     var tasks = TaskRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
     defer tasks.join(app_ctx.requests);
-    var running_timers: std.ArrayList(TimerHandle) = .empty;
+    var timers = TimerRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);
+    defer timers.shutdown();
     var completions: RuntimeCompletionBuffer(TestMsg) = .{};
     try completions.init(std.testing.allocator);
     defer completions.deinitUndelivered(std.testing.allocator);
@@ -1905,7 +1730,7 @@ test "runtime completion follow-up effect runs in next bounded drain round" {
         &app,
         &app_ctx,
         &tasks,
-        &running_timers,
+        &timers,
         &completions,
         &terminal_images,
         undefined,
@@ -3247,4 +3072,8 @@ test "foreground restore failures at every byte never replay the kitty push" {
         try std.testing.expect(std.mem.count(u8, output, "\x1b[>1u") <= 1);
         try std.testing.expect(std.mem.count(u8, output, "\x1b[<u") <= 1);
     }
+}
+
+test {
+    _ = @import("program/timers.zig");
 }

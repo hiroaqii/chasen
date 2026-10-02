@@ -298,6 +298,12 @@ may copy, replace, repeat, cancel, or drop those templates without invoking
 An app may still use `.deinit` for its root `Msg` when task results own memory;
 the particular variants used as timer templates must be plain values.
 
+Pending copied IDs belong to Requests until each timer stage detaches its batch.
+`TimerRuntime` then owns the running ID/Future pair. Replacement cancels and joins
+the old Future before freeing its ID. A start failure frees the new ID; a tracking
+allocation failure first cancels the new Future, then frees its ID. Cancel and
+shutdown use the same owner, without applying a Msg destructor to the template.
+
 ## Review checklist
 
 When adding a new asynchronously produced message variant:
