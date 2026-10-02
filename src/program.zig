@@ -159,6 +159,55 @@ const RenderTimings = struct {
     render_ns: u64 = 0,
 };
 
+const Renderer = struct {
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: std.mem.Allocator) Renderer {
+        return .{ .arena = .init(allocator) };
+    }
+
+    fn deinit(self: *Renderer) void {
+        self.arena.deinit();
+    }
+
+    fn render(
+        self: *Renderer,
+        comptime App: type,
+        vx: *vaxis.Vaxis,
+        terminal_images: *terminal_image.Registry,
+        app: *const App,
+        writer: *std.Io.Writer,
+        io: std.Io,
+        measure: bool,
+        opts: types.RunOptions,
+    ) !RenderTimings {
+        // Reuse frame scratch capacity across renders to avoid per-frame allocator churn.
+        _ = self.arena.reset(.retain_capacity);
+
+        const win = vx.window();
+        win.clear();
+
+        var sfc: Surface = .initVaxis(win, self.arena.allocator(), terminal_images);
+
+        trace(opts, .view_start);
+        const view_start = timingStart(measure, io);
+        try app.view(&sfc);
+        const view_ns = if (measure) timingElapsed(view_start, io) else 0;
+        trace(opts, .view_end);
+
+        trace(opts, .render_start);
+        const render_start = timingStart(measure, io);
+        try vx.render(writer);
+        const render_ns = if (measure) timingElapsed(render_start, io) else 0;
+        trace(opts, .render_end);
+
+        return .{
+            .view_ns = view_ns,
+            .render_ns = render_ns,
+        };
+    }
+};
+
 pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     const Msg = App.Msg;
     const Event = InternalEvent(Msg);
@@ -242,8 +291,8 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     }
 
     // --- Frame arena ---
-    var frame_arena: std.heap.ArenaAllocator = .init(allocator);
-    defer frame_arena.deinit();
+    var renderer = Renderer.init(allocator);
+    defer renderer.deinit();
 
     // --- App state ---
     var app = initial_app;
@@ -340,7 +389,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     } else |_| {}
 
     // Initial render
-    _ = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, false, opts);
+    _ = try renderer.render(App, &vx, &terminal_images, &app, tty.writer(), io, false, opts);
 
     if (use_resize_poll) {
         resize_thread = try std.Thread.spawn(.{
@@ -367,8 +416,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
             .winsize => |ws| {
                 // Resize always redraws so the screen buffer matches the new
                 // terminal size; redraw().skip() only applies to app-driven messages.
-                try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
-                needs_render = true;
+                needs_render = try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
             },
             .user_msg => |msg| {
                 needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats, opts);
@@ -410,8 +458,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         // full queue can drop the wake but not the latest dimensions: popping
         // any existing event creates this opportunity to apply them.
         if (resize_poll.takeLatest()) |ws| {
-            try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
-            needs_render = true;
+            needs_render = try applyTerminalResize(App, &vx, &tty, &app, &app_ctx, allocator, io, &stats, opts, ws);
         }
 
         // Process tasks, ticks, and everys spawned during update
@@ -428,7 +475,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         trace(opts, .effect_drain_end);
 
         if (needs_render) {
-            const timings = try render(App, &vx, &terminal_images, &frame_arena, &app, tty.writer(), io, stats_enabled, opts);
+            const timings = try renderer.render(App, &vx, &terminal_images, &app, tty.writer(), io, stats_enabled, opts);
             if (stats) |*s| {
                 s.view_ns = timings.view_ns;
                 s.render_ns = timings.render_ns;
@@ -583,10 +630,12 @@ fn applyTerminalResize(
     stats: *?runtime.RuntimeStats,
     opts: types.RunOptions,
     winsize: vaxis.Winsize,
-) !void {
+) !bool {
     try vx.resize(allocator, tty.writer(), winsize);
     useUnicodeWidth(vx);
     _ = try dispatchAppEvent(App, app, .{ .winsize = winsize }, app_ctx, io, stats, opts);
+    // Screen geometry changed even if update suppresses its own redraw.
+    return true;
 }
 
 fn queryTerminal(
@@ -987,43 +1036,6 @@ fn useUnicodeWidth(vx: *vaxis.Vaxis) void {
     // Keep the runtime surface width policy aligned with chasen.text.displayWidth.
     vx.caps.unicode = .unicode;
     vx.screen.width_method = .unicode;
-}
-
-fn render(
-    comptime App: type,
-    vx: *vaxis.Vaxis,
-    terminal_images: *terminal_image.Registry,
-    frame_arena: *std.heap.ArenaAllocator,
-    app: *const App,
-    writer: *std.Io.Writer,
-    io: std.Io,
-    measure: bool,
-    opts: types.RunOptions,
-) !RenderTimings {
-    // Reuse frame scratch capacity across renders to avoid per-frame allocator churn.
-    _ = frame_arena.reset(.retain_capacity);
-
-    const win = vx.window();
-    win.clear();
-
-    var sfc: Surface = .initVaxis(win, frame_arena.allocator(), terminal_images);
-
-    trace(opts, .view_start);
-    const view_start = timingStart(measure, io);
-    try app.view(&sfc);
-    const view_ns = if (measure) timingElapsed(view_start, io) else 0;
-    trace(opts, .view_end);
-
-    trace(opts, .render_start);
-    const render_start = timingStart(measure, io);
-    try vx.render(writer);
-    const render_ns = if (measure) timingElapsed(render_start, io) else 0;
-    trace(opts, .render_end);
-
-    return .{
-        .view_ns = view_ns,
-        .render_ns = render_ns,
-    };
 }
 
 const OwnershipTestPayload = struct {
@@ -2650,4 +2662,71 @@ test {
     _ = @import("program/timers.zig");
     _ = frame_mod;
     _ = events_mod;
+}
+
+test "event resize forces render and Renderer keeps view paint trace order" {
+    const Evidence = struct {
+        entries: std.ArrayList(runtime.TraceEvent) = .empty,
+        views: usize = 0,
+        fn record(context: ?*anyopaque, event: runtime.TraceEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.entries.append(std.testing.allocator, event) catch unreachable;
+        }
+    };
+    const App = struct {
+        evidence: *Evidence,
+        size: vaxis.Winsize = .{ .rows = 0, .cols = 0, .x_pixel = 0, .y_pixel = 0 },
+        pub const Msg = vaxis.Winsize;
+        pub fn handleEvent(_: *@This(), event: types.Event) ?Msg {
+            return event.winsize;
+        }
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.size = msg;
+            ctx.redraw().skip();
+        }
+        pub fn view(self: *const @This(), sfc: *Surface) !void {
+            try std.testing.expectEqual(self.size.cols, sfc.size().width);
+            try std.testing.expectEqual(self.size.rows, sfc.size().height);
+            try std.testing.expectEqual(runtime.TraceEvent.view_start, self.evidence.entries.getLast());
+            self.evidence.views += 1;
+            // Exercise the renderer-owned scratch allocator on both renders.
+            const text = try sfc.arena.dupe(u8, "redraw");
+            _ = sfc.borrowTextAt(0, 0, text, .{});
+        }
+    };
+    var evidence: Evidence = .{};
+    defer evidence.entries.deinit(std.testing.allocator);
+    var app: App = .{ .evidence = &evidence };
+    var requests = requests_mod.Requests(App.Msg).init(std.testing.allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(App.Msg).init(&requests);
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var buffer: [4096]u8 = undefined;
+    var tty = try vaxis.Tty.init(std.testing.io, &buffer);
+    defer tty.deinit();
+    var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+    defer vx.deinit(std.testing.allocator, tty.writer());
+    var images: terminal_image.Registry = .{};
+    defer images.deinit(std.testing.allocator);
+    var renderer = Renderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    const opts: types.RunOptions = .{
+        .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io, .trace_fn = Evidence.record, .trace_context = &evidence },
+        .terminal = .{ .env_map = &env },
+    };
+    for ([_]bool{ false, true }) |measure| {
+        evidence.entries.clearRetainingCapacity();
+        var stats: ?runtime.RuntimeStats = if (measure) .{ .event_kind = .winsize, .event_count = 2, .frame_count = 1 } else null;
+        const ws: vaxis.Winsize = .{ .rows = 3, .cols = if (measure) 12 else 8, .x_pixel = 0, .y_pixel = 0 };
+        try std.testing.expect(try applyTerminalResize(App, &vx, &tty, &app, &ctx, std.testing.allocator, std.testing.io, &stats, opts, ws));
+        try std.testing.expect(requests.redrawWasSuppressed());
+        const timings = try renderer.render(App, &vx, &images, &app, tty.writer(), std.testing.io, measure, opts);
+        if (!measure) {
+            try std.testing.expectEqual(@as(u64, 0), timings.view_ns);
+            try std.testing.expectEqual(@as(u64, 0), timings.render_ns);
+        }
+        try std.testing.expectEqualSlices(runtime.TraceEvent, &.{ .handle_event_start, .handle_event_end, .update_start, .update_end, .view_start, .view_end, .render_start, .render_end }, evidence.entries.items);
+    }
+    try std.testing.expectEqual(@as(usize, 2), evidence.views);
 }

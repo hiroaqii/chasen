@@ -57,7 +57,10 @@ so the screen buffer matches the new terminal size.
 
 Internally, `Events` owns bracketed-paste accumulation and the shared synchronous
 `handleEvent`/`update` path. Each message resets redraw suppression before update;
-an update error still leaves its message owned by the app.
+an update error still leaves its message owned by the app. The small `Renderer`
+inside Program owns the reusable frame arena and keeps view and terminal paint
+timings separate. Program retains event/frame counters, effect-drain order,
+forced resize redraws, and the final stats callback for each turn.
 
 ## Input and Messages
 
