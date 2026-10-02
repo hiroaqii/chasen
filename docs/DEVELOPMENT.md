@@ -29,8 +29,8 @@ zig build check-anim_transition -Dchasen-anim-path=../chasen-anim
 ## OSC 52 Ownership Check
 
 Terminal lifecycle tests live in `src/program/terminal_session.zig`; foreground,
-clipboard, and image-effect tests remain alongside TerminalEffects in Program.
-Program imports the session test module. The session tests inject allocation failures
+clipboard, and image-effect tests live in `src/program/terminal_effects.zig`.
+Program imports both test modules. The session tests inject allocation failures
 and reuse the reader protocol to fail initial start, query restart, and mouse
 restart, checking cleanup and queued-message ownership. These unit tests do not
 replace the production OSC 52 check, Linux PTY gates, or native macOS tests.
