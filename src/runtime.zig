@@ -5,6 +5,9 @@ pub const Ctx = ctx.Ctx;
 pub const Requests = @import("requests.zig").Requests;
 pub const TaskStartError = ctx.TaskStartError;
 pub const TaskId = ctx.TaskId;
+pub const Borrowed = @import("timer.zig").Borrowed;
+pub const TimerStartError = @import("timer.zig").TimerStartError;
+pub const TimerOutcome = @import("timer.zig").TimerOutcome;
 
 pub const stats = @import("stats.zig");
 pub const RuntimeEventKind = stats.RuntimeEventKind;

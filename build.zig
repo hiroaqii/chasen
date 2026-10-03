@@ -208,6 +208,60 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_mod_tests.step);
     test_step.dependOn(&b.addRunArtifact(task_consumer_tests).step);
 
+    const timer_consumer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/timer_notice_consumer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "chasen", .module = mod }},
+        }),
+        .use_llvm = true,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
+        .filters = test_filters,
+    });
+    const timer_contract_step = b.step("test-timer-notice-contract", "Test timer notice values and reject implicit ownership");
+    timer_contract_step.dependOn(&b.addRunArtifact(timer_consumer_tests).step);
+    test_step.dependOn(timer_contract_step);
+
+    // Only an internal test import: applications use Borrowed and the timer
+    // request boundary, not a separate public validator API.
+    const timer_contract = b.createModule(.{
+        .root_source_file = b.path("src/timer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const timer_contract_tests = b.addTest(.{ .root_module = timer_contract, .filters = test_filters });
+    timer_contract_step.dependOn(&b.addRunArtifact(timer_contract_tests).step);
+    const negative_notices = [_]struct { name: []const u8, diagnostic: []const u8 }{
+        .{ .name = "pointer", .diagnostic = "TimerNotice references require explicit Borrowed" },
+        .{ .name = "slice", .diagnostic = "TimerNotice references require explicit Borrowed" },
+        .{ .name = "nested-reference", .diagnostic = "TimerNotice references require explicit Borrowed" },
+        .{ .name = "fake-borrowed", .diagnostic = "TimerNotice references require explicit Borrowed" },
+        .{ .name = "fake-marker-value", .diagnostic = "TimerNotice references require explicit Borrowed" },
+        .{ .name = "root-alias", .diagnostic = "Msg.TimerNotice must be separate from the root Msg type" },
+        .{ .name = "untagged-union", .diagnostic = "TimerNotice must use tagged unions" },
+        .{ .name = "function", .diagnostic = "TimerNotice supports only values and explicit Borrowed references" },
+        .{ .name = "error-union", .diagnostic = "TimerNotice supports only values and explicit Borrowed references" },
+        .{ .name = "not-a-type", .diagnostic = "Msg.TimerNotice must be a type" },
+        .{ .name = "borrowed-nonpointer", .diagnostic = "Borrowed requires a pointer or slice type" },
+    };
+    for (negative_notices) |fixture| {
+        const negative = b.addObject(.{
+            .name = b.fmt("timer-{s}", .{fixture.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("test/compile_errors/timer-{s}.zig", .{fixture.name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "timer_contract", .module = timer_contract },
+                    .{ .name = "chasen", .module = mod },
+                },
+            }),
+        });
+        negative.expect_errors = .{ .contains = fixture.diagnostic };
+        timer_contract_step.dependOn(&negative.step);
+    }
+
     const osc52_step = b.step("test-osc52-ownership", "Check OSC 52 ownership without opening a terminal");
     const check_osc52_step = b.step("check-osc52-ownership", "Compile the OSC 52 ownership check for native or cross targets");
     if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
