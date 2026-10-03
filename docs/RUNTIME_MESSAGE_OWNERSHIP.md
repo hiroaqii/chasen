@@ -237,11 +237,17 @@ Runtime consumers detach each request kind into an independent fixed-capacity
 batch. `next()` transfers one entry to its consumer; batch cleanup handles only
 the unconsumed suffix. New pending requests remain separately owned. Timer
 message templates remain copy-safe and are not disposed as undelivered Msgs.
-Resource-only cleanup does not invoke app callbacks; runtime foreground
-abandonment separately produces and disposes its required result. The Ctx
-entry/take/cleanup bridge has been removed. Arbitrary byte copies cannot enforce
-linear ownership: forging entries or consuming copied handles twice remains
-outside the contract.
+Batch cleanup does not run tasks or produce result messages, but it does invoke
+owned-task cleanup callbacks. Runtime foreground abandonment separately produces
+and disposes its required result. The Ctx entry/take/cleanup bridge has been
+removed. Arbitrary byte copies cannot enforce linear ownership: forging entries
+or consuming copied handles twice remains outside the contract.
+
+Direct `Requests` consumers should replace `removeTaskAt`,
+`removeForegroundCommandAt`, and `removeClipboardCopyAt` with the corresponding
+`take...At` methods. Each transfers ownership of the returned entry to the caller.
+Effect views expose their borrowed owner as `requests` instead of `ctx`;
+ordinary calls such as `ctx.task().spawn(...)` are unchanged.
 
 Replace the old untyped context submission with spawnOwned and typed callbacks;
 move repeated run/failed destruction into cleanup. Preserve admission-error

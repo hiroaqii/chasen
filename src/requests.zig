@@ -196,19 +196,19 @@ pub fn Requests(comptime Msg: type) type {
         }
 
         pub const FrameEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             /// Request one future frame event.
             ///
             /// The runtime coalesces repeated calls while a frame is already
             /// pending. Call this again from the frame update to keep animating.
             pub fn request(self: FrameEffects) void {
-                self.ctx._frame_requested = true;
+                self.requests._frame_requested = true;
             }
         };
 
         pub const RedrawEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             /// Skip the default redraw for the current update cycle.
             ///
@@ -217,12 +217,12 @@ pub fn Requests(comptime Msg: type) type {
             /// the visual state and a redraw would be wasteful. This is a
             /// one-shot request; the runtime clears it before the next update.
             pub fn skip(self: RedrawEffects) void {
-                self.ctx._redraw_suppressed = true;
+                self.requests._redraw_suppressed = true;
             }
         };
 
         pub const TaskEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             /// Queue a plain task. No context or cancellation bookkeeping is
             /// required by the caller; discard the returned ID when unused.
@@ -263,30 +263,30 @@ pub fn Requests(comptime Msg: type) type {
             }
 
             fn enqueue(self: TaskEffects, callbacks: Callbacks) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
-                if (self.ctx._pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
-                if (self.ctx._next_task_id == 0) return error.TaskIdExhausted;
-                const id: TaskId = @enumFromInt(self.ctx._next_task_id);
-                self.ctx._next_task_id +%= 1;
-                self.ctx._pending_tasks[self.ctx._pending_tasks_len] = TaskEntry.init(id, callbacks);
-                self.ctx._pending_tasks_len += 1;
+                if (self.requests._pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
+                if (self.requests._next_task_id == 0) return error.TaskIdExhausted;
+                const id: TaskId = @enumFromInt(self.requests._next_task_id);
+                self.requests._next_task_id +%= 1;
+                self.requests._pending_tasks[self.requests._pending_tasks_len] = TaskEntry.init(id, callbacks);
+                self.requests._pending_tasks_len += 1;
                 return id;
             }
 
             /// Owning runtime thread only (init/update). Notify without joining
             /// or allocating. Completion/queued results can still win the race.
             pub fn requestCancel(self: TaskEffects, id: TaskId) void {
-                for (self.ctx._pending_tasks[0..self.ctx._pending_tasks_len]) |*entry| {
+                for (self.requests._pending_tasks[0..self.requests._pending_tasks_len]) |*entry| {
                     if (entry.id == id) {
                         entry.canceled = true;
                         return;
                     }
                 }
-                if (self.ctx._task_runtime) |runtime_| runtime_.request(runtime_.context, id, self.ctx._io);
+                if (self.requests._task_runtime) |runtime_| runtime_.request(runtime_.context, id, self.requests._io);
             }
         };
 
         pub const TimerEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             /// Schedule a one-shot delayed message.
             ///
@@ -306,20 +306,20 @@ pub fn Requests(comptime Msg: type) type {
             /// `Msg.deinitUndelivered`. Use only a non-owning/copy-safe message
             /// variant; heap-owning results belong in task callbacks.
             pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.ctx._pending_ticks[0..self.ctx._pending_ticks_len]) |*entry| {
+                for (self.requests._pending_ticks[0..self.requests._pending_ticks_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
                         entry.after_ns = after_ns;
                         entry.msg = msg;
                         return;
                     }
                 }
-                if (self.ctx._pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
-                self.ctx._pending_ticks[self.ctx._pending_ticks_len] = .{
-                    .id = try self.ctx._allocator.dupe(u8, id),
+                if (self.requests._pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
+                self.requests._pending_ticks[self.requests._pending_ticks_len] = .{
+                    .id = try self.requests._allocator.dupe(u8, id),
                     .after_ns = after_ns,
                     .msg = msg,
                 };
-                self.ctx._pending_ticks_len += 1;
+                self.requests._pending_ticks_len += 1;
             }
 
             /// Schedule a repeating timer.
@@ -339,20 +339,20 @@ pub fn Requests(comptime Msg: type) type {
             /// it without calling `Msg.deinitUndelivered`. Use only a
             /// non-owning/copy-safe message variant.
             pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.ctx._pending_everys[0..self.ctx._pending_everys_len]) |*entry| {
+                for (self.requests._pending_everys[0..self.requests._pending_everys_len]) |*entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
                         entry.interval_ns = interval_ns;
                         entry.msg = msg;
                         return;
                     }
                 }
-                if (self.ctx._pending_everys_len >= max_everys) return error.TimerLimitExceeded;
-                self.ctx._pending_everys[self.ctx._pending_everys_len] = .{
-                    .id = try self.ctx._allocator.dupe(u8, id),
+                if (self.requests._pending_everys_len >= max_everys) return error.TimerLimitExceeded;
+                self.requests._pending_everys[self.requests._pending_everys_len] = .{
+                    .id = try self.requests._allocator.dupe(u8, id),
                     .interval_ns = interval_ns,
                     .msg = msg,
                 };
-                self.ctx._pending_everys_len += 1;
+                self.requests._pending_everys_len += 1;
             }
 
             /// Cancel a timer by id.
@@ -369,12 +369,12 @@ pub fn Requests(comptime Msg: type) type {
             /// previously running timer and the newly queued replacement
             /// remains scheduled.
             pub fn cancel(self: TimerEffects, id: []const u8) TimerCancelError!void {
-                try self.ctx.cancelTimerInternal(id);
+                try self.requests.cancelTimerInternal(id);
             }
         };
 
         pub const ImageEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             /// Queue a local terminal image path to be loaded by the runtime.
             ///
@@ -393,33 +393,33 @@ pub fn Requests(comptime Msg: type) type {
                 loaded_fn: TerminalImageLoadedFn,
                 failed_fn: TerminalImageFailedFn,
             ) (error{TerminalImageLoadLimitExceeded} || std.mem.Allocator.Error)!terminal_image.TerminalImageRequestId {
-                if (self.ctx._pending_terminal_image_loads_len >= max_terminal_image_loads)
+                if (self.requests._pending_terminal_image_loads_len >= max_terminal_image_loads)
                     return error.TerminalImageLoadLimitExceeded;
 
-                const copied_path = try self.ctx._allocator.dupe(u8, path);
-                const request_id = terminal_image.TerminalImageRequestId{ .id = self.ctx._next_terminal_image_request_id };
-                self.ctx._next_terminal_image_request_id +%= 1;
-                self.ctx._pending_terminal_image_loads[self.ctx._pending_terminal_image_loads_len] = .{
+                const copied_path = try self.requests._allocator.dupe(u8, path);
+                const request_id = terminal_image.TerminalImageRequestId{ .id = self.requests._next_terminal_image_request_id };
+                self.requests._next_terminal_image_request_id +%= 1;
+                self.requests._pending_terminal_image_loads[self.requests._pending_terminal_image_loads_len] = .{
                     .request_id = request_id,
                     .path = copied_path,
                     .loaded = loaded_fn,
                     .failed = failed_fn,
                 };
-                self.ctx._pending_terminal_image_loads_len += 1;
+                self.requests._pending_terminal_image_loads_len += 1;
                 return request_id;
             }
 
             /// Queue a terminal image handle for release by the runtime.
             pub fn unload(self: ImageEffects, handle: terminal_image.TerminalImageHandle) error{TerminalImageUnloadLimitExceeded}!void {
-                if (self.ctx._pending_terminal_image_unloads_len >= max_terminal_image_unloads)
+                if (self.requests._pending_terminal_image_unloads_len >= max_terminal_image_unloads)
                     return error.TerminalImageUnloadLimitExceeded;
-                self.ctx._pending_terminal_image_unloads[self.ctx._pending_terminal_image_unloads_len] = handle;
-                self.ctx._pending_terminal_image_unloads_len += 1;
+                self.requests._pending_terminal_image_unloads[self.requests._pending_terminal_image_unloads_len] = handle;
+                self.requests._pending_terminal_image_unloads_len += 1;
             }
         };
 
         pub const TerminalEffects = struct {
-            ctx: *Self,
+            requests: *Self,
 
             pub const ForegroundCommandOptions = struct {
                 argv: []const []const u8,
@@ -487,12 +487,12 @@ pub fn Requests(comptime Msg: type) type {
                 cwd_ops: anytype,
                 environment_ops: anytype,
             ) foreground_command.ForegroundCommandQueueError!foreground_command.ForegroundCommandRequestId {
-                if (self.ctx._should_quit) return error.ForegroundCommandRuntimeStopped;
+                if (self.requests._should_quit) return error.ForegroundCommandRuntimeStopped;
                 if (opts.argv.len == 0) return error.ForegroundCommandEmptyArgv;
-                if (self.ctx._pending_foreground_commands_len >= max_foreground_commands)
+                if (self.requests._pending_foreground_commands_len >= max_foreground_commands)
                     return error.ForegroundCommandLimitExceeded;
                 const input = try foreground_command.OwnedInput.initWithOps(
-                    self.ctx._allocator,
+                    self.requests._allocator,
                     opts.argv,
                     opts.cwd,
                     opts.environment,
@@ -501,15 +501,15 @@ pub fn Requests(comptime Msg: type) type {
                 );
 
                 const request_id = foreground_command.ForegroundCommandRequestId{
-                    .id = self.ctx._next_foreground_command_request_id,
+                    .id = self.requests._next_foreground_command_request_id,
                 };
-                self.ctx._next_foreground_command_request_id +%= 1;
-                self.ctx._pending_foreground_commands[self.ctx._pending_foreground_commands_len] = .{
+                self.requests._next_foreground_command_request_id +%= 1;
+                self.requests._pending_foreground_commands[self.requests._pending_foreground_commands_len] = .{
                     .request_id = request_id,
                     .input = input,
                     .finished = opts.finished,
                 };
-                self.ctx._pending_foreground_commands_len += 1;
+                self.requests._pending_foreground_commands_len += 1;
                 return request_id;
             }
 
@@ -529,22 +529,22 @@ pub fn Requests(comptime Msg: type) type {
                 self: TerminalEffects,
                 opts: ClipboardCopyOptions,
             ) (error{ClipboardCopyLimitExceeded} || std.mem.Allocator.Error)!clipboard_types.ClipboardCopyRequestId {
-                if (self.ctx._pending_clipboard_copies_len >= max_clipboard_copies)
+                if (self.requests._pending_clipboard_copies_len >= max_clipboard_copies)
                     return error.ClipboardCopyLimitExceeded;
 
-                const copied_text = try self.ctx._allocator.dupe(u8, opts.text);
-                errdefer self.ctx._allocator.free(copied_text);
+                const copied_text = try self.requests._allocator.dupe(u8, opts.text);
+                errdefer self.requests._allocator.free(copied_text);
 
                 const request_id: clipboard_types.ClipboardCopyRequestId = .{
-                    .id = self.ctx._next_clipboard_copy_request_id,
+                    .id = self.requests._next_clipboard_copy_request_id,
                 };
-                self.ctx._next_clipboard_copy_request_id +%= 1;
-                self.ctx._pending_clipboard_copies[self.ctx._pending_clipboard_copies_len] = .{
+                self.requests._next_clipboard_copy_request_id +%= 1;
+                self.requests._pending_clipboard_copies[self.requests._pending_clipboard_copies_len] = .{
                     .request_id = request_id,
                     .text = copied_text,
                     .finished = opts.finished,
                 };
-                self.ctx._pending_clipboard_copies_len += 1;
+                self.requests._pending_clipboard_copies_len += 1;
                 return request_id;
             }
         };
@@ -560,27 +560,27 @@ pub fn Requests(comptime Msg: type) type {
         }
 
         pub fn frame(self: *@This()) FrameEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn redraw(self: *@This()) RedrawEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn task(self: *@This()) TaskEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn timer(self: *@This()) TimerEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn image(self: *@This()) ImageEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn terminal(self: *@This()) TerminalEffects {
-            return .{ .ctx = self };
+            return .{ .requests = self };
         }
 
         pub fn resetRedrawSuppressed(self: *@This()) void {
@@ -661,7 +661,8 @@ pub fn Requests(comptime Msg: type) type {
                     return entry;
                 }
 
-                /// Release only the unconsumed suffix. Never calls app callbacks.
+                /// Release only the unconsumed suffix without running tasks or
+                /// producing result messages. Owned-task cleanup callbacks run.
                 pub fn deinit(self: *@This()) void {
                     while (self.next()) |entry| switch (kind) {
                         .task => entry.discard(self.allocator),
@@ -710,15 +711,24 @@ pub fn Requests(comptime Msg: type) type {
             return Batch(.clipboard).take(self._allocator, &self._pending_clipboard_copies, &self._pending_clipboard_copies_len);
         }
 
-        pub fn removeTaskAt(self: *Self, index: usize) ?TaskEntry {
+        /// Transfer one queued task, preserving the order of the rest.
+        /// The caller must consume it exactly once with run, failed, or discard.
+        /// An out-of-range index returns null without changing the queue.
+        pub fn takeTaskAt(self: *Self, index: usize) ?TaskEntry {
             return Batch(.task).takeAt(&self._pending_tasks, &self._pending_tasks_len, index);
         }
 
-        pub fn removeForegroundCommandAt(self: *Self, index: usize) ?ForegroundCommandEntry {
+        /// Transfer one queued command, preserving the order of the rest.
+        /// The caller owns the returned entry and must deinit it.
+        /// An out-of-range index returns null without changing the queue.
+        pub fn takeForegroundCommandAt(self: *Self, index: usize) ?ForegroundCommandEntry {
             return Batch(.foreground).takeAt(&self._pending_foreground_commands, &self._pending_foreground_commands_len, index);
         }
 
-        pub fn removeClipboardCopyAt(self: *Self, index: usize) ?ClipboardCopyEntry {
+        /// Transfer one queued copy, preserving the order of the rest.
+        /// The caller owns the returned entry and must deinit it.
+        /// An out-of-range index returns null without changing the queue.
+        pub fn takeClipboardCopyAt(self: *Self, index: usize) ?ClipboardCopyEntry {
             return Batch(.clipboard).takeAt(&self._pending_clipboard_copies, &self._pending_clipboard_copies_len, index);
         }
 
@@ -782,8 +792,8 @@ pub fn Requests(comptime Msg: type) type {
             self._pending_cancels_len += 1;
         }
 
-        /// Release copied data for queued effects that have not been handed to
-        /// the runtime.
+        /// Release copied data for queued non-task effects that have not been
+        /// handed to the runtime. Use discardPendingTasks for queued tasks.
         ///
         /// App callbacks may queue effects and then return an error before the
         /// runtime drains them. This cleanup is for that unwind path; normally

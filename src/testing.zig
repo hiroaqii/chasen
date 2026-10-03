@@ -203,9 +203,11 @@ pub fn TestCtx(comptime Msg: type) type {
             self.* = undefined;
         }
 
+        /// Discard queued tasks, invoking owned-task cleanup callbacks.
         pub fn discardPendingTasks(self: *@This()) void {
             self.requests.discardPendingTasks();
         }
+        /// Discard queued non-task effects. Tasks require discardPendingTasks.
         pub fn discardPendingEffects(self: *@This()) void {
             self.requests.discardPendingEffects();
         }
@@ -278,7 +280,7 @@ pub fn TestCtx(comptime Msg: type) type {
         /// Transfer one task, preserving the relative order of the rest.
         pub fn takeTask(self: *@This(), index: usize) ?TestTask(Msg) {
             return .{
-                .entry = self.requests.removeTaskAt(index) orelse return null,
+                .entry = self.requests.takeTaskAt(index) orelse return null,
                 .allocator = self.requests.allocator(),
                 .io = self.requests.io(),
             };
@@ -287,12 +289,12 @@ pub fn TestCtx(comptime Msg: type) type {
         /// No child or tty is run. The returned Msg belongs to the test until
         /// passed to App.update or explicitly discarded.
         pub fn completeForeground(self: *@This(), index: usize, outcome: foreground_command.ForegroundCommandOutcome) error{IndexOutOfBounds}!Msg {
-            var entry = self.requests.removeForegroundCommandAt(index) orelse return error.IndexOutOfBounds;
+            var entry = self.requests.takeForegroundCommandAt(index) orelse return error.IndexOutOfBounds;
             defer entry.deinit(self.requests.allocator());
             return entry.message(outcome);
         }
         pub fn completeClipboard(self: *@This(), index: usize, outcome: clipboard.ClipboardCopyOutcome) error{IndexOutOfBounds}!Msg {
-            var entry = self.requests.removeClipboardCopyAt(index) orelse return error.IndexOutOfBounds;
+            var entry = self.requests.takeClipboardCopyAt(index) orelse return error.IndexOutOfBounds;
             defer entry.deinit(self.requests.allocator());
             return entry.message(outcome);
         }
