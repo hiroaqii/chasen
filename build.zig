@@ -223,6 +223,22 @@ pub fn build(b: *std.Build) void {
     timer_contract_step.dependOn(&b.addRunArtifact(timer_consumer_tests).step);
     test_step.dependOn(timer_contract_step);
 
+    // Compile a real Program with a composite notice. Unit-test contexts do not
+    // cover the comptime work accumulated while instantiating the whole app.
+    const timer_program = b.addExecutable(.{
+        .name = "timer-notice-program",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/timer_notice_program.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "chasen", .module = mod }},
+        }),
+        .use_llvm = true,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
+    });
+    timer_contract_step.dependOn(&timer_program.step);
+    b.step("check-timer-notice-program", "Compile a complete app with a composite timer notice").dependOn(&timer_program.step);
+
     // Exercise the internal value rules alongside the public consumer. Negative
     // fixtures below enter through the production timer request boundary.
     const timer_contract = b.createModule(.{

@@ -48,6 +48,9 @@ pub fn Notification(comptime Msg: type) type {
 /// A root message may own resources; its timer notice must be a separate,
 /// non-owning value type. Applications without a declaration use void notices.
 pub fn Notice(comptime Msg: type) type {
+    // Composite notices are also validated while instantiating a whole Program.
+    // Give recursive validation room without requiring a quota in every caller.
+    @setEvalBranchQuota(10_000);
     const has_notice = switch (@typeInfo(Msg)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(Msg, "TimerNotice"),
         else => false,
