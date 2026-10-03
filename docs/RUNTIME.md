@@ -97,6 +97,11 @@ callbacks and application-specific values must be supplied by the app.
 Chasen does not make `update` return a command value. Instead, `update` receives
 `*chasen.Ctx(Msg)` and queues runtime effects explicitly.
 
+Queued effects have [pending request limits](#pending-request-limits). The timer
+examples use non-owning message variants; see the
+[Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction) before passing
+other payloads.
+
 ```zig
 // Stop the runtime after the current update/effect cycle.
 ctx.quit();
@@ -177,6 +182,8 @@ and frame requests in that order. Follow-up synchronous effects are processed
 in at most eight rounds. Remaining work schedules one coalesced continuation
 event. If the queue is full, its existing events already guarantee another turn;
 the flag stays clear so a later drain can enqueue a wake.
+The eight-round limit bounds repeated passes, not elapsed time: a long-running
+callback or foreground command can still delay the event loop.
 
 Each stage detaches its own fixed-capacity value batch immediately before use.
 Follow-up requests occupy separate pending storage, so an update cannot overwrite
@@ -188,6 +195,62 @@ For task callback signatures, admission-error handling, cancellation, cleanup,
 and worker concurrency costs, see [Runtime Message Ownership](RUNTIME_MESSAGE_OWNERSHIP.md).
 The [task cancellation example](../examples/task_cancellation/main.zig) shows
 owned work, replace/close actions, and generation checks for late results.
+
+## Pending Request Limits
+
+Most effects first enter a fixed-capacity pending queue in `Requests`. Its slots
+count requests that the runtime has not yet taken for processing. Each stage of
+effect drain detaches its batch and empties that pending queue, making the slots
+available for new requests even while the detached work is running.
+
+The current capacities and queue-full errors are:
+
+| Request through `Ctx` | Pending capacity | Queue-full error |
+| --- | --- | --- |
+| `task().spawn` / `spawnOwned` | 16 shared | `TaskLimitExceeded` |
+| `timer().tick` | 8 | `TimerLimitExceeded` |
+| `timer().every` | 8 | `TimerLimitExceeded` |
+| `timer().cancel` | 8 | `TimerCancelLimitExceeded` |
+| `image().loadPath` | 8 | `TerminalImageLoadLimitExceeded` |
+| `image().unload` | 8 | `TerminalImageUnloadLimitExceeded` |
+| `terminal().runForegroundCommand` | 1 | `ForegroundCommandLimitExceeded` |
+| `terminal().copyToClipboard` | 4 | `ClipboardCopyLimitExceeded` |
+
+These are current implementation capacities, not configurable settings or
+guarantees that the numbers will remain unchanged. Handle admission errors.
+For example, submitting a seventeenth task before the task stage drains the
+queue fails; already-running tasks do not occupy those pending slots. Replacing
+an entry already pending in the same `tick` or `every` queue reuses its slot.
+An accepted `cancel` removes matching pending timers and queues cancellation of
+running timers; if admission fails, it leaves those timers unchanged.
+
+These limits do not cap the total number of running tasks or timers, the number
+of bytes in their payloads, or the runtime's total memory use. Backend concurrency
+limits are separate, and starting accepted work can still fail. `frame().request`
+coalesces requests; `task().requestCancel` notifies directly instead of using a
+queue in this table.
+
+Ownership on admission depends on the API:
+
+- `spawnOwned` transfers its context only on success. On an admission error,
+  the caller still owns it and no task callback runs. After success, Chasen owns
+  cleanup, including when the task never starts. See the
+  [owned-task example](RUNTIME_MESSAGE_OWNERSHIP.md#queueing-an-owned-task).
+- Timer calls copy IDs but only copy the message value; they do not take ownership
+  of its referenced storage. Use a non-owning, copy-safe template as described in
+  [Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction).
+- Image path loads, clipboard writes, and foreground commands own copies of their
+  queued inputs after admission. The caller retains the original inputs. A
+  foreground `.dir` cwd duplicates the descriptor; the caller retains the
+  original. Failed admission releases any partially acquired internal copies.
+- A rejected `image().unload` has not scheduled release of that handle. The app
+  must still arrange its release, for example by queueing it in a later update.
+
+Queue-full errors are only part of each API's error set. Copying inputs can fail
+with `OutOfMemory`; task admission can return `TaskIdExhausted`; foreground
+requests also validate their inputs. A successful call means admission, not
+successful execution or delivery. In particular, timers currently have no
+callback for failures after admission; see [Timers and Frames](#timers-and-frames).
 
 ## Timers and Frames
 
@@ -201,14 +264,21 @@ See the [tick example](../examples/tick/main.zig) for replacement and cancellati
 Timer and frame effects are intentionally simple. `ctx.timer().every` is a
 fixed-delay repeating timer: it waits for the interval, posts a message, then
 waits for the interval again. Timer intervals do not compensate for app
-update/render time. Timer message templates are copied/reused and must not own
-heap allocations.
+update/render time. Pass only non-owning, copy-safe message variants, including
+when the root `Msg` uses `.deinit` for other variants. See
+[Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction) for safe payloads
+and the distinction between templates and posted messages.
 
-If the runtime cannot start or track a `tick` / `every` helper, there is no
-timer failure callback and the timer message may never be delivered. Timers are
-canceled during shutdown, but completed one-shot timer handles can remain
-tracked until shutdown, so long-lived apps should avoid creating unbounded
-unique timer ids.
+A successful `tick` / `every` call means the request was accepted, not that its
+helper started or its message will arrive. If the runtime cannot start or track
+the helper, there is no timer failure callback and the message may never be
+delivered. Use a task with a failure callback when later progress depends on
+observing a start failure.
+
+Completed one-shot timers retain their copied ID and Future until replacement,
+explicit cancellation, or shutdown. Long-lived apps should reuse a bounded set
+of IDs or explicitly cancel completed timers, handling cancellation admission
+errors. The pending queue limit does not bound these retained handles.
 
 `ctx.frame().request` requests one future frame event paced from the last
 delivered frame, and is coalesced while a frame is already in flight. Animation

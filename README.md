@@ -181,6 +181,13 @@ heap-owning results; see [Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERS
 | Text, cells, and clipped regions | `Surface`, `Rect`, `Surface.child` | [Drawing](docs/SURFACE.md) |
 | Terminal images | `ctx.image().loadPath/unload` | [Loader setup](docs/RUNTIME.md#terminal-images-and-options) |
 
+Queued effects use [bounded pending queues](docs/RUNTIME.md#pending-request-limits).
+Handle admission errors; a successful call accepts a request but does not
+guarantee that its operation will start or complete. Timer messages must be
+non-owning and copy-safe, even when the root `Msg` uses `.deinit` for task
+results. See [Timer restriction](docs/RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction)
+and the [current timer lifecycle limits](docs/RUNTIME.md#timers-and-frames).
+
 For text created during `view`, use `printAt` or `copyTextAt`. Borrowed text must
 remain valid until rendering finishes; do not borrow local stack buffers.
 Image path loads require a configured `runWith` image loader; the default reports

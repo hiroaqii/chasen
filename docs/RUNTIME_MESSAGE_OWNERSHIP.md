@@ -321,11 +321,33 @@ may copy, replace, repeat, cancel, or drop those templates without invoking
 An app may still use `.deinit` for its root `Msg` when task results own memory;
 the particular variants used as timer templates must be plain values.
 
+For example, `.refresh` in the Msg above is safe to use as a timer template;
+`.loaded` with an owned buffer is not. A notification carrying only a numeric
+generation counter is also copy-safe. Passing an owned buffer to a one-shot
+timer can leak it when the template is replaced or dropped. Repeating timers
+can post multiple copies of the same buffer reference, causing use-after-free
+or double-free if the receiver frees it. Choosing `.deinit` does not change
+this template contract, and choosing `.plain` does not make an owning payload
+safe to copy or discard.
+
+Borrowed references must remain valid for the timer's lifetime and for all
+messages it has already posted. Cancellation does not revoke queued messages.
+Once a timer posts a message, that copy follows the normal
+[ownership states](#ownership-states): the app consumes it in `update`, or the
+runtime applies the root Msg's undelivered policy. With `.deinit`, the hook must
+handle the non-owning timer variant without freeing borrowed resources, as
+the `.refresh` branch above does. It is the retained template and its discarded
+copies that are exempt from the hook, not every message originating from a timer.
+
 Pending copied IDs belong to Requests until each timer stage detaches its batch.
 `TimerRuntime` then owns the running ID/Future pair. Replacement cancels and joins
 the old Future before freeing its ID. A start failure frees the new ID; a tracking
 allocation failure first cancels the new Future, then frees its ID. Cancel and
 shutdown use the same owner, without applying a Msg destructor to the template.
+
+See [Pending Request Limits](RUNTIME.md#pending-request-limits) for queue admission
+errors, and [Timers and Frames](RUNTIME.md#timers-and-frames) for the current lack
+of start-failure notifications and retention of completed one-shot handles.
 
 ## Review checklist
 
