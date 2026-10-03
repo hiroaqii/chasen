@@ -195,6 +195,8 @@ pub fn Requests(comptime Msg: type) type {
             self.* = undefined;
         }
 
+        // Request admission.
+
         pub const FrameEffects = struct {
             requests: *Self,
 
@@ -372,6 +374,46 @@ pub fn Requests(comptime Msg: type) type {
                 try self.requests.cancelTimerInternal(id);
             }
         };
+
+        fn cancelTimerInternal(self: *@This(), id: []const u8) TimerCancelError!void {
+            if (self._pending_cancels_len >= max_cancels) return error.TimerCancelLimitExceeded;
+            const copied_id = try self._allocator.dupe(u8, id);
+            errdefer self._allocator.free(copied_id);
+
+            // Remove from pending ticks (swap-remove).
+            {
+                var i: u8 = 0;
+                while (i < self._pending_ticks_len) {
+                    if (std.mem.eql(u8, self._pending_ticks[i].id, id)) {
+                        self._allocator.free(self._pending_ticks[i].id);
+                        self._pending_ticks_len -= 1;
+                        if (i < self._pending_ticks_len) {
+                            self._pending_ticks[i] = self._pending_ticks[self._pending_ticks_len];
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Remove from pending everys (swap-remove).
+            {
+                var i: u8 = 0;
+                while (i < self._pending_everys_len) {
+                    if (std.mem.eql(u8, self._pending_everys[i].id, id)) {
+                        self._allocator.free(self._pending_everys[i].id);
+                        self._pending_everys_len -= 1;
+                        if (i < self._pending_everys_len) {
+                            self._pending_everys[i] = self._pending_everys[self._pending_everys_len];
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Queue for runtime to cancel running timers.
+            self._pending_cancels[self._pending_cancels_len] = copied_id;
+            self._pending_cancels_len += 1;
+        }
 
         pub const ImageEffects = struct {
             requests: *Self,
@@ -583,6 +625,23 @@ pub fn Requests(comptime Msg: type) type {
             return .{ .requests = self };
         }
 
+        /// Return the current monotonic timestamp.
+        pub fn now(self: *const @This()) std.Io.Timestamp {
+            return std.Io.Clock.now(.awake, self._io);
+        }
+
+        /// Return the program-level allocator.
+        pub fn allocator(self: *const @This()) std.mem.Allocator {
+            return self._allocator;
+        }
+
+        /// Return the runtime I/O handle.
+        pub fn io(self: *const @This()) std.Io {
+            return self._io;
+        }
+
+        // Runtime observation and ownership transfer.
+
         pub fn resetRedrawSuppressed(self: *@This()) void {
             self._redraw_suppressed = false;
         }
@@ -732,64 +791,11 @@ pub fn Requests(comptime Msg: type) type {
             return Batch(.clipboard).takeAt(&self._pending_clipboard_copies, &self._pending_clipboard_copies_len, index);
         }
 
+        // Pending request cleanup.
+
         pub fn discardPendingTasks(self: *Self) void {
             var batch = self.detachTasks();
             batch.deinit();
-        }
-
-        /// Return the current monotonic timestamp.
-        pub fn now(self: *const @This()) std.Io.Timestamp {
-            return std.Io.Clock.now(.awake, self._io);
-        }
-
-        /// Return the program-level allocator.
-        pub fn allocator(self: *const @This()) std.mem.Allocator {
-            return self._allocator;
-        }
-
-        /// Return the runtime I/O handle.
-        pub fn io(self: *const @This()) std.Io {
-            return self._io;
-        }
-
-        fn cancelTimerInternal(self: *@This(), id: []const u8) TimerCancelError!void {
-            if (self._pending_cancels_len >= max_cancels) return error.TimerCancelLimitExceeded;
-            const copied_id = try self._allocator.dupe(u8, id);
-            errdefer self._allocator.free(copied_id);
-
-            // Remove from pending ticks (swap-remove).
-            {
-                var i: u8 = 0;
-                while (i < self._pending_ticks_len) {
-                    if (std.mem.eql(u8, self._pending_ticks[i].id, id)) {
-                        self._allocator.free(self._pending_ticks[i].id);
-                        self._pending_ticks_len -= 1;
-                        if (i < self._pending_ticks_len) {
-                            self._pending_ticks[i] = self._pending_ticks[self._pending_ticks_len];
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            // Remove from pending everys (swap-remove).
-            {
-                var i: u8 = 0;
-                while (i < self._pending_everys_len) {
-                    if (std.mem.eql(u8, self._pending_everys[i].id, id)) {
-                        self._allocator.free(self._pending_everys[i].id);
-                        self._pending_everys_len -= 1;
-                        if (i < self._pending_everys_len) {
-                            self._pending_everys[i] = self._pending_everys[self._pending_everys_len];
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            // Queue for runtime to cancel running timers.
-            self._pending_cancels[self._pending_cancels_len] = copied_id;
-            self._pending_cancels_len += 1;
         }
 
         /// Release copied data for queued non-task effects that have not been
@@ -830,6 +836,8 @@ pub fn Requests(comptime Msg: type) type {
         }
     };
 }
+
+// Test helpers.
 
 const InjectedForegroundCommandCwdOps = struct {
     result: DuplicateForegroundCommandDirResult,
