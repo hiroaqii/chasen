@@ -207,6 +207,22 @@ pub fn dispatchAppEvent(
     return false;
 }
 
+/// Create fired messages only on the runtime thread, immediately before update.
+/// Null is an explicit callback decision; update owns a returned Msg on error.
+pub fn applyTimerNotification(
+    comptime App: type,
+    app: *App,
+    notification: @import("../timer.zig").Notification(App.Msg),
+    app_ctx: *ctx_mod.Ctx(App.Msg),
+    io: std.Io,
+    stats: *?runtime.RuntimeStats,
+    opts: types.RunOptions,
+) !bool {
+    if (notification.message(.fired, app_ctx.allocator())) |msg|
+        return applyMsg(App, app, msg, app_ctx, io, stats, opts);
+    return false;
+}
+
 /// Apply one app message and return whether the app requested a redraw.
 ///
 /// `ctx.redraw().skip()` is message-scoped, so the flag is reset immediately
@@ -242,7 +258,7 @@ pub fn eventKind(event: anytype) runtime.RuntimeEventKind {
     return switch (event) {
         .key_press => .key_press,
         .winsize => .winsize,
-        .user_msg => .user_msg,
+        .user_msg, .timer_notification => .user_msg,
         .mouse => .mouse,
         .focus_in => .focus_in,
         .focus_out => .focus_out,
@@ -253,6 +269,52 @@ pub fn eventKind(event: anytype) runtime.RuntimeEventKind {
         .resize_pending => .winsize,
         .continue_effect_drain => .user_msg,
     };
+}
+
+test "timer fired dispatch respects null and transfers owned Msg on update error" {
+    const Evidence = struct { calls: usize = 0, drops: usize = 0, thread: std.Thread.Id };
+    const OwnedMsg = struct {
+        bytes: []u8,
+        evidence: *Evidence,
+        pub const TimerNotice = struct { evidence: runtime.Borrowed(*Evidence), emit: bool };
+        pub const undelivered_policy = .deinit;
+        pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
+            self.evidence.drops += 1;
+            allocator.free(self.bytes);
+        }
+        fn notify(notice: TimerNotice, outcome: runtime.TimerOutcome, allocator: std.mem.Allocator) ?@This() {
+            std.debug.assert(outcome == .fired);
+            std.debug.assert(notice.evidence.value.thread == std.Thread.getCurrentId());
+            notice.evidence.value.calls += 1;
+            if (!notice.emit) return null;
+            return .{ .bytes = allocator.dupe(u8, "fired") catch unreachable, .evidence = notice.evidence.value };
+        }
+    };
+    const App = struct {
+        pub const Msg = OwnedMsg;
+        retained: ?Msg = null,
+        pub fn update(self: *@This(), msg: Msg, _: *ctx_mod.Ctx(Msg)) !void {
+            self.retained = msg;
+            return error.ExpectedUpdateFailure;
+        }
+    };
+    var evidence: Evidence = .{ .thread = std.Thread.getCurrentId() };
+    var requests = @import("../requests.zig").Requests(OwnedMsg).init(std.testing.allocator, std.testing.io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(OwnedMsg).init(&requests);
+    var app: App = .{};
+    defer if (app.retained) |*msg| msg.deinitUndelivered(std.testing.allocator);
+    var stats: ?runtime.RuntimeStats = null;
+    const opts: types.RunOptions = .{ .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io }, .terminal = undefined };
+    const Notification = @import("../timer.zig").Notification(OwnedMsg);
+    var notification: Notification = .{ .notice = .{ .evidence = .init(&evidence), .emit = false }, .notify = OwnedMsg.notify };
+    try std.testing.expect(!try applyTimerNotification(App, &app, notification, &ctx, std.testing.io, &stats, opts));
+    try std.testing.expect(app.retained == null);
+    notification.notice.emit = true;
+    try std.testing.expectError(error.ExpectedUpdateFailure, applyTimerNotification(App, &app, notification, &ctx, std.testing.io, &stats, opts));
+    try std.testing.expectEqualStrings("fired", app.retained.?.bytes);
+    try std.testing.expectEqual(@as(usize, 2), evidence.calls);
+    try std.testing.expectEqual(@as(usize, 0), evidence.drops);
 }
 
 test "BracketedPasteAccumulator combines pasted key text" {

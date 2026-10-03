@@ -39,8 +39,8 @@ pub const Frame = struct {
 /// Chasen requires every root `Msg` type to choose explicitly. This prevents an
 /// allocator-owning result from silently inheriting plain-value drop semantics.
 pub const UndeliveredPolicy = enum {
-    /// Every message variant is safe to discard by value. Timer templates must
-    /// use this kind of non-owning/copy-safe message.
+    /// Every message variant is safe to discard by value. Timer Notice has its
+    /// own non-owning contract; callback-created messages follow this policy.
     plain,
     /// `Msg` provides `deinitUndelivered(*Msg, allocator)`.
     deinit,

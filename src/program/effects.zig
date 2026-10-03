@@ -138,8 +138,8 @@ pub fn Effects(comptime Msg: type) type {
                 result.needs_render = result.needs_render or clipboard_needs_render;
                 try tasks.startPending(app_ctx.requests, &self.completions, &terminal.loop, shutting_down);
                 timers.cancelPending(app_ctx.requests);
-                timers.startTicks(app_ctx.requests, &terminal.loop, shutting_down);
-                timers.startEvery(app_ctx.requests, &terminal.loop, &terminal.suspended, shutting_down);
+                try timers.startTicks(app_ctx.requests, &self.completions, &terminal.loop, shutting_down);
+                try timers.startEvery(app_ctx.requests, &self.completions, &terminal.loop, &terminal.suspended, shutting_down);
                 try terminal_effects.processImages(Msg, app_ctx, &self.completions, terminal, opts);
                 frames.startRequested(app_ctx.requests, &terminal.loop, &terminal.suspended, shutting_down);
 
@@ -157,6 +157,94 @@ pub fn Effects(comptime Msg: type) type {
     };
 }
 
+test "runtime completion holds task16 tick8 every8 image8 failures with full queue and follow-up" {
+    const TestMsg = enum {
+        task_failed,
+        tick_failed,
+        every_failed,
+        image_failed,
+        followup_failed,
+        pub const TimerNotice = enum { tick, every, followup };
+        pub const undelivered_policy = .plain;
+    };
+    const Callbacks = struct {
+        fn task(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestMsg {
+            unreachable;
+        }
+        fn taskFailed(_: ctx_mod.TaskStartError) TestMsg {
+            return .task_failed;
+        }
+        fn timer(notice: TestMsg.TimerNotice, outcome: runtime.TimerOutcome, _: std.mem.Allocator) ?TestMsg {
+            std.debug.assert(outcome == .failed);
+            return switch (notice) {
+                .tick => .tick_failed,
+                .every => .every_failed,
+                .followup => .followup_failed,
+            };
+        }
+        fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) TestMsg {
+            unreachable;
+        }
+        fn imageFailed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) TestMsg {
+            return .image_failed;
+        }
+    };
+    const App = struct {
+        pub const Msg = TestMsg;
+        counts: [5]usize = @splat(0),
+        total: usize = 0,
+        completions: *RuntimeCompletionBuffer(TestMsg),
+        pub fn update(self: *@This(), msg: TestMsg, ctx: *ctx_mod.Ctx(TestMsg)) !void {
+            if (self.total == 0) try std.testing.expectEqual(@as(usize, 40), self.completions.items.items.len);
+            self.total += 1;
+            self.counts[@intFromEnum(msg)] += 1;
+            if (msg == .tick_failed and self.counts[@intFromEnum(msg)] == 1)
+                try ctx.timer().tick("followup", 0, .followup, Callbacks.timer);
+        }
+    };
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(TestMsg).init(&requests);
+    for (0..16) |_| _ = try ctx.task().spawn(.{ .run = Callbacks.task, .failed = Callbacks.taskFailed });
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" }) |id| {
+        try ctx.timer().tick(id, 0, .tick, Callbacks.timer);
+        try ctx.timer().every(id, 1, .every, Callbacks.timer);
+        _ = try ctx.image().loadPath(id, Callbacks.loaded, Callbacks.imageFailed);
+    }
+    var tasks = TaskRuntime(TestMsg).init(allocator, io);
+    defer tasks.join(&requests);
+    var timers = TimerRuntime(TestMsg).init(allocator, io);
+    defer timers.shutdown();
+    var effects = try Effects(TestMsg).init(allocator);
+    defer effects.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 40), RuntimeCompletionBuffer(TestMsg).capacity);
+    var app: App = .{ .completions = &effects.completions };
+    var env: std.process.Environ.Map = .init(allocator);
+    defer env.deinit();
+    var terminal: TerminalSession(TestMsg) = undefined;
+    try terminal.init(allocator, io, .{ .env_map = &env });
+    defer terminal.deinit();
+    var terminal_effects: TerminalEffects = .{};
+    defer terminal_effects.deinit(&terminal);
+    while (try terminal.loop.tryPostEvent(.continue_effect_drain)) {}
+    var shutdown: std.atomic.Value(bool) = .init(false);
+    var frames = FrameRuntime(TestMsg).init(io);
+    defer frames.shutdown();
+    var stats: ?runtime.RuntimeStats = null;
+    _ = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutdown, &frames, &stats, .{
+        .runtime = .{ .allocator = allocator, .io = io },
+        .terminal = .{ .env_map = &env },
+    });
+    try std.testing.expectEqualSlices(usize, &.{ 16, 8, 8, 8, 1 }, &app.counts);
+    try std.testing.expectEqual(@as(usize, 41), app.total);
+    try std.testing.expectEqual(@as(usize, 0), effects.completions.items.items.len);
+    try std.testing.expect(!(try terminal.loop.tryPostEvent(.continue_effect_drain)));
+}
+
 const OwnershipTestPayload = struct {
     bytes: []u8,
     deinit_count: *usize,
@@ -165,6 +253,7 @@ const OwnershipTestPayload = struct {
 
 const OwnershipTestMsg = union(enum) {
     owned: OwnershipTestPayload,
+    pub const TimerNotice = runtime.Borrowed(*usize);
 
     pub const undelivered_policy = .deinit;
 
@@ -177,6 +266,15 @@ const OwnershipTestMsg = union(enum) {
             },
         }
         self.* = undefined;
+    }
+
+    fn timerNotice(notice: TimerNotice, outcome: runtime.TimerOutcome, allocator: std.mem.Allocator) ?@This() {
+        std.debug.assert(outcome == .failed);
+        return .{ .owned = .{
+            .bytes = allocator.dupe(u8, "timer failure") catch unreachable,
+            .deinit_count = notice.value,
+            .owner_thread = std.Thread.getCurrentId(),
+        } };
     }
 };
 
@@ -450,7 +548,7 @@ test "runtime completion delivery transfers ownership to update" {
     try std.testing.expectEqual(@as(usize, 0), effects.completions.items.items.len);
 }
 
-test "runtime completion update error remains app-owned" {
+test "runtime completion timer failure update error stays app-owned and cleans unapplied suffix" {
     const TestApp = struct {
         retained: ?OwnershipTestPayload = null,
 
@@ -466,20 +564,23 @@ test "runtime completion update error remains app-owned" {
 
     var deinit_count: usize = 0;
     var suffix_deinit_count: usize = 0;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
     var app: TestApp = .{};
     defer if (app.retained) |owned| std.testing.allocator.free(owned.bytes);
-    var app_ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, std.testing.io);
+    var app_ctx_requests = requests_mod.Requests(OwnershipTestMsg).init(std.testing.allocator, io);
+    defer app_ctx_requests.deinit();
     var app_ctx = ctx_mod.Ctx(OwnershipTestMsg).init(&app_ctx_requests);
     var effects = try Effects(OwnershipTestMsg).init(std.testing.allocator);
     defer effects.deinit(std.testing.allocator);
-    try effects.completions.append(.{ .owned = .{
-        .bytes = try std.testing.allocator.dupe(u8, "update-error-completion"),
-        .deinit_count = &deinit_count,
-    } });
-    try effects.completions.append(.{ .owned = .{
-        .bytes = try std.testing.allocator.dupe(u8, "unapplied-suffix"),
-        .deinit_count = &suffix_deinit_count,
-    } });
+    var timers = TimerRuntime(OwnershipTestMsg).init(std.testing.allocator, io);
+    defer timers.shutdown();
+    var loop = vaxis.Loop(InternalEvent(OwnershipTestMsg)).init(io, undefined, undefined);
+    var shutdown: std.atomic.Value(bool) = .init(false);
+    try app_ctx.timer().tick("first", 0, .init(&deinit_count), OwnershipTestMsg.timerNotice);
+    try app_ctx.timer().tick("suffix", 0, .init(&suffix_deinit_count), OwnershipTestMsg.timerNotice);
+    try timers.startTicks(&app_ctx_requests, &effects.completions, &loop, &shutdown);
     var stats: ?runtime.RuntimeStats = null;
 
     try std.testing.expectError(
@@ -539,8 +640,8 @@ test "effect coordination preserves stage order and callback admission" {
                         self.state.record(.clipboard);
                         _ = try ctx.task().spawnOwned(self.state, .{ .run = taskRun, .failed = taskFailed, .cleanup = taskCleanup });
                         try ctx.timer().cancel("old");
-                        try ctx.timer().tick("tick", 100, .noop);
-                        try ctx.timer().every("every", 200, .noop);
+                        try ctx.timer().tick("tick", 100, {}, timerNotice);
+                        try ctx.timer().every("every", 200, {}, timerNotice);
                         _ = try ctx.image().loadPath("stage.png", imageLoaded, imageFailed);
                         ctx.frame().request();
                     },
@@ -549,6 +650,12 @@ test "effect coordination preserves stage order and callback admission" {
             }
             fn foreground(_: foreground_command.ForegroundCommandResult) Msg {
                 return .foreground;
+            }
+            fn timerNotice(_: void, outcome: runtime.TimerOutcome, _: std.mem.Allocator) ?Msg {
+                return switch (outcome) {
+                    .fired => .noop,
+                    .failed => .noop,
+                };
             }
             fn clipboard(_: ctx_mod.Ctx(Msg).ClipboardCopyResult) Msg {
                 return .clipboard;
@@ -615,10 +722,9 @@ test "effect coordination preserves stage order and callback admission" {
     vtable.now = Harness.Admission.now;
     var timers = TimerRuntime(TestMsg).init(allocator, .{ .vtable = &vtable, .userdata = &timer_admission });
     defer timers.shutdown();
-    try timers.running.append(allocator, .{
-        .id = try allocator.dupe(u8, "old"),
-        .future = .{ .any_future = @ptrCast(&timer_admission), .result = {} },
-    });
+    const old_timer = try @import("../timer_entry.zig").TimerEntry(TestMsg).create(allocator, "old", 1, {}, Harness.App.timerNotice);
+    old_timer.future = .{ .any_future = @ptrCast(&timer_admission), .result = {} };
+    try timers.running.append(allocator, old_timer);
     var frames = FrameRuntime(TestMsg).init(.{ .vtable = &vtable, .userdata = &frame_admission });
     defer frames.shutdown();
     var tasks = TaskRuntime(TestMsg).init(std.testing.failing_allocator, std.testing.io);

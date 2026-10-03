@@ -223,8 +223,8 @@ pub fn build(b: *std.Build) void {
     timer_contract_step.dependOn(&b.addRunArtifact(timer_consumer_tests).step);
     test_step.dependOn(timer_contract_step);
 
-    // Only an internal test import: applications use Borrowed and the timer
-    // request boundary, not a separate public validator API.
+    // Exercise the internal value rules alongside the public consumer. Negative
+    // fixtures below enter through the production timer request boundary.
     const timer_contract = b.createModule(.{
         .root_source_file = b.path("src/timer.zig"),
         .target = target,
@@ -244,6 +244,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "error-union", .diagnostic = "TimerNotice supports only values and explicit Borrowed references" },
         .{ .name = "not-a-type", .diagnostic = "Msg.TimerNotice must be a type" },
         .{ .name = "borrowed-nonpointer", .diagnostic = "Borrowed requires a pointer or slice type" },
+        .{ .name = "missing-callback", .diagnostic = "member function expected 4 argument(s), found 3" },
     };
     for (negative_notices) |fixture| {
         const negative = b.addObject(.{
@@ -253,7 +254,6 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "timer_contract", .module = timer_contract },
                     .{ .name = "chasen", .module = mod },
                 },
             }),

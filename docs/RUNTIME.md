@@ -18,7 +18,9 @@ Chasen runtime.
 ```mermaid
 flowchart TD
     Event["Runtime event<br/>key / mouse / paste / resize / focus / frame"]
-    RuntimeMsg["Queued app message<br/>timer result / task result"]
+    RuntimeMsg["Queued task result Msg"]
+    TimerNotice["Queued non-owning Timer Notice"]
+    Notify["app timer callback(Notice, Outcome, Allocator) ?Msg"]
     Continue["Internal effect-drain continuation"]
     Handle["app.handleEvent?(Event) ?Msg"]
     Update["app.update(Msg, *Ctx)"]
@@ -32,6 +34,9 @@ flowchart TD
     Handle -->|"Msg"| Update
     Handle -->|"null"| Effects
     RuntimeMsg --> Update
+    TimerNotice --> Notify
+    Notify -->|"Msg"| Update
+    Notify -->|"null"| Effects
     Continue --> Effects
     Update --> Effects
     Effects -->|"completion Msg"| Update
@@ -44,12 +49,13 @@ flowchart TD
     classDef runtime fill:#f4f4f5,stroke:#71717a,color:#18181b;
     classDef decision fill:#fff7ed,stroke:#f97316,color:#431407;
 
-    class Handle,Update,View app;
-    class Event,RuntimeMsg,Continue,Effects,Render,Skip runtime;
+    class Handle,Update,View,Notify app;
+    class Event,RuntimeMsg,TimerNotice,Continue,Effects,Render,Skip runtime;
     class NeedRender decision;
 ```
 
-Timer and task results skip `handleEvent` because they are already app messages.
+Timer callbacks create Msgs on the runtime thread; task workers return Msgs.
+Both reach update without passing through `handleEvent`.
 Requested frame events go through `handleEvent`, so an animation app maps
 `Event.frame` into its own `Msg` before `update` advances state.
 
@@ -96,8 +102,9 @@ depending on the current screen and app state. By returning `?Msg`,
 `handleEvent` lets the app explicitly decide which events matter.
 
 This keeps `update` focused on domain messages instead of terminal/runtime event
-details. Timer and task results already arrive as app messages, so they skip
-`handleEvent` and go directly to `update`. Requested frame events still go
+details. Timer notices are converted by their registered callbacks on runtime,
+and task results arrive as Msgs. Both skip `handleEvent` and go directly to
+`update`. Requested frame events still go
 through `handleEvent`, which lets animation apps decide whether a frame matters
 for their current state.
 
@@ -113,9 +120,9 @@ Chasen does not make `update` return a command value. Instead, `update` receives
 `*chasen.Ctx(Msg)` and queues runtime effects explicitly.
 
 Queued effects have [pending request limits](#pending-request-limits). The timer
-examples use non-owning message variants; see the
-[Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction) before passing
-other payloads.
+examples use non-owning Notice values and mandatory callbacks; see
+[Timer Notice ownership](RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership)
+before passing references.
 
 ```zig
 // Stop the runtime after the current update/effect cycle.
@@ -133,11 +140,11 @@ _ = try ctx.task().spawn(.{
     .failed = Task.failed,
 });
 
-// Send `.reload` once after the given delay.
-try ctx.timer().tick("reload", 1_000_000_000, .reload);
+// With no Msg.TimerNotice declaration, use void and a callback.
+try ctx.timer().tick("reload", 1_000_000_000, {}, reloadNotice);
 
-// Send `.tick` repeatedly until the timer is cancelled or replaced.
-try ctx.timer().every("clock", 1_000_000_000, .tick);
+// The callback handles both fired and failed outcomes.
+try ctx.timer().every("clock", 1_000_000_000, {}, clockNotice);
 
 // Cancel a pending or running timer with this id.
 try ctx.timer().cancel("clock");
@@ -174,11 +181,14 @@ and completion-buffer types live in `program_types.zig`; backend-independent
 frame timing lives in `runtime.zig`. The public root keeps the same event and
 option exports.
 
-`TimerRuntime(Msg)` owns each running timer's copied ID and Future. The effect
+`TimerRuntime(Msg)` owns typed stable nodes containing copied IDs, Notice,
+callback, delay, and Future. The effect
 coordinator calls its cancel, tick, and every stages in that order; Program shuts
 it down before joining tasks. Same-ID replacement cancels and joins the old Future before
-starting the replacement. It shares the non-owning queue-post helper in
-`program_types.zig` with frames; completed one-shot retention is unchanged.
+starting the replacement. Tracking capacity is reserved before worker admission.
+Workers post copied Notice/callback values, independent of node and ID lifetime,
+using the non-owning queue-post helper shared with frames. Completed one-shot
+retention is described below.
 
 `ctx.quit()` remains a direct shortcut because it is used by almost every
 interactive app. `ctx.allocator()`, `ctx.io()`, and `ctx.now()` are direct
@@ -235,7 +245,9 @@ These are current implementation capacities, not configurable settings or
 guarantees that the numbers will remain unchanged. Handle admission errors.
 For example, submitting a seventeenth task before the task stage drains the
 queue fails; already-running tasks do not occupy those pending slots. Replacing
-an entry already pending in the same `tick` or `every` queue reuses its slot.
+an entry already pending in the same `tick` or `every` queue reuses its node
+and slot without allocation. `every(0)` returns `InvalidInterval` before any
+allocation or replacement; `tick(0)` is allowed.
 An accepted `cancel` removes matching pending timers and queues cancellation of
 running timers; if admission fails, it leaves those timers unchanged.
 
@@ -251,9 +263,9 @@ Ownership on admission depends on the API:
   the caller still owns it and no task callback runs. After success, Chasen owns
   cleanup, including when the task never starts. See the
   [owned-task example](RUNTIME_MESSAGE_OWNERSHIP.md#queueing-an-owned-task).
-- Timer calls copy IDs but only copy the message value; they do not take ownership
-  of its referenced storage. Use a non-owning, copy-safe template as described in
-  [Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction).
+- Timer calls allocate a typed node with copied ID, and copy the non-owning
+  Notice. Referents remain caller-owned; use explicit Borrowed as described in
+  [Timer Notice ownership](RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership).
 - Image path loads, clipboard writes, and foreground commands own copies of their
   queued inputs after admission. The caller retains the original inputs. A
   foreground `.dir` cwd duplicates the descriptor; the caller retains the
@@ -264,36 +276,73 @@ Ownership on admission depends on the API:
 Queue-full errors are only part of each API's error set. Copying inputs can fail
 with `OutOfMemory`; task admission can return `TaskIdExhausted`; foreground
 requests also validate their inputs. A successful call means admission, not
-successful execution or delivery. In particular, timers currently have no
-callback for failures after admission; see [Timers and Frames](#timers-and-frames).
+successful execution or delivery. Timer tracking/worker start failures are
+reported to the registered callback; see [Timers and Frames](#timers-and-frames).
 
 ## Timers and Frames
 
-`tick(id, delay_ns, msg)` schedules one message; `every(id, interval_ns, msg)`
-repeats until canceled or replaced. Scheduling either with the same id replaces
-the running timer. IDs are copied while queueing, so temporary ID strings are
-allowed. `cancel(id)` removes matching pending timers and queues cancellation
-for a running timer; it can fail if the cancellation queue is full.
-See the [tick example](../examples/tick/main.zig) for replacement and cancellation.
+`tick(id, delay_ns, notice, notify)` schedules one notification;
+`every(id, interval_ns, notice, notify)` repeats until canceled or replaced.
+Notice is the dedicated `Msg.TimerNotice` type, or void when omitted. Root Msg
+aliases and recursively nested bare pointers/slices are rejected. References
+must use genuine `Borrowed(Ref)` wrappers. Simple applications need no Notice
+enum or generation:
 
-Timer and frame effects are intentionally simple. `ctx.timer().every` is a
-fixed-delay repeating timer: it waits for the interval, posts a message, then
-waits for the interval again. Timer intervals do not compensate for app
-update/render time. Pass only non-owning, copy-safe message variants, including
-when the root `Msg` uses `.deinit` for other variants. See
-[Timer restriction](RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction) for safe payloads
-and the distinction between templates and posted messages.
+```zig
+fn clockNotice(_: void, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?Msg {
+    return switch (outcome) {
+        .fired => .tick,
+        .failed => .timer_unavailable,
+    };
+}
+// Inside init/update:
+try ctx.timer().every("clock", std.time.ns_per_s, {}, clockNotice);
+```
 
-A successful `tick` / `every` call means the request was accepted, not that its
-helper started or its message will arrive. If the runtime cannot start or track
-the helper, there is no timer failure callback and the message may never be
-delivered. Use a task with a failure callback when later progress depends on
-observing a start failure.
+The mandatory callback receives `.fired` or
+`.failed(error.OutOfMemory / error.ConcurrencyUnavailable)` on the runtime
+thread. It may return a Msg (including an owned value using its allocator), or
+explicitly return null. It must not block or reenter effects/runtime driving.
+Failure handlers should release application waiting/running state. An accepted
+request that cannot start invokes the failure path exactly once; it cannot also
+fire. There is no automatic retry. Cancellation, replacement, quit, and shutdown
+do not manufacture start failures.
 
-Completed one-shot timers retain their copied ID and Future until replacement,
-explicit cancellation, or shutdown. Long-lived apps should reuse a bounded set
-of IDs or explicitly cancel completed timers, handling cancellation admission
-errors. The pending queue limit does not bound these retained handles.
+IDs are copied into the node's allocation; temporary ID strings are allowed.
+Replacing an ID still pending in the same queue reuses that node. Running
+replacement cancels and joins the old worker before starting the new one.
+`every(0)` fails with `InvalidInterval` before allocation or state changes;
+`tick(0)` is allowed. Admission errors leave existing pending/running timers
+unchanged. A valid replacement whose later start fails does not restore the
+old timer. Tracking storage is reserved before worker admission, eliminating
+a firing-versus-tracking-failure race.
+
+`cancel(id)` removes matching pending timers and queues cancellation for a
+running timer. It can fail with OutOfMemory or TimerCancelLimitExceeded; failure
+leaves existing timers intact. In one update, `cancel(id); tick(id, ...)` keeps
+the new tick: stages process cancel, then tick, then every. If both timer kinds
+use the same ID, every is processed last. A notice already posted is not
+retracted; carry application generations/identity in Notice when staleness
+matters. See the [tick example](../examples/tick/main.zig).
+
+Repeating timers use fixed delay: wait, post Notice, then wait again. They do
+not compensate for update/render time and skip firing during foreground
+suspension. Queue delivery uses cancellable retries without making the runtime
+thread post to its own full queue. Runtime converts a fired Notice immediately
+before update; failure Msgs use the completion buffer. Shutdown drops queued
+notices without invoking callbacks. See
+[Timer Notice ownership](RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership)
+for Borrowed lifetime and generated Msg cleanup.
+
+One allocation stores each pending/running node and its ID; no Notice payload
+box or fixed inline-size limit is used. A large common Notice increases every
+node/notification's size, and callback-created owned Msgs can allocate. This
+contract does not promise lower total allocation bytes or RSS.
+
+Completed one-shot nodes currently retain their copied ID and Future until
+replacement, explicit cancellation, or shutdown. Long-lived apps should reuse
+a bounded set of IDs or explicitly cancel completed timers, handling admission
+errors. The pending queue limit does not bound these retained nodes.
 
 `ctx.frame().request` requests one future frame event paced from the last
 delivered frame, and is coalesced while a frame is already in flight. Animation

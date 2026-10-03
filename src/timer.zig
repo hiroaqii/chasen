@@ -27,6 +27,23 @@ pub const TimerOutcome = union(enum) {
     failed: TimerStartError,
 };
 
+/// Internal typed callback/transport vocabulary. Only the runtime invokes it.
+pub fn Notify(comptime Msg: type) type {
+    return *const fn (Notice(Msg), TimerOutcome, std.mem.Allocator) ?Msg;
+}
+
+/// Independent non-owning value: never borrows a timer node or its ID storage.
+pub fn Notification(comptime Msg: type) type {
+    return struct {
+        notice: Notice(Msg),
+        notify: Notify(Msg),
+
+        pub fn message(self: @This(), outcome: TimerOutcome, allocator: std.mem.Allocator) ?Msg {
+            return self.notify(self.notice, outcome, allocator);
+        }
+    };
+}
+
 /// Internal associated-type boundary, shared by requests and runtime storage.
 /// A root message may own resources; its timer notice must be a separate,
 /// non-owning value type. Applications without a declaration use void notices.

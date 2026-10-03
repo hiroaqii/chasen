@@ -6,7 +6,8 @@ const reminder_delay_ns: u64 = 2 * std.time.ns_per_s;
 
 // This example demonstrates `ctx.timer().tick`: a one-shot timer that sends one future
 // app message. Re-scheduling with the same id replaces the pending/running
-// timer, and `ctx.timer().cancel` stops it before it fires.
+// timer. Cancellation stops future posts; a notice already in the queue may
+// still arrive. This simple example needs no custom Notice type (it uses void).
 const TickDemo = struct {
     scheduled: bool = false,
     scheduled_count: u32 = 0,
@@ -19,6 +20,7 @@ const TickDemo = struct {
 
         schedule,
         fired,
+        unavailable,
         cancel,
         quit,
     };
@@ -42,12 +44,16 @@ const TickDemo = struct {
                 self.scheduled = true;
                 self.scheduled_count += 1;
                 self.last_event = "Scheduled. Press s again to replace it.";
-                try ctx.timer().tick(reminder_id, reminder_delay_ns, .fired);
+                try ctx.timer().tick(reminder_id, reminder_delay_ns, {}, timerNotice);
             },
             .fired => {
                 self.scheduled = false;
                 self.fired_count += 1;
                 self.last_event = "Tick fired once.";
+            },
+            .unavailable => {
+                self.scheduled = false;
+                self.last_event = "Timer could not start. Press s to try again.";
             },
             .cancel => {
                 if (self.scheduled) {
@@ -61,6 +67,13 @@ const TickDemo = struct {
             },
             .quit => ctx.quit(),
         }
+    }
+
+    fn timerNotice(_: void, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?Msg {
+        return switch (outcome) {
+            .fired => .fired,
+            .failed => .unavailable,
+        };
     }
 
     pub fn view(self: *const TickDemo, sfc: *chasen.Surface) !void {

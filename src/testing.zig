@@ -192,6 +192,8 @@ pub fn TestCtx(comptime Msg: type) type {
             request_id: clipboard.ClipboardCopyRequestId,
             text: []const u8,
         };
+        pub const TickView = struct { id: []const u8, after_ns: u64, notice: @import("timer.zig").Notice(Msg) };
+        pub const EveryView = struct { id: []const u8, interval_ns: u64, notice: @import("timer.zig").Notice(Msg) };
 
         pub fn init(self: *@This(), allocator: std.mem.Allocator, io: std.Io) void {
             self.requests = Requests.init(allocator, io);
@@ -249,13 +251,15 @@ pub fn TestCtx(comptime Msg: type) type {
         }
 
         /// Observation borrows IDs and payloads until this owner next mutates.
-        pub fn tickAt(self: *const @This(), index: usize) ?Requests.TickEntry {
+        pub fn tickAt(self: *const @This(), index: usize) ?TickView {
             if (index >= self.pendingTickCount()) return null;
-            return self.requests._pending_ticks[index];
+            const entry = self.requests._pending_ticks[index];
+            return .{ .id = entry.id, .after_ns = entry.duration_ns, .notice = entry.notification.notice };
         }
-        pub fn everyAt(self: *const @This(), index: usize) ?Requests.EveryEntry {
+        pub fn everyAt(self: *const @This(), index: usize) ?EveryView {
             if (index >= self.pendingEveryCount()) return null;
-            return self.requests._pending_everys[index];
+            const entry = self.requests._pending_everys[index];
+            return .{ .id = entry.id, .interval_ns = entry.duration_ns, .notice = entry.notification.notice };
         }
         pub fn cancelAt(self: *const @This(), index: usize) ?[]const u8 {
             if (index >= self.pendingCancelCount()) return null;
@@ -318,6 +322,68 @@ pub fn TestCtx(comptime Msg: type) type {
     };
 }
 
+/// Timer-only integration driver. Initialize in final storage after TestCtx;
+/// keep both at their original addresses and do not reset or concurrently drive
+/// the borrowed TestCtx. The driver uses its allocator/Io and the production
+/// TimerRuntime, not a simulated clock or task/application runner.
+/// Returned messages belong to the test (deliver to update or explicitly drop).
+pub fn TimerDriver(comptime Msg: type) type {
+    const types = @import("program_types.zig");
+    const Timers = @import("program/timers.zig").TimerRuntime(Msg);
+    return struct {
+        const Self = @This();
+        tc: *TestCtx(Msg),
+        timers: Timers,
+        loop: vaxis.Loop(types.InternalEvent(Msg)),
+        completions: types.RuntimeCompletionBuffer(Msg) = .{},
+        shutting_down: std.atomic.Value(bool) = .init(false),
+        suspended: std.atomic.Value(bool) = .init(false),
+
+        pub fn init(self: *Self, tc: *TestCtx(Msg)) !void {
+            comptime runtime.validateUndeliveredPolicy(Msg);
+            self.* = .{
+                .tc = tc,
+                .timers = Timers.init(tc.ctx.allocator(), tc.ctx.io()),
+                .loop = .init(tc.ctx.io(), undefined, undefined),
+            };
+            try self.completions.init(tc.ctx.allocator());
+        }
+
+        /// Apply the real cancel -> tick -> every stages. Completion messages
+        /// are returned by nextMessage, rather than recursively invoking update.
+        pub fn drain(self: *Self) !void {
+            self.timers.cancelPending(&self.tc.requests);
+            try self.timers.startTicks(&self.tc.requests, &self.completions, &self.loop, &self.shutting_down);
+            try self.timers.startEvery(&self.tc.requests, &self.completions, &self.loop, &self.suspended, &self.shutting_down);
+        }
+
+        pub fn nextMessage(self: *Self) !?Msg {
+            if (self.completions.items.items.len > 0)
+                return self.completions.items.orderedRemove(0);
+            while (try self.loop.tryEvent()) |event| switch (event) {
+                .timer_notification => |notification| {
+                    if (notification.message(.fired, self.tc.ctx.allocator())) |msg| return msg;
+                },
+                .user_msg => |msg| return msg,
+                else => {},
+            };
+            return null;
+        }
+
+        /// Joins workers before discarding queued notices and undelivered Msgs.
+        /// TestCtx continues to own pending requests; returned Msgs remain owned
+        /// by the caller. Deinitialize this driver before its borrowed TestCtx.
+        pub fn deinit(self: *Self) void {
+            const allocator = self.tc.ctx.allocator();
+            self.shutting_down.store(true, .seq_cst);
+            self.timers.shutdown();
+            @import("program/terminal_session.zig").drainInternalEventsForShutdown(Msg, &self.loop, allocator);
+            self.completions.deinitUndelivered(allocator);
+            self.* = undefined;
+        }
+    };
+}
+
 // --- Tests ---
 
 test "TestCtx initialises with valid allocator and default state" {
@@ -350,8 +416,8 @@ test "resetTransient clears pending queues and redraw suppression" {
         }
     };
     _ = try tc.ctx.task().spawn(.{ .run = task.run, .failed = task.failed });
-    try tc.ctx.timer().tick("t1", 1_000, .inc);
-    try tc.ctx.timer().every("e1", 2_000, .dec);
+    try tc.ctx.timer().tick("t1", 1_000, {}, ignoreTimerOutcome(TestMsg));
+    try tc.ctx.timer().every("e1", 2_000, {}, ignoreTimerOutcome(TestMsg));
     try tc.ctx.timer().cancel("x");
     _ = try tc.ctx.terminal().copyToClipboard(.{
         .text = "clip",
@@ -430,6 +496,14 @@ test "update call pattern with a counter app" {
 }
 
 const TestMsg = union(enum) { inc, dec };
+
+fn ignoreTimerOutcome(comptime Msg: type) @import("timer.zig").Notify(Msg) {
+    return struct {
+        fn notify(_: @import("timer.zig").Notice(Msg), _: runtime.TimerOutcome, _: std.mem.Allocator) ?Msg {
+            return null;
+        }
+    }.notify;
+}
 
 test "TestSurface exposes a drawable headless surface" {
     // Keep TestSurface in stable storage: the embedded Surface points at the
@@ -548,6 +622,7 @@ test "TestTask consumes owned contexts once across every terminal" {
 test "TestCtx observes requests and completes owned messages without a terminal" {
     const Msg = struct {
         bytes: []const u8,
+        pub const TimerNotice = runtime.Borrowed([]const u8);
         pub const undelivered_policy = .deinit;
         pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(self.bytes);
@@ -562,13 +637,15 @@ test "TestCtx observes requests and completes owned messages without a terminal"
     var tc: TestCtx(Msg) = undefined;
     tc.init(std.testing.allocator, std.testing.io);
     defer tc.deinit();
-    const template: Msg = .{ .bytes = "borrowed timer template" };
-    try tc.ctx.timer().tick("tick", 10, template);
-    try tc.ctx.timer().every("every", 20, template);
+    const notice = Msg.TimerNotice.init("borrowed timer notice");
+    try tc.ctx.timer().tick("tick", 10, notice, ignoreTimerOutcome(Msg));
+    try tc.ctx.timer().every("every", 20, notice, ignoreTimerOutcome(Msg));
     try tc.ctx.timer().cancel("cancel");
     try std.testing.expectEqualStrings("tick", tc.tickAt(0).?.id);
     try std.testing.expectEqual(@as(u64, 10), tc.tickAt(0).?.after_ns);
-    try std.testing.expectEqualStrings(template.bytes, tc.everyAt(0).?.msg.bytes);
+    try std.testing.expectEqualStrings(notice.value, tc.everyAt(0).?.notice.value);
+    try std.testing.expect(!@hasField(TestCtx(Msg).TickView, "notify"));
+    try std.testing.expect(!@hasDecl(TestCtx(Msg).EveryView, "destroy"));
     try std.testing.expectEqual(@as(u64, 20), tc.everyAt(0).?.interval_ns);
     try std.testing.expectEqualStrings("cancel", tc.cancelAt(0).?);
     try std.testing.expect(tc.tickAt(1) == null and tc.everyAt(1) == null and tc.cancelAt(1) == null);
@@ -626,7 +703,7 @@ test "TestCtx admission uses the supplied failing allocator" {
     var tc: TestCtx(u8) = undefined;
     tc.init(failing.allocator(), std.testing.io);
     defer tc.deinit();
-    try std.testing.expectError(error.OutOfMemory, tc.ctx.timer().tick("owned id", 1, 0));
+    try std.testing.expectError(error.OutOfMemory, tc.ctx.timer().tick("owned id", 1, {}, ignoreTimerOutcome(u8)));
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount());
     _ = tc.ctx.now();
 }

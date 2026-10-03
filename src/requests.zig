@@ -4,6 +4,7 @@ const terminal_image = @import("terminal_image_types.zig");
 const foreground_command = @import("foreground_command.zig");
 const clipboard_types = @import("clipboard.zig");
 const runtime_limits = @import("runtime_limits.zig");
+const timer_contract = @import("timer.zig");
 
 const foreground_command_duplicate_min_fd = foreground_command.foreground_command_duplicate_min_fd;
 const DuplicateForegroundCommandDirResult = foreground_command.DuplicateForegroundCommandDirResult;
@@ -22,8 +23,10 @@ pub fn Requests(comptime Msg: type) type {
     const TaskFn = *const fn (std.mem.Allocator, std.Io) std.Io.Cancelable!Msg;
     const TaskFailedFn = *const fn (TaskStartError) Msg;
     const max_tasks = runtime_limits.max_tasks;
-    const max_ticks = 8;
-    const max_everys = 8;
+    const max_ticks = runtime_limits.max_ticks;
+    const max_everys = runtime_limits.max_everys;
+    const TimerEntry = @import("timer_entry.zig").TimerEntry(Msg);
+    const Notice = timer_contract.Notice(Msg);
     const max_terminal_image_loads = runtime_limits.max_terminal_image_loads;
     const max_terminal_image_unloads = 8;
     const max_foreground_commands = 1;
@@ -33,25 +36,13 @@ pub fn Requests(comptime Msg: type) type {
 
     return struct {
         const Self = @This();
-        const TimerScheduleError = error{TimerLimitExceeded} || std.mem.Allocator.Error;
+        const TimerScheduleError = error{ TimerLimitExceeded, InvalidInterval } || std.mem.Allocator.Error;
         const TimerCancelError = error{TimerCancelLimitExceeded} || std.mem.Allocator.Error;
 
         pub const TerminalImageLoadedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.TerminalImageHandle) Msg;
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
         pub const ForegroundCommandFinishedFn = *const fn (foreground_command.ForegroundCommandResult) Msg;
         pub const ClipboardCopyFinishedFn = *const fn (clipboard_types.ClipboardCopyResult) Msg;
-
-        pub const TickEntry = struct {
-            id: []const u8,
-            after_ns: u64,
-            msg: Msg,
-        };
-
-        pub const EveryEntry = struct {
-            id: []const u8,
-            interval_ns: u64,
-            msg: Msg,
-        };
 
         pub const SpawnOptions = struct {
             run: TaskFn,
@@ -164,9 +155,9 @@ pub fn Requests(comptime Msg: type) type {
             context: *anyopaque,
             request: *const fn (*anyopaque, TaskId, std.Io) void,
         } = null,
-        _pending_ticks: [max_ticks]TickEntry = undefined,
+        _pending_ticks: [max_ticks]*TimerEntry = undefined,
         _pending_ticks_len: u8 = 0,
-        _pending_everys: [max_everys]EveryEntry = undefined,
+        _pending_everys: [max_everys]*TimerEntry = undefined,
         _pending_everys_len: u8 = 0,
         _pending_cancels: [max_cancels][]const u8 = undefined,
         _pending_cancels_len: u8 = 0,
@@ -289,71 +280,51 @@ pub fn Requests(comptime Msg: type) type {
 
         pub const TimerEffects = struct {
             requests: *Self,
+            pub const Notify = timer_contract.Notify(Msg);
 
-            /// Schedule a one-shot delayed message.
+            /// Queue one non-owning notice after after_ns (zero is allowed).
+            /// IDs are copied. A same-kind pending ID reuses its stable node.
+            /// Notice is Msg.TimerNotice, or void when no type is declared.
+            /// Raw references must be wrapped explicitly with Borrowed.
             ///
-            /// The message will be delivered once after `after_ns`
-            /// nanoseconds. If a timer with the same `id` is already pending,
-            /// it is overwritten.
-            ///
-            /// The id is copied into runtime-owned memory while queueing, so
-            /// callers may pass temporary or dynamically formatted ids.
-            ///
-            /// If the runtime cannot start or track the timer helper, this
-            /// API currently has no failure callback and the timer message may
-            /// never be delivered.
-            ///
-            /// The runtime may copy this template and drop pending copies
-            /// during replacement or shutdown without calling
-            /// `Msg.deinitUndelivered`. Use only a non-owning/copy-safe message
-            /// variant; heap-owning results belong in task callbacks.
-            pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.requests._pending_ticks[0..self.requests._pending_ticks_len]) |*entry| {
+            /// notify is mandatory for both fired and failed outcomes. It runs
+            /// on the runtime thread, must not block/reenter effects, and may
+            /// return an owned Msg using its allocator or explicitly return null.
+            /// Admission errors invoke no callback and preserve existing timers.
+            /// Accepted start failures invoke notify with the registered notice.
+            /// Cancel/replacement/shutdown do not invoke a failure callback, and
+            /// cannot retract queued notices. Keep borrowed referents alive until
+            /// both queued notices and generated messages have finished using them.
+            pub fn tick(self: TimerEffects, id: []const u8, after_ns: u64, notice: Notice, notify: Notify) TimerScheduleError!void {
+                for (self.requests._pending_ticks[0..self.requests._pending_ticks_len]) |entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
-                        entry.after_ns = after_ns;
-                        entry.msg = msg;
+                        entry.duration_ns = after_ns;
+                        entry.notification = .{ .notice = notice, .notify = notify };
                         return;
                     }
                 }
                 if (self.requests._pending_ticks_len >= max_ticks) return error.TimerLimitExceeded;
-                self.requests._pending_ticks[self.requests._pending_ticks_len] = .{
-                    .id = try self.requests._allocator.dupe(u8, id),
-                    .after_ns = after_ns,
-                    .msg = msg,
-                };
+                self.requests._pending_ticks[self.requests._pending_ticks_len] =
+                    try TimerEntry.create(self.requests._allocator, id, after_ns, notice, notify);
                 self.requests._pending_ticks_len += 1;
             }
 
-            /// Schedule a repeating timer.
-            ///
-            /// The message will be delivered every `interval_ns` nanoseconds
-            /// until the future is cancelled. If a timer with the same `id` is
-            /// already pending, it is overwritten.
-            ///
-            /// The id is copied into runtime-owned memory while queueing, so
-            /// callers may pass temporary or dynamically formatted ids.
-            ///
-            /// If the runtime cannot start or track the timer helper, this
-            /// API currently has no failure callback and the timer message may
-            /// never be delivered.
-            ///
-            /// The runtime reuses this template for every firing and may drop
-            /// it without calling `Msg.deinitUndelivered`. Use only a
-            /// non-owning/copy-safe message variant.
-            pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, msg: Msg) TimerScheduleError!void {
-                for (self.requests._pending_everys[0..self.requests._pending_everys_len]) |*entry| {
+            /// Queue a repeating notice with the same callback/ownership contract
+            /// as tick. Zero is rejected before allocation or pending replacement.
+            /// A running timer is canceled/joined before its replacement starts;
+            /// its immutable notice is never updated in place.
+            pub fn every(self: TimerEffects, id: []const u8, interval_ns: u64, notice: Notice, notify: Notify) TimerScheduleError!void {
+                if (interval_ns == 0) return error.InvalidInterval;
+                for (self.requests._pending_everys[0..self.requests._pending_everys_len]) |entry| {
                     if (std.mem.eql(u8, entry.id, id)) {
-                        entry.interval_ns = interval_ns;
-                        entry.msg = msg;
+                        entry.duration_ns = interval_ns;
+                        entry.notification = .{ .notice = notice, .notify = notify };
                         return;
                     }
                 }
                 if (self.requests._pending_everys_len >= max_everys) return error.TimerLimitExceeded;
-                self.requests._pending_everys[self.requests._pending_everys_len] = .{
-                    .id = try self.requests._allocator.dupe(u8, id),
-                    .interval_ns = interval_ns,
-                    .msg = msg,
-                };
+                self.requests._pending_everys[self.requests._pending_everys_len] =
+                    try TimerEntry.create(self.requests._allocator, id, interval_ns, notice, notify);
                 self.requests._pending_everys_len += 1;
             }
 
@@ -385,7 +356,7 @@ pub fn Requests(comptime Msg: type) type {
                 var i: u8 = 0;
                 while (i < self._pending_ticks_len) {
                     if (std.mem.eql(u8, self._pending_ticks[i].id, id)) {
-                        self._allocator.free(self._pending_ticks[i].id);
+                        self._pending_ticks[i].destroy(self._allocator);
                         self._pending_ticks_len -= 1;
                         if (i < self._pending_ticks_len) {
                             self._pending_ticks[i] = self._pending_ticks[self._pending_ticks_len];
@@ -400,7 +371,7 @@ pub fn Requests(comptime Msg: type) type {
                 var i: u8 = 0;
                 while (i < self._pending_everys_len) {
                     if (std.mem.eql(u8, self._pending_everys[i].id, id)) {
-                        self._allocator.free(self._pending_everys[i].id);
+                        self._pending_everys[i].destroy(self._allocator);
                         self._pending_everys_len -= 1;
                         if (i < self._pending_everys_len) {
                             self._pending_everys[i] = self._pending_everys[self._pending_everys_len];
@@ -670,8 +641,7 @@ pub fn Requests(comptime Msg: type) type {
         fn Batch(comptime kind: RequestKind) type {
             const Entry = switch (kind) {
                 .task => TaskEntry,
-                .tick => TickEntry,
-                .every => EveryEntry,
+                .tick, .every => *TimerEntry,
                 .cancel => []const u8,
                 .image_load => TerminalImageLoadEntry,
                 .image_unload => terminal_image.TerminalImageHandle,
@@ -725,7 +695,7 @@ pub fn Requests(comptime Msg: type) type {
                 pub fn deinit(self: *@This()) void {
                     while (self.next()) |entry| switch (kind) {
                         .task => entry.discard(self.allocator),
-                        .tick, .every => self.allocator.free(entry.id),
+                        .tick, .every => entry.destroy(self.allocator),
                         .cancel => self.allocator.free(entry),
                         .image_load => self.allocator.free(entry.path),
                         .image_unload => {},
@@ -838,6 +808,13 @@ pub fn Requests(comptime Msg: type) type {
 }
 
 // Test helpers.
+fn ignoreTimerOutcome(comptime Msg: type) timer_contract.Notify(Msg) {
+    return struct {
+        fn notify(_: timer_contract.Notice(Msg), _: timer_contract.TimerOutcome, _: std.mem.Allocator) ?Msg {
+            return null;
+        }
+    }.notify;
+}
 
 const InjectedForegroundCommandCwdOps = struct {
     result: DuplicateForegroundCommandDirResult,
@@ -980,108 +957,134 @@ test "Requests spawn returns error when task queue is full" {
 }
 
 test "Requests tick accumulates entries" {
-    const TestMsg = union(enum) { timeout, ping };
+    const TestMsg = union(enum) {
+        timeout,
+        ping,
+        pub const TimerNotice = enum { timeout, ping };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
-    try ctx_val.timer().tick("t2", 500_000_000, .ping);
+    try ctx_val.timer().tick("t2", 500_000_000, .ping, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_ticks_len);
 
     const slice = ctx_val._pending_ticks[0..ctx_val._pending_ticks_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
-    try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].after_ns);
-    try std.testing.expect(slice[0].msg == .timeout);
-    try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].after_ns);
-    try std.testing.expect(slice[1].msg == .ping);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].duration_ns);
+    try std.testing.expect(slice[0].notification.notice == .timeout);
+    try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].duration_ns);
+    try std.testing.expect(slice[1].notification.notice == .ping);
 }
 
 test "Requests tick returns error when timer queue is full" {
-    const TestMsg = union(enum) { timeout };
+    const TestMsg = union(enum) {
+        timeout,
+        pub const TimerNotice = enum { timeout };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
-        try ctx_val.timer().tick(ids[i], 1_000_000_000, .timeout);
+        try ctx_val.timer().tick(ids[i], 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
     }
-    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().tick("overflow", 1_000_000_000, .timeout));
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().tick("overflow", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg)));
 }
 
 test "Requests every accumulates entries" {
-    const TestMsg = union(enum) { tick_msg, heartbeat };
+    const TestMsg = union(enum) {
+        tick_msg,
+        heartbeat,
+        pub const TimerNotice = enum { tick_msg, heartbeat };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg);
+    try ctx_val.timer().every("e1", 1_000_000_000, .tick_msg, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
-    try ctx_val.timer().every("e2", 500_000_000, .heartbeat);
+    try ctx_val.timer().every("e2", 500_000_000, .heartbeat, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 2), ctx_val._pending_everys_len);
 
     const slice = ctx_val._pending_everys[0..ctx_val._pending_everys_len];
     try std.testing.expectEqual(@as(usize, 2), slice.len);
-    try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].interval_ns);
-    try std.testing.expect(slice[0].msg == .tick_msg);
-    try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].interval_ns);
-    try std.testing.expect(slice[1].msg == .heartbeat);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), slice[0].duration_ns);
+    try std.testing.expect(slice[0].notification.notice == .tick_msg);
+    try std.testing.expectEqual(@as(u64, 500_000_000), slice[1].duration_ns);
+    try std.testing.expect(slice[1].notification.notice == .heartbeat);
 }
 
 test "Requests every returns error when timer queue is full" {
-    const TestMsg = union(enum) { tick_msg };
+    const TestMsg = union(enum) {
+        tick_msg,
+        pub const TimerNotice = enum { tick_msg };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
     for (0..8) |i| {
         const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
-        try ctx_val.timer().every(ids[i], 1_000_000_000, .tick_msg);
+        try ctx_val.timer().every(ids[i], 1_000_000_000, .tick_msg, ignoreTimerOutcome(TestMsg));
     }
-    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().every("overflow", 1_000_000_000, .tick_msg));
+    try std.testing.expectError(error.TimerLimitExceeded, ctx_val.timer().every("overflow", 1_000_000_000, .tick_msg, ignoreTimerOutcome(TestMsg)));
 }
 
 test "Requests tick same id overwrites existing entry" {
-    const TestMsg = union(enum) { timeout, ping };
+    const TestMsg = union(enum) {
+        timeout,
+        ping,
+        pub const TimerNotice = enum { timeout, ping };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("timer1", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
     // Same id should overwrite, not grow the queue.
-    try ctx_val.timer().tick("timer1", 2_000_000_000, .ping);
+    try ctx_val.timer().tick("timer1", 2_000_000_000, .ping, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
     const slice = ctx_val._pending_ticks[0..ctx_val._pending_ticks_len];
-    try std.testing.expectEqual(@as(u64, 2_000_000_000), slice[0].after_ns);
-    try std.testing.expect(slice[0].msg == .ping);
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), slice[0].duration_ns);
+    try std.testing.expect(slice[0].notification.notice == .ping);
 }
 
 test "Requests every same id overwrites existing entry" {
-    const TestMsg = union(enum) { tick_msg, heartbeat };
+    const TestMsg = union(enum) {
+        tick_msg,
+        heartbeat,
+        pub const TimerNotice = enum { tick_msg, heartbeat };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg);
+    try ctx_val.timer().every("refresh", 1_000_000_000, .tick_msg, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     // Same id should overwrite.
-    try ctx_val.timer().every("refresh", 500_000_000, .heartbeat);
+    try ctx_val.timer().every("refresh", 500_000_000, .heartbeat, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
     const slice = ctx_val._pending_everys[0..ctx_val._pending_everys_len];
-    try std.testing.expectEqual(@as(u64, 500_000_000), slice[0].interval_ns);
-    try std.testing.expect(slice[0].msg == .heartbeat);
+    try std.testing.expectEqual(@as(u64, 500_000_000), slice[0].duration_ns);
+    try std.testing.expect(slice[0].notification.notice == .heartbeat);
 }
 
 test "Requests timer cancel removes from pending queues" {
-    const TestMsg = union(enum) { timeout, tick_msg };
+    const TestMsg = union(enum) {
+        timeout,
+        tick_msg,
+        pub const TimerNotice = enum { timeout, tick_msg };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout);
-    try ctx_val.timer().every("e1", 500_000_000, .tick_msg);
+    try ctx_val.timer().tick("t1", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
+    try ctx_val.timer().every("e1", 500_000_000, .tick_msg, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_everys_len);
 
@@ -1107,29 +1110,35 @@ test "Requests timer cancel queues id for runtime cancellation" {
 }
 
 test "Requests timer cancel then tick queues cancel and replacement" {
-    const TestMsg = union(enum) { timeout };
+    const TestMsg = union(enum) {
+        timeout,
+        pub const TimerNotice = enum { timeout };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
     try ctx_val.timer().cancel("restart");
-    try ctx_val.timer().tick("restart", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("restart", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
 
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_cancels_len);
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
 
     try std.testing.expectEqualStrings("restart", ctx_val._pending_cancels[0..ctx_val._pending_cancels_len][0]);
     try std.testing.expectEqualStrings("restart", ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].id);
-    try std.testing.expectEqual(@as(u64, 1_000_000_000), ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].after_ns);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), ctx_val._pending_ticks[0..ctx_val._pending_ticks_len][0].duration_ns);
 }
 
 test "Requests timer cancel leaves pending timers unchanged when cancel queue is full" {
-    const TestMsg = union(enum) { timeout };
+    const TestMsg = union(enum) {
+        timeout,
+        pub const TimerNotice = enum { timeout };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
     const cancel_ids = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7" };
     for (cancel_ids) |id| try ctx_val.timer().cancel(id);
-    try ctx_val.timer().tick("pending", 1_000_000_000, .timeout);
+    try ctx_val.timer().tick("pending", 1_000_000_000, .timeout, ignoreTimerOutcome(TestMsg));
 
     try std.testing.expectError(error.TimerCancelLimitExceeded, ctx_val.timer().cancel("pending"));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
@@ -1820,11 +1829,14 @@ test "Requests take pending queues returns empty slices initially" {
 }
 
 test "Requests take pending ticks clears queue and allows requeue" {
-    const TestMsg = union(enum) { timeout };
+    const TestMsg = union(enum) {
+        timeout,
+        pub const TimerNotice = enum { timeout };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().tick("first", 1, .timeout);
+    try ctx_val.timer().tick("first", 1, .timeout, ignoreTimerOutcome(TestMsg));
     var taken = ctx_val.detachTicks();
     defer taken.deinit();
 
@@ -1833,17 +1845,23 @@ test "Requests take pending ticks clears queue and allows requeue" {
     try std.testing.expectEqual(@as(u8, 0), ctx_val._pending_ticks_len);
 
     ctx_val.discardPendingEffects();
-    try ctx_val.timer().tick("second", 2, .timeout);
+    try ctx_val.timer().tick("second", 2, .timeout, ignoreTimerOutcome(TestMsg));
     try std.testing.expectEqual(@as(u8, 1), ctx_val._pending_ticks_len);
     try std.testing.expectEqualStrings("second", ctx_val._pending_ticks[0].id);
 }
 
 test "Requests taken effect copies are not cleared by runtime cleanup" {
-    const TestMsg = union(enum) { timeout, loaded, failed, finished };
+    const TestMsg = union(enum) {
+        timeout,
+        loaded,
+        failed,
+        finished,
+        pub const TimerNotice = enum { timeout, loaded, failed, finished };
+    };
     var ctx_val: Requests(TestMsg) = .init(std.testing.allocator, std.testing.io);
     defer ctx_val.discardPendingEffects();
 
-    try ctx_val.timer().tick("taken-tick", 1, .timeout);
+    try ctx_val.timer().tick("taken-tick", 1, .timeout, ignoreTimerOutcome(TestMsg));
     _ = try ctx_val.image().loadPath("image.png", &struct {
         fn loaded(_: terminal_image.TerminalImageRequestId, _: terminal_image.TerminalImageHandle) TestMsg {
             return .loaded;
@@ -1979,8 +1997,8 @@ test "Requests timer batches own unconsumed IDs separately from new pending" {
     var requests = Requests(u8).init(std.testing.allocator, std.testing.io);
     defer requests.deinit();
     for ([_][]const u8{ "one", "two" }) |id| {
-        try requests.timer().tick(id, 1, 1);
-        try requests.timer().every(id, 2, 2);
+        try requests.timer().tick(id, 1, {}, ignoreTimerOutcome(u8));
+        try requests.timer().every(id, 2, {}, ignoreTimerOutcome(u8));
     }
     try requests.timer().cancel("absent-one");
     try requests.timer().cancel("absent-two");
@@ -1991,13 +2009,13 @@ test "Requests timer batches own unconsumed IDs separately from new pending" {
     var cancels = requests.detachCancels();
     defer cancels.deinit();
     const tick = ticks.next().?;
-    defer std.testing.allocator.free(tick.id);
+    defer tick.destroy(std.testing.allocator);
     const every = everys.next().?;
-    defer std.testing.allocator.free(every.id);
+    defer every.destroy(std.testing.allocator);
     const cancel = cancels.next().?;
     defer std.testing.allocator.free(cancel);
-    try requests.timer().tick("new-tick", 3, 3);
-    try requests.timer().every("new-every", 4, 4);
+    try requests.timer().tick("new-tick", 3, {}, ignoreTimerOutcome(u8));
+    try requests.timer().every("new-every", 4, {}, ignoreTimerOutcome(u8));
     try requests.timer().cancel("new-cancel");
     requests.discardPendingEffects();
     try std.testing.expectEqualStrings("two", ticks.entries[ticks.cursor].id);

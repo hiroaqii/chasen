@@ -16,11 +16,13 @@ const Stopwatch = struct {
     started_at_ns: Nanoseconds = 0,
     accumulated_ns: Nanoseconds = 0,
     display_ns: Nanoseconds = 0,
+    refresh_unavailable: bool = false,
 
     pub const Msg = union(enum) {
         pub const undelivered_policy = .plain;
 
         tick,
+        refresh_failed,
         toggle,
         reset,
         quit,
@@ -28,7 +30,14 @@ const Stopwatch = struct {
 
     pub fn init(self: *Stopwatch, ctx: *chasen.Ctx(Msg)) !void {
         _ = self;
-        try ctx.timer().every("refresh", refresh_interval_ns, .tick);
+        try ctx.timer().every("refresh", refresh_interval_ns, {}, refreshNotice);
+    }
+
+    fn refreshNotice(_: void, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?Msg {
+        return switch (outcome) {
+            .fired => .tick,
+            .failed => .refresh_failed,
+        };
     }
 
     pub fn handleEvent(self: *const Stopwatch, event: chasen.Event) ?Msg {
@@ -46,6 +55,7 @@ const Stopwatch = struct {
 
     pub fn update(self: *Stopwatch, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
+            .refresh_failed => self.refresh_unavailable = true,
             .tick => if (self.running) {
                 const now = ctx.now().nanoseconds;
                 self.display_ns = self.accumulated_ns + (now - self.started_at_ns);
@@ -83,6 +93,7 @@ const Stopwatch = struct {
 
         const status: []const u8 = if (self.running) "Running" else "Stopped";
         col.borrowText(status, .{ .fg = .gray });
+        if (self.refresh_unavailable) col.borrowText("Automatic refresh unavailable; key presses still update the display.", .{ .fg = .gray });
         col.borrowText("space: start/stop  r: reset  q: quit", .{ .dim = true });
     }
 };

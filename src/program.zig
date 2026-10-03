@@ -203,6 +203,9 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
             .user_msg => |msg| {
                 needs_render = try applyMsg(App, &app, msg, &app_ctx, io, &stats, opts);
             },
+            .timer_notification => |notification| {
+                needs_render = try events_mod.applyTimerNotification(App, &app, notification, &app_ctx, io, &stats, opts);
+            },
             .mouse => |m| {
                 needs_render = try dispatchAppEvent(App, &app, .{ .mouse = m }, &app_ctx, io, &stats, opts);
             },
@@ -565,9 +568,15 @@ test "Program init and effect errors clean pending owners before App deinit" {
             _ = try ctx.task().spawnOwned(self.state, .{ .run = taskRun, .failed = taskFailed, .cleanup = taskCleanup });
             _ = try ctx.terminal().copyToClipboard(.{ .text = "old first", .finished = copied });
             _ = try ctx.terminal().copyToClipboard(.{ .text = "old suffix", .finished = copied });
-            try ctx.timer().tick("pending", std.time.ns_per_s, .copied);
+            try ctx.timer().tick("pending", std.time.ns_per_s, {}, timerNotice);
             _ = try ctx.image().loadPath("pending.png", imageLoaded, imageFailed);
             if (self.fail_init) return error.ExpectedInitFailure;
+        }
+        fn timerNotice(_: void, outcome: runtime.TimerOutcome, _: std.mem.Allocator) ?Msg {
+            return switch (outcome) {
+                .fired => .copied,
+                .failed => null,
+            };
         }
         pub fn update(self: *@This(), _: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
             self.state.updates += 1;

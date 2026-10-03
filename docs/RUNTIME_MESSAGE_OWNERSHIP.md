@@ -236,7 +236,7 @@ owned if the call returns a limit error. Do not run/fail these saturation tasks.
 Runtime consumers detach each request kind into an independent fixed-capacity
 batch. `next()` transfers one entry to its consumer; batch cleanup handles only
 the unconsumed suffix. New pending requests remain separately owned. Timer
-message templates remain copy-safe and are not disposed as undelivered Msgs.
+notices remain non-owning and are discarded without invoking a callback or Msg destructor.
 Batch cleanup does not run tasks or produce result messages, but it does invoke
 owned-task cleanup callbacks. Runtime foreground abandonment separately produces
 and disposes its required result. The Ctx entry/take/cleanup bridge has been
@@ -299,55 +299,105 @@ TaskId. Runtime ownership entry points live on Requests, not the app facade.
 
 ## Runtime-thread callbacks
 
-Task start failures and terminal image load callbacks are produced on the
+Task/timer start failures and terminal image load callbacks are produced on the
 runtime thread. They must not be posted back into the same bounded queue that
 the runtime thread consumes: a full queue would self-deadlock. Chasen stores
 them in the `Effects` owner's preallocated bounded completion buffer and applies
 them at the start of the next effect-drain round. On update error, the delivered
 message stays app-owned and the unapplied suffix is destroyed once. A coalesced
 continuation event schedules another main loop turn after eight synchronous
-rounds; a full queue already guarantees another turn.
+rounds; a full queue already guarantees another turn. Its capacity is derived
+from the largest producer set in one pass: 16 tasks + 8 ticks + 8 repeating
+timers + 8 image loads = 40 messages. Fired timer notices travel through the
+event queue and do not consume this failure buffer.
 
 Terminal image callback messages carry registry handles, not independent image
 allocations. `deinitUndelivered` must not unload such a handle during shutdown;
 the runtime image registry releases all remaining handles after app cleanup.
 
-## Timer restriction
+## Timer Notice ownership
 
-`ctx.timer().tick` and `ctx.timer().every` accept message templates. The runtime
-may copy, replace, repeat, cancel, or drop those templates without invoking
-`deinitUndelivered`. Only pass non-owning/copy-safe variants to timer APIs.
+Timers accept a dedicated non-owning Notice and a mandatory callback, rather
+than a root Msg template. Declare `pub const TimerNotice = ...` inside Msg, or
+omit it to use `void`. Notice must differ from the root Msg type. Values can be
+nested structs, tagged unions, arrays, and optionals; bare pointers/slices are
+rejected recursively. Use an explicit `chasen.Borrowed(Ref)` for a reference:
 
-An app may still use `.deinit` for its root `Msg` when task results own memory;
-the particular variants used as timer templates must be plain values.
+```zig
+pub const TimerNotice = struct {
+    generation: u64,
+    label: chasen.Borrowed([]const u8),
+};
+// Inside init/update, with a callback supplied by the application:
+try ctx.timer().tick("reload", 0, .{
+    .generation = generation,
+    .label = chasen.Borrowed([]const u8).init("reload"),
+}, timerNotice);
+```
 
-For example, `.refresh` in the Msg above is safe to use as a timer template;
-`.loaded` with an owned buffer is not. A notification carrying only a numeric
-generation counter is also copy-safe. Passing an owned buffer to a one-shot
-timer can leak it when the template is replaced or dropped. Repeating timers
-can post multiple copies of the same buffer reference, causing use-after-free
-or double-free if the receiver frees it. Choosing `.deinit` does not change
-this template contract, and choosing `.plain` does not make an owning payload
-safe to copy or discard.
+Borrowed accepts pointer/slice types and provides only `value` and `init`.
+It does not allocate, clone, free, extend a lifetime, synchronize access, or
+provide a snapshot/deep const. Mutable referents and other aliases require
+application synchronization. Use `?Borrowed(*T)` for an optional reference.
+The wrapper's exact type is recognized; copying its marker declarations into
+another type does not bypass validation. Integer handles can still encode
+ownership that the compiler cannot infer; transfer owned work through tasks.
 
-Borrowed references must remain valid for the timer's lifetime and for all
-messages it has already posted. Cancellation does not revoke queued messages.
-Once a timer posts a message, that copy follows the normal
-[ownership states](#ownership-states): the app consumes it in `update`, or the
-runtime applies the root Msg's undelivered policy. With `.deinit`, the hook must
-handle the non-owning timer variant without freeing borrowed resources, as
-the `.refresh` branch above does. It is the retained template and its discarded
-copies that are exempt from the hook, not every message originating from a timer.
+Keep referents alive while pending/running timers, queued notices, **and any
+messages constructed from them** can use them. Cancel acceptance, cancel
+completion, or freeing a timer node does not revoke notices/messages already
+in the queue. IDs control replacement/cancellation; generations and identity
+inside Notice control application acceptance of stale results.
 
-Pending copied IDs belong to Requests until each timer stage detaches its batch.
-`TimerRuntime` then owns the running ID/Future pair. Replacement cancels and joins
-the old Future before freeing its ID. A start failure frees the new ID; a tracking
-allocation failure first cancels the new Future, then frees its ID. Cancel and
-shutdown use the same owner, without applying a Msg destructor to the template.
+The callback signature is
+`fn (Notice, chasen.TimerOutcome, std.mem.Allocator) ?Msg`. Both `.fired` and
+`.failed(TimerStartError)` run on the runtime thread outside init/update.
+Callbacks must finish promptly, avoid blocking I/O/waits and effect/runtime
+reentry, and clean up temporary ownership they do not return. A callback may
+allocate an owned Msg with the supplied allocator; it handles allocation
+failure itself. Returning null is an explicit decision after seeing the
+outcome. A callback and its failure handling cannot be omitted.
 
-See [Pending Request Limits](RUNTIME.md#pending-request-limits) for queue admission
-errors, and [Timers and Frames](RUNTIME.md#timers-and-frames) for the current lack
-of start-failure notifications and retention of completed one-shot handles.
+| Boundary | Ownership/action |
+| --- | --- |
+| Admission error | No callback; existing pending/running timer unchanged |
+| Accepted request | Requests owns one typed node with copied ID and non-owning Notice |
+| Same-kind pending replacement | Reuse the node; copy the new Notice/callback/duration |
+| Running replacement/cancel | Cancel and join before destroying the old node; no failed callback |
+| Tracking/start failure | Runtime invokes callback with registered Notice and failure; destroys node |
+| Fired worker event | Queue owns a Notice/callback value, independent of node and ID |
+| Normal event dispatch | Runtime invokes callback and passes any Msg directly to update |
+| Queue drain on shutdown/unwind | Drop Notice without callback; no owned Msg is constructed |
+| Failure Msg in completion buffer | Runtime owns it until update, or destroys it as undelivered |
+
+Tracking capacity is reserved before the worker starts. A registration cannot
+both fire and report a tracking/start failure. If the defensive completion
+limit check fails, the generated Msg is destroyed before error propagation;
+the node and remaining detached requests are also cleaned up. The callback
+never sends owned Msgs from a worker or back into the runtime's own full queue.
+Once update begins, the app owns the Msg even if update returns an error.
+Root `.deinit` and owned task results are fully compatible with this contract.
+
+Completed one-shot nodes currently remain until replacement, explicit cancel,
+or shutdown; they are always joined before release. See
+[Timers and Frames](RUNTIME.md#timers-and-frames) for admission/start semantics
+and this lifecycle limit.
+
+### Testing real timer delivery
+
+`TestCtx.tickAt/everyAt` expose only borrowed ID, duration, and non-owning Notice.
+For a real consumer test, initialize `chasen.testing.TimerDriver(Msg)` in final
+storage with `try driver.init(&tc)`. It borrows that TestCtx's allocator/Io and
+owns a real TimerRuntime, headless event loop, and failure completion buffer.
+`try driver.drain()` applies cancel/tick/every stages. `try driver.nextMessage()`
+polls completions before queued notifications and returns an optional Msg,
+owned by the test: pass it to update or use `tc.discardMessage(&msg)`.
+
+Deinitialize the driver before TestCtx. It joins workers, drops queued notices
+without callbacks, and destroys unapplied Msgs; it does not free already
+returned Msgs. Keep TestCtx and driver at their initialized addresses, do not
+drive them concurrently, and do not reset the borrowed TestCtx while in use.
+This is a Timer test driver, not a task runner or a full application runtime.
 
 ## Review checklist
 
@@ -359,7 +409,7 @@ When adding a new asynchronously produced message variant:
 3. Keep the normal `update` cleanup path separate; the runtime hook is never
    called after `update` has accepted the message.
 4. Verify stale-result branches also release their payloads.
-5. Do not use an owning variant as a timer template.
+5. Keep Timer Notice non-owning; declare generated owned Msg cleanup separately.
 6. Add a test that constructs the owned variant, calls
    `deinitUndelivered`, and passes under `std.testing.allocator`.
 

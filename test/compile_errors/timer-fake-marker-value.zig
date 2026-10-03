@@ -1,4 +1,4 @@
-const contract = @import("timer_contract");
+const chasen = @import("chasen");
 
 const Msg = enum {
     done,
@@ -8,6 +8,7 @@ const Msg = enum {
     };
 };
 
-comptime {
-    _ = contract.Notice(Msg);
+export fn rejectInvalidNotice() void {
+    var requests = chasen.runtime.Requests(Msg).init(undefined, undefined);
+    requests.timer().tick("reject", 0, undefined, undefined) catch unreachable;
 }

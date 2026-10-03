@@ -93,6 +93,8 @@ pub fn InternalEvent(comptime Msg: type) type {
 
         /// Async task result injected via postEvent.
         user_msg: Msg,
+        /// Copied non-owning notice; the runtime creates a Msg only on dispatch.
+        timer_notification: @import("timer.zig").Notification(Msg),
     };
 }
 
@@ -100,10 +102,11 @@ pub fn RuntimeCompletionBuffer(comptime Msg: type) type {
     return struct {
         const Self = @This();
         // A single drain pass can manufacture at most one completion per
-        // queued task start failure and terminal image load. Preallocating the
-        // sum keeps runtime-thread callbacks allocation-free, which avoids an
+        // queued task/tick/every start failure and terminal image load. Preallocating the
+        // sum keeps completion transport allocation-free, which avoids an
         // error path that would otherwise need another callback transport.
-        pub const capacity = runtime_limits.max_tasks + runtime_limits.max_terminal_image_loads;
+        pub const capacity = runtime_limits.max_tasks + runtime_limits.max_ticks +
+            runtime_limits.max_everys + runtime_limits.max_terminal_image_loads;
 
         items: std.ArrayList(Msg) = .empty,
 
@@ -147,7 +150,7 @@ test "InternalEvent instantiation" {
 }
 
 /// Post a plain/copy-safe internal event without blocking shutdown behind a
-/// full queue. Timer templates are documented as non-owning in the current API.
+/// full queue. Timer events contain non-owning notices, never generated Msgs.
 pub fn postPlainUntilShutdown(
     comptime Msg: type,
     event: InternalEvent(Msg),

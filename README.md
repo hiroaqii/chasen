@@ -199,10 +199,14 @@ heap-owning results; see [Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERS
 
 Queued effects use [bounded pending queues](docs/RUNTIME.md#pending-request-limits).
 Handle admission errors; a successful call accepts a request but does not
-guarantee that its operation will start or complete. Timer messages must be
-non-owning and copy-safe, even when the root `Msg` uses `.deinit` for task
-results. See [Timer restriction](docs/RUNTIME_MESSAGE_OWNERSHIP.md#timer-restriction)
-and the [current timer lifecycle limits](docs/RUNTIME.md#timers-and-frames).
+guarantee that its operation will start or complete. Timers accept a dedicated
+non-owning Notice and mandatory callback: `tick(id, delay, notice, notify)` or
+`every(id, interval, notice, notify)`. The callback receives firing or start
+failure on the runtime thread and may create an owned Msg. Plain values are the
+default; references require explicit `Borrowed(Ref)`. Simple notifications use
+void without declaring a Notice type. Root `.deinit` remains compatible.
+See [Timer Notice ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership)
+and [timer timing and lifecycle](docs/RUNTIME.md#timers-and-frames).
 
 For text created during `view`, use `printAt` or `copyTextAt`. Borrowed text must
 remain valid until rendering finishes; do not borrow local stack buffers.

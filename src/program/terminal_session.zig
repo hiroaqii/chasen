@@ -363,6 +363,8 @@ pub fn drainInternalEventsForShutdown(
                 var msg = value;
                 runtime.deinitUndeliveredMessage(Msg, &msg, allocator);
             },
+            // No callback during shutdown: queued Timer Notice owns no Msg.
+            .timer_notification => {},
             else => {},
         }
     }
