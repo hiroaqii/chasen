@@ -90,6 +90,22 @@ pub fn build(b: *std.Build) void {
 
 ## Minimal App
 
+Messages drive state updates; `view` draws that state to a `Surface`.
+
+```mermaid
+flowchart LR
+    Input["Input / frame events"] -->|"handleEvent → Msg"| Update["update"]
+    Update -->|"mutates"| State["App state"]
+    State -->|"read by"| View["view → Surface"]
+    View --> Screen["Terminal"]
+    Update -->|"Ctx requests"| Effects["Runtime effects"]
+    Effects -->|"result Msg"| Update
+```
+
+This is a conceptual overview. See
+[Runtime and Effects](docs/RUNTIME.md#application-lifecycle) for effect processing
+order and redraw timing.
+
 Save this as `src/main.zig`, then run `zig build` and `./zig-out/bin/my-tui`:
 
 ```zig

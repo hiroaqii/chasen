@@ -11,16 +11,18 @@ Before the first render, Chasen also delivers the initial terminal size when it
 is available, so apps that care about layout can initialize size-dependent state
 through the normal event/update path.
 
-In the diagram below, nodes starting with `app.` are implemented by the
-application author. The other nodes are handled by the Chasen runtime.
+The diagram below shows a normal event-loop turn. Nodes starting with `app.`
+are implemented by the application author. The other nodes are handled by the
+Chasen runtime.
 
 ```mermaid
 flowchart TD
     Event["Runtime event<br/>key / mouse / paste / resize / focus / frame"]
-    RuntimeMsg["App message<br/>timer result / task result"]
+    RuntimeMsg["Queued app message<br/>timer result / task result"]
+    Continue["Internal effect-drain continuation"]
     Handle["app.handleEvent?(Event) ?Msg"]
     Update["app.update(Msg, *Ctx)"]
-    Effects["Runtime drains pending Requests effects"]
+    Effects["Runtime drains pending Requests<br/>and completion messages"]
     NeedRender{"Redraw needed?<br/>Resize always redraws"}
     View["app.view(*Surface)"]
     Render["Terminal render"]
@@ -28,12 +30,12 @@ flowchart TD
 
     Event --> Handle
     Handle -->|"Msg"| Update
-    Handle -->|"null"| Resize{"Resize event?"}
-    Resize -->|"yes"| View
-    Resize -->|"no"| Skip
+    Handle -->|"null"| Effects
     RuntimeMsg --> Update
+    Continue --> Effects
     Update --> Effects
-    Effects --> NeedRender
+    Effects -->|"completion Msg"| Update
+    Effects -->|"drain complete or round limit reached"| NeedRender
     NeedRender -->|"yes"| View
     View --> Render
     NeedRender -->|"no"| Skip
@@ -43,17 +45,30 @@ flowchart TD
     classDef decision fill:#fff7ed,stroke:#f97316,color:#431407;
 
     class Handle,Update,View app;
-    class Event,RuntimeMsg,Effects,Render,Skip runtime;
-    class NeedRender,Resize decision;
+    class Event,RuntimeMsg,Continue,Effects,Render,Skip runtime;
+    class NeedRender decision;
 ```
 
 Timer and task results skip `handleEvent` because they are already app messages.
 Requested frame events go through `handleEvent`, so an animation app maps
 `Event.frame` into its own `Msg` before `update` advances state.
 
-If `handleEvent` returns `null`, Chasen does not call `update` and does not
-redraw for that event. Resize is the exception: terminal resize always redraws
-so the screen buffer matches the new terminal size.
+If `handleEvent` returns `null` or is omitted, that event produces no app message.
+The runtime still drains pending effects before deciding whether to redraw.
+Effect completion messages, such as foreground-command or clipboard results,
+go directly to `update` during the drain. Those updates can queue more effects
+and request a redraw even when the original event produced no message.
+
+The return edge from `update` resumes effect processing. Follow-up work is
+processed in bounded rounds; remaining work continues in a later event-loop
+turn. An internal continuation event enters the drain without calling
+`handleEvent`.
+
+Redraw is needed if any update in the turn requests it or a terminal resize
+occurs. Resize forces a redraw even when `handleEvent` returns `null` or an
+update calls `ctx.redraw().skip()`. It still passes through effect drain before
+`view` and terminal rendering, so the screen buffer matches the new terminal
+size.
 
 Internally, `Events` owns bracketed-paste accumulation and the shared synchronous
 `handleEvent`/`update` path. Each message resets redraw suppression before update;
