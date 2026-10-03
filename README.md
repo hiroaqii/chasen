@@ -205,6 +205,8 @@ non-owning Notice and mandatory callback: `tick(id, delay, notice, notify)` or
 failure on the runtime thread and may create an owned Msg. Plain values are the
 default; references require explicit `Borrowed(Ref)`. Simple notifications use
 void without declaring a Notice type. Root `.deinit` remains compatible.
+Completed one-shots are joined and reclaimed during runtime effect drains;
+an internal wake makes this progress while the application is idle.
 See [Timer Notice ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership)
 and [timer timing and lifecycle](docs/RUNTIME.md#timers-and-frames).
 

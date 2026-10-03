@@ -10,6 +10,8 @@ pub fn TimerEntry(comptime Msg: type) type {
         duration_ns: u64,
         notification: timer.Notification(Msg),
         future: std.Io.Future(void) = undefined,
+        // Release/acquire only publishes helper completion. Future.await/cancel
+        // must also finish before this node or its copied ID can be freed.
         completed: std.atomic.Value(bool) = .init(false),
 
         pub fn create(allocator: std.mem.Allocator, id: []const u8, duration_ns: u64, notice: timer.Notice(Msg), notify: timer.Notify(Msg)) !*Self {

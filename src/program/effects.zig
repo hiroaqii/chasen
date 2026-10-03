@@ -127,6 +127,7 @@ pub fn Effects(comptime Msg: type) type {
             stats: *?runtime.RuntimeStats,
             opts: types.RunOptions,
         ) !EffectDrainResult {
+            timers.reapCompleted();
             var result: EffectDrainResult = .{};
 
             for (0..max_effect_drain_rounds) |round| {
@@ -155,6 +156,72 @@ pub fn Effects(comptime Msg: type) type {
             return result;
         }
     };
+}
+
+test "timer completed wake reaches the real effect-drain reaper without app input" {
+    const App = struct {
+        pub const Msg = enum {
+            fired,
+            failed,
+            pub const undelivered_policy = .plain;
+        };
+        updates: usize = 0,
+        fn notify(_: void, outcome: runtime.TimerOutcome, _: std.mem.Allocator) ?Msg {
+            return switch (outcome) {
+                .fired => .fired,
+                .failed => .failed,
+            };
+        }
+        pub fn update(self: *@This(), msg: Msg, _: *ctx_mod.Ctx(Msg)) !void {
+            try std.testing.expectEqual(Msg.fired, msg);
+            self.updates += 1;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var requests = requests_mod.Requests(App.Msg).init(allocator, io);
+    defer requests.deinit();
+    var ctx = ctx_mod.Ctx(App.Msg).init(&requests);
+    var tasks = TaskRuntime(App.Msg).init(allocator, io);
+    defer tasks.join(&requests);
+    var timers = TimerRuntime(App.Msg).init(allocator, io);
+    defer timers.shutdown();
+    var effects = try Effects(App.Msg).init(allocator);
+    defer effects.deinit(allocator);
+    var app: App = .{};
+    var env: std.process.Environ.Map = .init(allocator);
+    defer env.deinit();
+    var terminal: TerminalSession(App.Msg) = undefined;
+    try terminal.init(allocator, io, .{ .env_map = &env });
+    defer terminal.deinit();
+    var terminal_effects: TerminalEffects = .{};
+    defer terminal_effects.deinit(&terminal);
+    var shutdown: std.atomic.Value(bool) = .init(false);
+    var frames = FrameRuntime(App.Msg).init(io);
+    defer frames.shutdown();
+    var stats: ?runtime.RuntimeStats = null;
+    const opts: types.RunOptions = .{ .runtime = .{ .allocator = allocator, .io = io }, .terminal = .{ .env_map = &env } };
+    try ctx.timer().tick("idle", 0, {}, App.notify);
+    _ = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutdown, &frames, &stats, opts);
+    for (0..5000) |_| {
+        if (try terminal.loop.tryEvent()) |event| {
+            switch (event) {
+                .timer_notification => |notification| {
+                    _ = try @import("events.zig").applyTimerNotification(App, &app, notification, &ctx, io, &stats, opts);
+                },
+                .timers_completed => break,
+                else => return error.UnexpectedTimerEvent,
+            }
+        } else try io.sleep(.fromMilliseconds(1), .awake);
+    } else return error.TimerWakeTimedOut;
+    try std.testing.expectEqual(@as(usize, 1), app.updates);
+    try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
+    // This is the same drain used by Program's timers_completed event branch.
+    _ = try effects.drain(App, &app, &ctx, &tasks, &timers, &terminal_effects, &terminal, &shutdown, &frames, &stats, opts);
+    try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.updates);
 }
 
 test "runtime completion holds task16 tick8 every8 image8 failures with full queue and follow-up" {

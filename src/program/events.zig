@@ -258,7 +258,7 @@ pub fn eventKind(event: anytype) runtime.RuntimeEventKind {
     return switch (event) {
         .key_press => .key_press,
         .winsize => .winsize,
-        .user_msg, .timer_notification => .user_msg,
+        .user_msg, .timer_notification, .timers_completed => .user_msg,
         .mouse => .mouse,
         .focus_in => .focus_in,
         .focus_out => .focus_out,

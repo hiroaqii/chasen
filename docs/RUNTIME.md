@@ -339,10 +339,22 @@ box or fixed inline-size limit is used. A large common Notice increases every
 node/notification's size, and callback-created owned Msgs can allocate. This
 contract does not promise lower total allocation bytes or RSS.
 
-Completed one-shot nodes currently retain their copied ID and Future until
-replacement, explicit cancellation, or shutdown. Long-lived apps should reuse
-a bounded set of IDs or explicitly cancel completed timers, handling admission
-errors. The pending queue limit does not bound these retained nodes.
+Completed one-shot nodes are joined and reclaimed at the next effect-drain
+entrance. The worker publishes completion after its work, then tries one
+payload-free wake without waiting for queue capacity. If the queue is full,
+an existing event supplies that next turn. Completion after the fired notice
+was consumed still produces a wake, so idle reclamation needs no extra user
+input, same-ID registration, or shutdown.
+
+The completion flag is not proof that the backend has returned: runtime awaits
+the Future before freeing its node and copied ID. Reaping skips active timers,
+including long sleeps and notice-post retries. It may wait for a completed
+worker's final finite wake/backend return; it holds no event-queue lock.
+Foreground commands or long application callbacks can delay effect drains;
+there is no wall-clock reclamation deadline. With fair backend scheduling and
+finite app work, the next effect-drain opportunity makes progress. Registry
+capacity may retain its concurrency high-water mark, while completed node/ID/
+Future storage does not grow with the total number of sequential timer IDs.
 
 `ctx.frame().request` requests one future frame event paced from the last
 delivered frame, and is coalesced while a frame is already in flight. Animation

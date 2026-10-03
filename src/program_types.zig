@@ -90,6 +90,9 @@ pub fn InternalEvent(comptime Msg: type) type {
         /// Wakes the main loop when a bounded synchronous effect drain leaves
         /// work for another pass. It carries no app-owned payload.
         continue_effect_drain,
+        /// Payload-free wake after a timer publishes completion. A full queue
+        /// needs no extra wake; every effect-drain entrance reaps completed nodes.
+        timers_completed,
 
         /// Async task result injected via postEvent.
         user_msg: Msg,

@@ -349,9 +349,10 @@ pub fn TimerDriver(comptime Msg: type) type {
             try self.completions.init(tc.ctx.allocator());
         }
 
-        /// Apply the real cancel -> tick -> every stages. Completion messages
+        /// Reap completed timers, then apply real cancel -> tick -> every stages. Completion messages
         /// are returned by nextMessage, rather than recursively invoking update.
         pub fn drain(self: *Self) !void {
+            self.timers.reapCompleted();
             self.timers.cancelPending(&self.tc.requests);
             try self.timers.startTicks(&self.tc.requests, &self.completions, &self.loop, &self.shutting_down);
             try self.timers.startEvery(&self.tc.requests, &self.completions, &self.loop, &self.suspended, &self.shutting_down);
@@ -361,6 +362,7 @@ pub fn TimerDriver(comptime Msg: type) type {
             if (self.completions.items.items.len > 0)
                 return self.completions.items.orderedRemove(0);
             while (try self.loop.tryEvent()) |event| switch (event) {
+                .timers_completed => self.timers.reapCompleted(),
                 .timer_notification => |notification| {
                     if (notification.message(.fired, self.tc.ctx.allocator())) |msg| return msg;
                 },

@@ -167,6 +167,7 @@ test "timer public driver creates owned messages on runtime thread and drops que
         // that exact value for the production driver/shutdown consumer.
         for (0..2000) |_| {
             if (try driver.loop.tryEvent()) |event| {
+                if (event == .timers_completed) continue;
                 try std.testing.expect(event == .timer_notification);
                 try std.testing.expectEqual(generation, evidence.calls);
                 try std.testing.expect(try driver.loop.tryPostEvent(event));
@@ -218,4 +219,61 @@ test "timer failure callback can explicitly return null while quit skips new sta
     try driver.drain();
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount() + tc.pendingEveryCount());
+}
+
+test "timer public driver reaps 256 unique completed IDs with bounded live storage" {
+    const Msg = struct {
+        generation: usize,
+        pub const TimerNotice = usize;
+        pub const undelivered_policy = .plain;
+        fn notify(generation: usize, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?@This() {
+            std.debug.assert(outcome == .fired);
+            return .{ .generation = generation };
+        }
+    };
+    // Backend thread-pool storage has a separate allocator and is not counted
+    // as Timer node/ID/registry/completion storage.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var tc: chasen.testing.TestCtx(Msg) = undefined;
+    tc.init(counter.allocator(), io);
+    defer tc.deinit();
+    var driver: chasen.testing.TimerDriver(Msg) = undefined;
+    try driver.init(&tc);
+    var live = true;
+    defer if (live) driver.deinit();
+    var steady_bytes: usize = 0;
+    var steady_capacity: usize = 0;
+    for (0..256) |generation| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "unique-{d}", .{generation});
+        try tc.ctx.timer().tick(id, 0, generation, Msg.notify);
+        try driver.drain();
+        var received = false;
+        for (0..5000) |_| {
+            if (try driver.nextMessage()) |msg| {
+                try std.testing.expect(!received);
+                try std.testing.expectEqual(generation, msg.generation);
+                received = true;
+            }
+            if (received and driver.timers.running.items.len == 0) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        } else return error.TimerReapTimedOut;
+        try std.testing.expectEqual(@as(usize, 0), tc.pendingTickCount());
+        try std.testing.expectEqual(@as(usize, 0), driver.timers.running.items.len);
+        const bytes = counter.allocated_bytes - counter.freed_bytes;
+        if (generation == 0) {
+            steady_bytes = bytes;
+            steady_capacity = driver.timers.running.capacity;
+        }
+        try std.testing.expectEqual(steady_bytes, bytes);
+        try std.testing.expectEqual(steady_capacity, driver.timers.running.capacity);
+        // Only registry capacity and the failure completion buffer remain.
+        try std.testing.expectEqual(@as(usize, 2), counter.allocations - counter.deallocations);
+    }
+    driver.deinit();
+    live = false;
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
 }

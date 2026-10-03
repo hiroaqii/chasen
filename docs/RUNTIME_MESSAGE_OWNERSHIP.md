@@ -378,10 +378,14 @@ never sends owned Msgs from a worker or back into the runtime's own full queue.
 Once update begins, the app owns the Msg even if update returns an error.
 Root `.deinit` and owned task results are fully compatible with this contract.
 
-Completed one-shot nodes currently remain until replacement, explicit cancel,
-or shutdown; they are always joined before release. See
-[Timers and Frames](RUNTIME.md#timers-and-frames) for admission/start semantics
-and this lifecycle limit.
+Completed one-shot nodes are joined and freed at the next effect-drain entrance.
+The terminal worker publishes completion before one nonblocking wake attempt;
+a full queue already supplies another turn. Runtime distinguishes the helper
+flag from backend completion and awaits the Future before freeing the node/ID.
+Active timers are skipped. Queued notices and their borrowed referents remain
+independent of node reclamation. See
+[Timers and Frames](RUNTIME.md#timers-and-frames) for idle progress and delay
+conditions, including foreground commands and long application callbacks.
 
 ### Testing real timer delivery
 
@@ -389,7 +393,8 @@ and this lifecycle limit.
 For a real consumer test, initialize `chasen.testing.TimerDriver(Msg)` in final
 storage with `try driver.init(&tc)`. It borrows that TestCtx's allocator/Io and
 owns a real TimerRuntime, headless event loop, and failure completion buffer.
-`try driver.drain()` applies cancel/tick/every stages. `try driver.nextMessage()`
+`try driver.drain()` reaps completed timers and applies cancel/tick/every stages.
+`try driver.nextMessage()` consumes completion wakes through the same reaper and
 polls completions before queued notifications and returns an optional Msg,
 owned by the test: pass it to update or use `tc.discardMessage(&msg)`.
 

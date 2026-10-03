@@ -236,7 +236,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
                 effects.receiveContinuation();
                 if (stats) |*s| s.event_kind = .user_msg;
             },
-            .resize_pending => {},
+            .resize_pending, .timers_completed => {},
         }
 
         // Polled updates are coalesced outside the bounded event queue. A

@@ -1,12 +1,29 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const requests_mod = @import("../requests.zig");
 const runtime = @import("../runtime.zig");
 const types = @import("../program_types.zig");
 const InternalEvent = types.InternalEvent;
 
-/// Owns stable nodes after starting their workers. Completed one-shots remain
-/// tracked until cancel/replacement/shutdown.
+// Private test barriers surround the real worker's terminal publication. They
+// are absent from production storage and do not substitute a fake worker/Io.
+const TestBarrier = struct {
+    reached: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    fn pause(self: *TestBarrier, io: std.Io) void {
+        self.reached.set(io);
+        self.release.waitUncancelable(io);
+    }
+};
+const TestHooks = struct {
+    before_completed: ?*TestBarrier = null,
+    after_completed: ?*TestBarrier = null,
+    after_wake: ?*std.Io.Event = null,
+};
+const WorkerHooks = if (builtin.is_test) ?*TestHooks else void;
+
+/// Owns stable nodes until their workers are canceled/joined or reaped.
 pub fn TimerRuntime(comptime Msg: type) type {
     return struct {
         const Self = @This();
@@ -14,6 +31,7 @@ pub fn TimerRuntime(comptime Msg: type) type {
         allocator: std.mem.Allocator,
         io: std.Io,
         running: std.ArrayList(*Entry) = .empty,
+        test_hooks: WorkerHooks = if (builtin.is_test) null else {},
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
             return .{ .allocator = allocator, .io = io };
@@ -45,7 +63,7 @@ pub fn TimerRuntime(comptime Msg: type) type {
             self.running.ensureUnusedCapacity(self.allocator, 1) catch {
                 return self.startFailed(entry, error.OutOfMemory, completions);
             };
-            const future = self.io.concurrent(run, .{ entry, repeating, self.io, loop, suspended, shutting_down }) catch {
+            const future = self.io.concurrent(run, .{ entry, repeating, self.io, loop, suspended, shutting_down, self.test_hooks }) catch {
                 return self.startFailed(entry, error.ConcurrencyUnavailable, completions);
             };
             entry.future = future;
@@ -63,13 +81,45 @@ pub fn TimerRuntime(comptime Msg: type) type {
             }
         }
 
-        fn run(entry: *const Entry, repeating: bool, io: std.Io, loop: *vaxis.Loop(InternalEvent(Msg)), suspended: ?*const std.atomic.Value(bool), shutting_down: *const std.atomic.Value(bool)) void {
+        fn run(entry: *Entry, repeating: bool, io: std.Io, loop: *vaxis.Loop(InternalEvent(Msg)), suspended: ?*const std.atomic.Value(bool), shutting_down: *const std.atomic.Value(bool), hooks: WorkerHooks) void {
+            defer {
+                if (builtin.is_test) if (hooks) |h| {
+                    if (h.before_completed) |barrier| barrier.pause(io);
+                };
+                entry.completed.store(true, .release);
+                if (builtin.is_test) if (hooks) |h| {
+                    if (h.after_completed) |barrier| barrier.pause(io);
+                };
+                // Never wait for queue capacity after publishing completion.
+                // A full queue already guarantees another effect-drain turn.
+                _ = loop.tryPostEvent(.timers_completed) catch false;
+                if (builtin.is_test) if (hooks) |h| {
+                    if (h.after_wake) |event| event.set(io);
+                };
+            }
             // u64 -> i96 is a widening conversion; even maxInt(u64) is valid.
             while (!shutting_down.load(.seq_cst)) {
                 io.sleep(.fromNanoseconds(entry.duration_ns), .awake) catch return;
                 if (repeating and suspended.?.load(.seq_cst)) continue;
                 types.postPlainUntilShutdown(Msg, .{ .timer_notification = entry.notification }, io, loop, shutting_down);
                 if (!repeating) return;
+            }
+        }
+
+        /// Called without the event-queue lock. A published completion means
+        /// no sleep/post retry remains, but the backend may still own the node.
+        /// Join before freeing, and never wait for an active timer here.
+        pub fn reapCompleted(self: *Self) void {
+            var i: usize = 0;
+            while (i < self.running.items.len) {
+                const entry = self.running.items[i];
+                if (!entry.completed.load(.acquire)) {
+                    i += 1;
+                    continue;
+                }
+                entry.future.await(self.io);
+                entry.destroy(self.allocator);
+                _ = self.running.swapRemove(i);
             }
         }
 
@@ -121,6 +171,7 @@ const TestMsg = union(enum) {
 fn expectReplacement(loop: *vaxis.Loop(InternalEvent(TestMsg)), io: std.Io) !void {
     for (0..2000) |_| {
         if (try loop.tryEvent()) |event| {
+            if (event == .timers_completed) continue;
             const msg = event.timer_notification.message(.fired, std.testing.allocator).?;
             try std.testing.expectEqual(TestMsg.TimerNotice.replacement, msg.fired);
             return;
@@ -170,7 +221,7 @@ test "timer runtime replaces the running ID before admitting a same-ID tick or e
                 try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
                 try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
                 try expectReplacement(&loop, io);
-                // Completed one-shots are still tracked until explicit cancellation.
+                // No runtime reap has run yet; explicit cancellation can join it.
                 try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
                 try requests.timer().cancel("same");
                 timers.cancelPending(&requests);
@@ -285,7 +336,7 @@ test "timer runtime shutdown cancels notice producers behind a full queue" {
         shutting_down.store(true, .seq_cst);
         timers.shutdown();
         try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
-        while (try loop.tryEvent()) |event| try std.testing.expect(event == .continue_effect_drain);
+        while (try loop.tryEvent()) |event| try std.testing.expect(event == .continue_effect_drain or event == .timers_completed);
     }
 }
 
@@ -330,4 +381,120 @@ test "timer completion overflow destroys generated Msg and unconsumed node suffi
     try std.testing.expectEqual(@as(usize, 1), evidence.drops);
     try std.testing.expectEqual(@as(u8, 0), requests._pending_ticks_len);
     try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
+}
+
+fn waitForTestEvent(event: *std.Io.Event, io: std.Io) !void {
+    for (0..5000) |_| {
+        if (event.isSet()) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.TimerBarrierTimedOut;
+}
+
+test "timer late completion wakes idle runtime or falls back to an already full queue" {
+    for ([_]bool{ false, true }) |full| {
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(2) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+        defer requests.deinit();
+        var timers = TimerRuntime(TestMsg).init(allocator, io);
+        defer timers.shutdown();
+        var completions: types.RuntimeCompletionBuffer(TestMsg) = .{};
+        try completions.init(allocator);
+        defer completions.deinitUndelivered(allocator);
+        var loop = vaxis.Loop(InternalEvent(TestMsg)).init(io, undefined, undefined);
+        var shutdown: std.atomic.Value(bool) = .init(false);
+        try requests.timer().tick("sleeping", std.math.maxInt(u64), .old, TestMsg.notify);
+        try timers.startTicks(&requests, &completions, &loop, &shutdown);
+        const sleeping = timers.running.items[0];
+
+        var barrier: TestBarrier = .{};
+        defer barrier.release.set(io);
+        var terminal: std.Io.Event = .unset;
+        var hooks: TestHooks = .{ .before_completed = &barrier, .after_wake = &terminal };
+        timers.test_hooks = &hooks;
+        try requests.timer().tick("late", 0, .replacement, TestMsg.notify);
+        try timers.startTicks(&requests, &completions, &loop, &shutdown);
+        try waitForTestEvent(&barrier.reached, io);
+        const notification = (try loop.tryEvent()).?.timer_notification;
+        try std.testing.expectEqual(TestMsg.TimerNotice.replacement, notification.message(.fired, allocator).?.fired);
+        try std.testing.expect((try loop.tryEvent()) == null);
+        // The only app Msg is already consumed, but helper completion is later.
+        timers.reapCompleted();
+        try std.testing.expectEqual(@as(usize, 2), timers.running.items.len);
+        if (full) while (try loop.tryPostEvent(.continue_effect_drain)) {};
+        barrier.release.set(io);
+        try waitForTestEvent(&terminal, io);
+        const wake = (try loop.tryEvent()).?;
+        const expected_wake: std.meta.Tag(InternalEvent(TestMsg)) = if (full) .continue_effect_drain else .timers_completed;
+        try std.testing.expect(wake == expected_wake);
+        timers.reapCompleted();
+        try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
+        try std.testing.expectEqual(sleeping, timers.running.items[0]);
+        try std.testing.expect(!sleeping.completed.load(.acquire));
+        // No extra input, replacement or explicit cancel was needed to reap.
+        // A rejected wake did not wait for capacity; all existing events remain.
+        while (try loop.tryEvent()) |event| try std.testing.expect(full and event == .continue_effect_drain);
+    }
+}
+
+test "timer completion publication does not free a node before the real backend join" {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = counter.allocator();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+    defer requests.deinit();
+    var timers = TimerRuntime(TestMsg).init(allocator, io);
+    defer timers.shutdown();
+    var completions: types.RuntimeCompletionBuffer(TestMsg) = .{};
+    try completions.init(allocator);
+    defer completions.deinitUndelivered(allocator);
+    var loop = vaxis.Loop(InternalEvent(TestMsg)).init(io, undefined, undefined);
+    var shutdown: std.atomic.Value(bool) = .init(false);
+    var barrier: TestBarrier = .{};
+    defer barrier.release.set(io);
+    var hooks: TestHooks = .{ .after_completed = &barrier };
+    timers.test_hooks = &hooks;
+    try requests.timer().tick("join-before-free", 0, .replacement, TestMsg.notify);
+    try timers.startTicks(&requests, &completions, &loop, &shutdown);
+    try waitForTestEvent(&barrier.reached, io);
+    const entry = timers.running.items[0];
+    try std.testing.expect(entry.completed.load(.acquire));
+    try std.testing.expect(entry.future.any_future != null);
+    const node_bytes = @sizeOf(@import("../timer_entry.zig").TimerEntry(TestMsg)) + entry.id.len;
+    const freed_before = counter.freed_bytes;
+    const JoinProbe = struct {
+        io: std.Io,
+        barrier: *TestBarrier,
+        counter: *std.testing.FailingAllocator,
+        freed_before: usize,
+        called: bool = false,
+        live_at_join: bool = false,
+        fn await(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result: []u8, alignment: std.mem.Alignment) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.called = true;
+            self.live_at_join = self.counter.freed_bytes == self.freed_before;
+            // Only the actual Future.await entry releases the real paused worker.
+            // Delegate to the original backend before allowing reap to free.
+            self.barrier.release.set(self.io);
+            self.io.vtable.await(self.io.userdata, future, result, alignment);
+        }
+    };
+    var probe: JoinProbe = .{ .io = io, .barrier = &barrier, .counter = &counter, .freed_before = freed_before };
+    var vtable = io.vtable.*;
+    vtable.await = JoinProbe.await;
+    timers.io = .{ .userdata = &probe, .vtable = &vtable };
+    timers.reapCompleted();
+    timers.io = io;
+    try std.testing.expect(probe.called and probe.live_at_join);
+    try std.testing.expectEqual(freed_before + node_bytes, counter.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
+    // Queue payload remains usable after both node and copied ID were freed.
+    const notification = (try loop.tryEvent()).?.timer_notification;
+    try std.testing.expectEqual(TestMsg.TimerNotice.replacement, notification.message(.fired, allocator).?.fired);
+    try std.testing.expect((try loop.tryEvent()).? == .timers_completed);
 }
