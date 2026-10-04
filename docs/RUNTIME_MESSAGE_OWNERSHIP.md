@@ -156,6 +156,34 @@ application generations/identity checks. Cancellation during full-queue result
 transfer returns the owned Msg for runtime destruction. Non-cooperative tasks
 can still delay shutdown.
 
+### Borrowed data and stale results
+
+Task contexts may contain borrowed pointers or slices. `spawnOwned` transfers
+cleanup responsibility for the context; it does not copy or extend the lifetime
+of objects referenced by its fields. Keep each referent alive for every use by
+the worker and cleanup callback, and by any result that continues borrowing it.
+The app must also prevent data races when worker and runtime access shared
+mutable state.
+
+Screen lifetime and result freshness are separate concerns:
+
+| Concern | Application responsibility |
+| --- | --- |
+| A worker reads its input after a screen closes | Copy the input into task-owned storage, or retain its owner until every borrower has finished. |
+| A completed result belongs to an old screen/search | Include a generation or request identity and reject stale results in `update`, releasing their owned payloads. |
+| A screen closes while work is running | A cancel request is not a join. Do not free borrowed screen memory merely because cancellation was requested. |
+
+For screen-scoped work, prefer a task-owned input snapshot and a result carrying
+the screen/search generation. This lets the screen close without invalidating
+worker input. The [task cancellation example](../examples/task_cancellation/main.zig)
+uses owned query data and rejects late results after replacement or close.
+Generation checks protect which result is applied; they cannot repair a dangling
+pointer used earlier by the worker. See the [shutdown sequence](#shutdown-sequence)
+for the runtime barrier before final `App.deinit`; closing a screen during normal
+operation does not invoke that barrier.
+
+### Task runtime ownership
+
 The internal `TaskRuntime(Msg)` owns the stable nodes and supervisor Futures.
 Requests owns only pending entries and the borrowed cancellation connection;
 it does not store the live-task registry. Program requests shutdown before any

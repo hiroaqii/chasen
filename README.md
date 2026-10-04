@@ -1,6 +1,6 @@
 # Chasen (茶筅)
 
-Chasen is a small-core TUI runtime for Zig.
+Chasen is a small-core Zig TUI runtime with Elm-inspired flow and explicit effects.
 
 It provides a typed application loop, explicit runtime effects, and immediate
 cell-based drawing through `Surface`. It does not try to be a batteries-included
@@ -10,10 +10,10 @@ widget framework.
 
 Chasen focuses on the runtime substrate needed to build terminal applications:
 
-- Elm-style application flow with `Msg`, `update`, and `view`
+- Elm-inspired application flow with `Msg`, `update`, and `view`
 - typed app messages instead of stringly event routing
 - event-driven terminal runtime backed by libvaxis
-- explicit side effects through `Ctx`
+- explicit runtime effect requests through `Ctx`
 - timers, requested frame events, and background tasks with cooperative cancellation
 - foreground commands with terminal handoff on Linux and macOS
 - best-effort OSC 52 clipboard writes
@@ -45,6 +45,12 @@ Those pieces can be built on top of Chasen when an application needs them.
 stores visual state without creating or managing a component tree. Frame events
 provide timing for app-driven animation; interpolation and transitions remain
 outside the core. Image decoding is supplied by an external loader.
+
+Components can keep visual state directly in app-owned structs; they do not
+need `ComponentStateStore`. When using a store, choose its lifetime explicitly:
+removing entries runs their cleanup but retains arena memory until store
+deinitialization. See [state ownership patterns](docs/AUTHORING_COMPONENTS.md#componentstatestore)
+for direct fields and screen-scoped stores.
 
 For example, [`chasen-ui`](https://github.com/hiroaqii/chasen-ui),
 [`chasen-anim`](https://github.com/hiroaqii/chasen-anim), and
@@ -291,5 +297,5 @@ such as [`gitframe`](https://github.com/hiroaqii/gitframe) and
 
 ## Acknowledgements
 
-- [Charm](https://charm.land/) inspired the Elm-style application flow.
+- [Charm](https://charm.land/) influenced Chasen's Elm-inspired application flow.
 - [libvaxis](https://github.com/rockorager/libvaxis) provides the terminal foundation.

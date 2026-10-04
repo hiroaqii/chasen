@@ -67,7 +67,8 @@ should not return a `Msg`. If user input changes state, map it to `Msg` from
 Reusable component packages should expose small, explicit APIs. A typical
 component package can define:
 
-- `State`: visual retained state owned by `ComponentStateStore`
+- `State`: visual state owned directly by the app/component, or optionally by
+  an app-managed `ComponentStateStore`
 - `Options`: app-owned semantic inputs and callbacks expressed as values
 - `Action`: component-level event result, if useful
 - `handleEvent`: pure event-to-action helper
@@ -127,10 +128,14 @@ message types fully under application control.
 
 ## ComponentStateStore
 
-Use `chasen.ComponentStateStore` for visual state that belongs to a reusable
-component but is not part of the application's semantic model. Examples include
-scroll offset, viewport cache, animation phase, selection anchor, or cursor
-viewport position.
+`chasen.ComponentStateStore` is optional. A component can keep visual state in
+its own struct, or accept a state pointer owned by the app. No store, string id,
+or framework-managed component tree is required for those patterns.
+
+Use a store when looking up visual state by stable id helps the application.
+Examples include scroll offset, viewport cache, animation phase, selection
+anchor, or cursor viewport position. The app owns the store and decides when
+entries and the store itself stop being used.
 
 Do not use `ComponentStateStore` for data that should be saved, restored,
 deep-linked, or sent to business logic. Text input values, selected board game
@@ -140,6 +145,17 @@ ids, filters, and loaded records should live in the app model.
 `clearNamespace(prefix)` call stored `deinit` hooks and remove map entries, but
 they do not reclaim arena memory. Memory is reclaimed when the whole store is
 deinitialized. Avoid using it as a high-churn cache.
+
+Choose storage based on the required lifetime:
+
+| Use case | Ownership pattern |
+| --- | --- |
+| A fixed set of components | Keep their state in app/component fields; call each owned resource's `deinit` when its owner ends. |
+| Visual state belonging to one screen | Let that screen own a store and deinitialize the whole store when the screen is discarded. |
+| A long-lived set of stable ids | Reuse existing entries; do not repeatedly remove and recreate them to reclaim memory. |
+| Frequent insertion/removal or large, independently released buffers | Use app-owned storage with explicit reclamation; keep only visual metadata or handles in the store. |
+
+For example, state looked up within a store can remain small:
 
 ```zig
 const ListVisualState = struct {
@@ -167,12 +183,61 @@ State ids should include a package/component/path prefix:
 "bgg/detail/comments"
 ```
 
-Call `remove(id)` when a dynamic item disappears. Call
-`clearNamespace(prefix)` when leaving a screen:
+Within a store that will remain alive, call `remove(id)` when a dynamic item
+disappears or `clearNamespace(prefix)` to discard a group of entries:
 
 ```zig
 store.clearNamespace("bgg/search/");
 ```
+
+These operations invalidate the removed states even though their arena memory
+remains allocated. Recreating the same ids allocates new storage. For repeated
+screen creation and destruction, release the whole screen-owned store instead:
+
+```zig
+const SearchScreen = struct {
+    visual: chasen.ComponentStateStore,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io) SearchScreen {
+        return .{ .visual = .initWithIo(allocator, io) };
+    }
+
+    fn deinit(self: *SearchScreen) void {
+        self.visual.deinit();
+    }
+};
+```
+
+The following fields and methods belong inside the app, alongside its `Msg`,
+`update`, and `view`:
+
+```zig
+search: ?SearchScreen = null,
+
+fn openSearch(self: *App, ctx: *chasen.Ctx(Msg)) void {
+    if (self.search == null) {
+        self.search = SearchScreen.init(ctx.allocator(), ctx.io());
+    }
+}
+
+fn closeSearch(self: *App) void {
+    if (self.search) |*screen| {
+        screen.deinit();
+        self.search = null;
+    }
+}
+
+pub fn deinit(self: *App, _: chasen.AppDeinitContext) void {
+    self.closeSearch();
+}
+```
+
+Call `closeSearch` when discarding the screen and use `App.deinit` for a screen
+still open at app shutdown. Closing releases the arena; reopening creates a new
+store. Do not use pointers to old states after removal or store deinitialization.
+Before closing, ensure no worker still borrows screen state: requesting cancel
+does not wait for that worker to finish. See
+[task borrowing and stale results](RUNTIME_MESSAGE_OWNERSHIP.md#borrowed-data-and-stale-results).
 
 If a stored state owns long-lived resources, define `deinit`:
 
@@ -198,6 +263,11 @@ the store is deinitialized. `remove` calls the stored value's `deinit`, but the
 underlying arena allocation remains owned by the store. `ComponentStateInitContext.io`
 and `ComponentStateDeinitContext.io` are optional so the store can be used in
 tests without a runtime `std.Io`.
+
+For a buffer that must be freed independently of the store, keep ownership in
+the app or explicitly retain its external allocator with the owning state.
+The allocator passed to a stored state's hooks is the arena allocator; it must
+not be used to free memory allocated by a different allocator.
 
 ## Surface
 
@@ -536,7 +606,8 @@ Do not execute I/O from `view`.
 Before publishing a component package, verify:
 
 - Semantic state remains in the app model.
-- Visual retained state uses `ComponentStateStore` with stable ids.
+- Visual state has an explicit app/component owner. If using `ComponentStateStore`,
+  ids are stable and the store lifetime matches the intended reclamation point.
 - `view` is draw-only and only uses `Surface`.
 - Frame allocator memory is not stored.
 - Heap payload ownership is documented.

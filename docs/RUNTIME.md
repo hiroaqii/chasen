@@ -279,6 +279,36 @@ requests also validate their inputs. A successful call means admission, not
 successful execution or delivery. Timer tracking/worker start failures are
 reported to the registered callback; see [Timers and Frames](#timers-and-frames).
 
+## Effect Contract Overview
+
+Admission, execution, and result delivery are separate stages. On an admission
+error, handle the error in `init`/`update`: choose a fallback, retry in a later
+update, or propagate it to end the run. Repeating a queue-full call in a tight
+loop inside the same update does not let the runtime drain pending requests.
+This is different from a worker waiting to deliver a result into a full event
+queue; those retries and cancellation/shutdown ownership are handled by the
+runtime. See [message ownership](RUNTIME_MESSAGE_OWNERSHIP.md#ownership-states).
+
+| Effect | Ownership after admission | Execution and result | Cancellation / shutdown |
+| --- | --- | --- | --- |
+| Task | `spawnOwned` transfers context cleanup; borrowed referents stay app-owned. | `run` returns Msg or Canceled (no Msg); `failed` handles start failure. Work errors belong in Msg. | Cooperative `requestCancel`; cleanup also runs for accepted work discarded before start. Queued Msgs are not revoked. |
+| Timer | Runtime owns node/ID and copies non-owning Notice; referents stay app-owned. | `notify` receives `.fired` or start `.failed`, and may return Msg or null. | Cancel/replacement does not retract queued notices. Shutdown drops notices without calling `notify`. |
+| Foreground command | Runtime owns copied argv/environment/path or duplicated cwd descriptor. | `finished` reports exit, signal, stopped job, failure, or abandonment; normal delivery follows TUI resume. | No per-request cancel API. Shutdown abandons queued commands; abandonment/fatal-restore Msgs use undelivered cleanup. |
+| Clipboard copy | Runtime owns copied text. | `finished` reports local send/failure; `.sent` does not prove clipboard acceptance. | No per-request cancel API; pending text is released without `finished` during shutdown. |
+| Image path load | Runtime owns copied path; app manages a delivered image handle. | `loaded` / `failed` reports loader outcome, including unsupported loading. | No per-request cancel API; unload stale handles. Shutdown releases remaining registry handles. |
+| Frame request | No payload ownership; repeated requests coalesce. | A frame event goes through `handleEvent`; start failure consumes the request without a failure callback. | Shutdown cancels the producer; foreground suspension cancels and reschedules it. |
+
+`image().unload` queues handle release without a completion callback;
+`redraw().skip` changes the current update's redraw decision without producing
+a result. These operations do not share the task/timer notification lifecycle.
+
+Once a Msg reaches `update`, its ownership belongs to the app even if update
+fails. Undelivered owned Msgs follow the root Msg cleanup policy. For exact
+cleanup order and callback behavior, see
+[task ownership](RUNTIME_MESSAGE_OWNERSHIP.md#task-context-and-cancellation),
+[timer ownership](RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership), and the
+terminal-effect sections below.
+
 ## Timers and Frames
 
 `tick(id, delay_ns, notice, notify)` schedules one notification;
