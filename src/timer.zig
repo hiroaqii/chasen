@@ -48,9 +48,6 @@ pub fn Notification(comptime Msg: type) type {
 /// A root message may own resources; its timer notice must be a separate,
 /// non-owning value type. Applications without a declaration use void notices.
 pub fn Notice(comptime Msg: type) type {
-    // Composite notices are also validated while instantiating a whole Program.
-    // Give recursive validation room without requiring a quota in every caller.
-    @setEvalBranchQuota(10_000);
     const has_notice = switch (@typeInfo(Msg)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(Msg, "TimerNotice"),
         else => false,
@@ -60,8 +57,13 @@ pub fn Notice(comptime Msg: type) type {
         @compileError("Msg.TimerNotice must be a type");
     if (Msg.TimerNotice == Msg)
         @compileError("Msg.TimerNotice must be separate from the root Msg type");
-    validateValue(Msg.TimerNotice);
-    return Msg.TimerNotice;
+    return struct {
+        // Keep recursive validation separate from the caller's comptime budget.
+        const Validated = blk: {
+            validateValue(Msg.TimerNotice);
+            break :blk Msg.TimerNotice;
+        };
+    }.Validated;
 }
 
 fn isBorrowed(comptime T: type) bool {

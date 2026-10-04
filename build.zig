@@ -261,6 +261,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "not-a-type", .diagnostic = "Msg.TimerNotice must be a type" },
         .{ .name = "borrowed-nonpointer", .diagnostic = "Borrowed requires a pointer or slice type" },
         .{ .name = "missing-callback", .diagnostic = "member function expected 4 argument(s), found 3" },
+        .{ .name = "quota-typed", .diagnostic = "evaluation exceeded 1000 backwards branches" },
+        .{ .name = "quota-default-void", .diagnostic = "evaluation exceeded 1000 backwards branches" },
+        .{ .name = "quota-explicit-void", .diagnostic = "evaluation exceeded 1000 backwards branches" },
     };
     for (negative_notices) |fixture| {
         const negative = b.addObject(.{
