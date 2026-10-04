@@ -8,14 +8,14 @@ pseudo terminals and do not need an interactive CI session.
 ## Local Checks
 
 ```sh
-zig build
 TMPDIR="${TMPDIR:-/tmp}" zig build test
 zig build check-io-threaded
 zig build check-examples
 zig build check-runtime-wasm
 ```
 
-`zig build` alone does not compile the full example suite. Use `check-examples`
+`zig build` alone only evaluates the build graph; it does not compile Chasen.
+Use `test` to compile and run tests, and `check-examples`
 to compile all standard examples, including the foreground-command and task
 cancellation apps. `check-io-threaded` runs the standard-Io smoke test.
 `check-runtime-wasm` compiles a small runtime-only API usage check; it is not a
@@ -115,10 +115,9 @@ zig build check-osc52-ownership -Dtarget=aarch64-macos
 `ubuntu-24.04` and `macos-26` with Zig 0.16.0. The matrix uses `fail-fast: false`,
 so a failure on one OS does not cancel the other job. Both jobs run:
 
-1. `zig build --summary all`
-2. `zig build test --summary all`, with `TMPDIR` set to `${{ runner.temp }}`
-3. `zig build check-io-threaded --summary all`
-4. `zig build check-examples --summary all`
+1. `zig build test --summary all`, with `TMPDIR` set to `${{ runner.temp }}`
+2. `zig build check-io-threaded --summary all`
+3. `zig build check-examples --summary all`
 
 Both jobs run the OSC 52 ownership executable as part of `test`. The Linux job
 also runs the real PTY integration tests included in `test`.

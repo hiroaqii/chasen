@@ -259,7 +259,6 @@ zig build run-anim_transition -Dchasen-anim-path=../chasen-anim
 From a repository checkout:
 
 ```sh
-zig build
 TMPDIR="${TMPDIR:-/tmp}" zig build test
 zig build check-io-threaded
 zig build check-examples

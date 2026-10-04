@@ -33,9 +33,6 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Build
-        run: zig build --summary all
-
       - name: Test
         env:
           TMPDIR: ${{ runner.temp }}
