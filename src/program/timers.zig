@@ -182,19 +182,48 @@ fn expectReplacement(loop: *vaxis.Loop(InternalEvent(TestMsg)), io: std.Io) !voi
 }
 
 test "timer runtime replaces the running ID before admitting a same-ID tick or every" {
+    const AdmissionProbe = struct {
+        threaded: std.Io.Threaded,
+        old_completed: std.Io.Event = .unset,
+        admissions: usize = 0,
+        completed_before_replacement: bool = false,
+
+        fn concurrent(
+            userdata: ?*anyopaque,
+            result_len: usize,
+            result_alignment: std.mem.Alignment,
+            context: []const u8,
+            context_alignment: std.mem.Alignment,
+            start: *const fn (*const anyopaque, *anyopaque) void,
+        ) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            if (self.admissions == 1) {
+                self.completed_before_replacement = self.old_completed.isSet();
+            }
+            self.admissions += 1;
+            return threaded.io().vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+        }
+    };
     for ([_]bool{ false, true }) |old_every| {
         for ([_]bool{ false, true }) |new_every| {
             for ([_]bool{ false, true }) |cancel_first| {
                 const allocator = std.testing.allocator;
-                // A replacement can start only after the previous Future releases
-                // the sole concurrent slot. Long delays keep the old Msg unposted.
-                var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(1) });
-                defer threaded.deinit();
-                const io = threaded.io();
+                // Future.cancel can return before Threaded decrements busy_count.
+                // Observe the old worker's completion at the next admission instead
+                // of assuming its concurrent slot is immediately reusable.
+                var probe: AdmissionProbe = .{ .threaded = .init(allocator, .{}) };
+                defer probe.threaded.deinit();
+                var io = probe.threaded.io();
+                var vtable = io.vtable.*;
+                vtable.concurrent = AdmissionProbe.concurrent;
+                io.vtable = &vtable;
                 var requests = requests_mod.Requests(TestMsg).init(allocator, io);
                 defer requests.deinit();
                 var timers = TimerRuntime(TestMsg).init(allocator, io);
                 defer timers.shutdown();
+                var hooks: TestHooks = .{ .after_wake = &probe.old_completed };
+                timers.test_hooks = &hooks;
                 var completions: types.RuntimeCompletionBuffer(TestMsg) = .{};
                 try completions.init(allocator);
                 defer completions.deinitUndelivered(allocator);
@@ -209,6 +238,9 @@ test "timer runtime replaces the running ID before admitting a same-ID tick or e
                 try timers.startTicks(&requests, &completions, &loop, &shutting_down);
                 try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
                 try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
+                // Only the old worker may publish this evidence.
+                timers.test_hooks = null;
+                try std.testing.expect(!probe.old_completed.isSet());
                 if (cancel_first) try requests.timer().cancel("same");
                 if (new_every) {
                     try requests.timer().every("same", std.time.ns_per_ms, .replacement, TestMsg.notify);
@@ -219,6 +251,9 @@ test "timer runtime replaces the running ID before admitting a same-ID tick or e
                 if (cancel_first) try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
                 try timers.startTicks(&requests, &completions, &loop, &shutting_down);
                 try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
+                try std.testing.expectEqual(@as(usize, 2), probe.admissions);
+                try std.testing.expect(probe.completed_before_replacement);
+                try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
                 try std.testing.expectEqual(@as(usize, 1), timers.running.items.len);
                 try expectReplacement(&loop, io);
                 // No runtime reap has run yet; explicit cancellation can join it.
