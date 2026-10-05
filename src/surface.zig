@@ -307,8 +307,10 @@ pub const Column = struct {
         return @ptrCast(&self.backend);
     }
 
-    /// Print a borrowed styled text segment at the current row, then advance
-    /// the cursor by `gap` rows.
+    /// Print borrowed styled text with grapheme wrapping, then advance `gap`
+    /// rows from the last text row. Filling a row exactly adds no extra row.
+    /// Empty text still advances by `gap`; explicit trailing newlines retain
+    /// their line movement. Text beyond the available height is not drawn.
     ///
     /// This has the same lifetime requirement as `Surface.borrowTextAt`: the
     /// text is not copied, and the caller must keep it alive until the current
@@ -320,10 +322,26 @@ pub const Column = struct {
             .text = str,
             .style = vaxis_convert.textStyleToVaxis(ts),
         }, .{ .row_offset = self.row });
-        self.row = result.row + self.gap;
+        var last_row = result.row;
+        if (!result.overflow and result.col == 0 and result.row > self.row) {
+            // The backend also returns col=0 after LF. Only discount an unused
+            // row reached by wrapping text, preserving explicit line movement.
+            var ends_in_text = false;
+            var iter = text.graphemeIterator(str);
+            while (iter.next()) |grapheme| {
+                const bytes = grapheme.bytes(str);
+                if (std.mem.eql(u8, bytes, "\n")) {
+                    ends_in_text = false;
+                } else if (self.vaxisWindow().gwidth(bytes) > 0) {
+                    ends_in_text = true;
+                }
+            }
+            if (ends_in_text) last_row -= 1;
+        }
+        self.row = last_row + self.gap;
     }
 
-    /// Copy text into the frame allocator, print it, then advance by `gap`.
+    /// Copy text into the frame allocator, then draw and advance as `borrowText`.
     ///
     /// This is the safe column API for dynamic slices whose original storage
     /// may not live until render completion.
@@ -332,8 +350,8 @@ pub const Column = struct {
         self.borrowText(copied, ts);
     }
 
-    /// Format text into the frame allocator, print it with the default style,
-    /// then advance by `gap`.
+    /// Format text into the frame allocator, then draw with the default style
+    /// and advance as `borrowText`.
     ///
     /// This is the safe column API for formatted text created during `view`.
     /// Returns an error if formatting allocation fails.
@@ -384,6 +402,83 @@ fn testSurface(width: u16, height: u16) !TestSurface {
         .arena = .init(std.testing.allocator),
         .surface = .initVaxis(window, undefined, null),
     };
+}
+
+test "Column text APIs advance from the last wrapped text row" {
+    const cases = .{
+        .{ "abc", @as(u16, 1) },
+        .{ "abcd", @as(u16, 1) },
+        .{ "abcdefgh", @as(u16, 2) },
+    };
+    inline for (.{ .borrow, .copy, .format }) |api| {
+        inline for (cases) |case| {
+            var ts = try testSurface(4, 4);
+            ts.bind();
+            defer ts.deinit();
+            var column = ts.surface.column(.{});
+            switch (api) {
+                .borrow => column.borrowText(case[0], .{}),
+                .copy => try column.copyText(case[0], .{}),
+                .format => try column.print("{s}", .{case[0]}),
+                else => unreachable,
+            }
+            column.borrowText("x", .{});
+
+            for (case[0], 0..) |_, i| {
+                try std.testing.expectEqualStrings(case[0][i .. i + 1], ts.surface.readCell(
+                    @intCast(i % 4),
+                    @intCast(i / 4),
+                ).?.char.grapheme);
+            }
+            try std.testing.expectEqualStrings("x", ts.surface.readCell(0, case[1]).?.char.grapheme);
+        }
+    }
+}
+
+test "Column preserves gap and explicit empty or newline movement" {
+    const cases = .{
+        .{ "abcd", @as(u16, 2), @as(u16, 2) },
+        .{ "abcdefgh", @as(u16, 2), @as(u16, 3) },
+        .{ "abcd", @as(u16, 0), @as(u16, 0) },
+        .{ "", @as(u16, 1), @as(u16, 1) },
+        .{ "ab\n", @as(u16, 1), @as(u16, 2) },
+        .{ "abcd\n", @as(u16, 1), @as(u16, 3) },
+        .{ "abcd\n\u{200b}", @as(u16, 1), @as(u16, 3) },
+        .{ "abcd\u{200b}", @as(u16, 1), @as(u16, 1) },
+    };
+    inline for (cases) |case| {
+        var ts = try testSurface(4, 5);
+        ts.bind();
+        defer ts.deinit();
+        var column = ts.surface.column(.{ .gap = case[1] });
+        column.borrowText(case[0], .{});
+        column.borrowText("x", .{});
+        try std.testing.expectEqualStrings("x", ts.surface.readCell(0, case[2]).?.char.grapheme);
+        if (case[2] > 1) {
+            for (0..4) |col| {
+                try std.testing.expectEqualStrings(" ", ts.surface.readCell(@intCast(col), case[2] - 1).?.char.grapheme);
+            }
+        }
+    }
+}
+
+test "Column height exhaustion does not draw outside the child" {
+    for ([_][]const u8{ "abcd", "abcde" }) |str| {
+        var ts = try testSurface(6, 3);
+        ts.bind();
+        defer ts.deinit();
+        ts.surface.fillAll(.{ .char = .{ .grapheme = "#", .width = 1 } });
+        var child = ts.surface.child(.{ .col = 1, .row = 1, .width = 4, .height = 1 });
+        var column = child.column(.{});
+        column.borrowText(str, .{});
+        column.borrowText("x", .{});
+        for (0..3) |row| {
+            for (0..6) |col| {
+                const expected = if (row == 1 and col >= 1 and col <= 4) str[col - 1 .. col] else "#";
+                try std.testing.expectEqualStrings(expected, ts.surface.readCell(@intCast(col), @intCast(row)).?.char.grapheme);
+            }
+        }
+    }
 }
 
 test "Surface.size returns window dimensions" {

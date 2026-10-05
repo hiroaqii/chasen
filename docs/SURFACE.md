@@ -104,6 +104,25 @@ anything formatted or assembled inside `view` should use `printAt` or
 Frame-owned text is allocated from a frame arena. The arena is reset before each
 render and retains capacity so repeated redraws do not churn the allocator.
 
+## Column Layout
+
+`surface.column(.{ .gap = 1 })` places text elements from top to bottom.
+`Column.borrowText`, `copyText`, and `print` wrap at grapheme boundaries and
+share the same row advancement. The borrowed and frame-owned lifetimes above
+also apply to these methods.
+
+`gap` is the line distance from the last text row to the next element:
+`gap=1` places it on the adjacent row, `gap=2` leaves one blank row, and
+`gap=0` reuses the last row. Filling a row exactly does not add an empty row.
+For example, in a column of width 4, `"abcd"` followed by `"x"` with `gap=1`
+places `x` on row 1; `"abcdefgh"` followed by `"x"` places it on row 2.
+
+Empty text still advances by `gap`. Explicit trailing LF newlines keep their
+existing line movement before `gap` is added, including a newline immediately
+after a full row (the wrap and explicit newline both advance). Zero-width
+graphemes do not add a text row. When the available height is exhausted, further
+text is not drawn; a height-overflow result keeps its existing row advancement.
+
 ## Child Surfaces
 
 `Surface.child(Rect)` creates a clipped local drawing area.
