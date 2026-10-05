@@ -104,12 +104,26 @@ anything formatted or assembled inside `view` should use `printAt` or
 Frame-owned text is allocated from a frame arena. The arena is reset before each
 render and retains capacity so repeated redraws do not churn the allocator.
 
+`borrowTextAt`, `copyTextAt`, and `printAt` draw without wrapping. They stop
+before the first grapheme that does not fit in the remaining cells, leaving
+that grapheme and all later text undrawn. Width follows the terminal's active
+width method, not UTF-8 byte length; combining sequences remain whole.
+`PrintResult.col` and `row` describe the processed prefix. Right-edge clipping
+or an LF newline sets `overflow`; text ending exactly at the edge does not.
+
 ## Column Layout
 
 `surface.column(.{ .gap = 1 })` places text elements from top to bottom.
 `Column.borrowText`, `copyText`, and `print` wrap at grapheme boundaries and
 share the same row advancement. The borrowed and frame-owned lifetimes above
 also apply to these methods.
+
+A grapheme that does not fit in the remaining cells moves to the next row
+before drawing. For example, width 4 and `"abcあ"` place `あ` at column 0 of
+the next row, leaving the last cell of the first row unchanged. If the next
+row is outside the available height, or the grapheme is wider than the entire
+column, that grapheme and the rest of the element are not drawn. Neither
+Surface nor Column text drawing places a wide grapheme across its right edge.
 
 `gap` is the line distance from the last text row to the next element:
 `gap=1` places it on the adjacent row, `gap=2` leaves one blank row, and

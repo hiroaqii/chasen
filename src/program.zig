@@ -551,6 +551,58 @@ test "event resize forces render and Renderer keeps view paint trace order" {
     try std.testing.expectEqual(@as(usize, 2), evidence.views);
 }
 
+test "Renderer preserves sibling and next-row text at wide grapheme boundaries" {
+    const App = struct {
+        pub fn view(_: *const @This(), sfc: *Surface) !void {
+            sfc.fillAll(.{ .char = .{ .grapheme = "#", .width = 1 } });
+            var child = sfc.child(.{ .col = 1, .row = 0, .width = 4, .height = 1 });
+            _ = child.borrowTextAt(0, 0, "abcあ", .{});
+            _ = sfc.borrowTextAt(5, 0, "S", .{});
+            _ = sfc.borrowTextAt(0, 1, "N", .{});
+            _ = sfc.borrowTextAt(7, 1, "R", .{});
+            _ = sfc.borrowTextAt(7, 1, "あ", .{});
+            _ = sfc.borrowTextAt(0, 2, "M", .{});
+
+            var body = sfc.child(.{ .col = 1, .row = 3, .width = 4, .height = 2 });
+            var column = body.column(.{});
+            column.borrowText("abcあ", .{});
+            var edge = sfc.child(.{ .col = 6, .row = 3, .width = 2, .height = 2 });
+            var edge_column = edge.column(.{});
+            edge_column.borrowText("xあ", .{});
+            _ = sfc.borrowTextAt(5, 3, "S", .{});
+            _ = sfc.borrowTextAt(5, 4, "S", .{});
+            _ = sfc.borrowTextAt(0, 4, "N", .{});
+        }
+    };
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var output: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var vx = try vaxis.Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+    defer vx.deinit(std.testing.allocator, &writer);
+    vx.caps.unicode = .unicode;
+    vx.state.alt_screen = true;
+    try vx.resize(std.testing.allocator, &writer, .{ .cols = 8, .rows = 5, .x_pixel = 0, .y_pixel = 0 });
+    writer.end = 0;
+    var images: terminal_image.Registry = .{};
+    defer images.deinit(std.testing.allocator);
+    var renderer = Renderer.init(std.testing.allocator);
+    defer renderer.deinit();
+    _ = try renderer.render(App, &vx, &images, &.{}, &writer, std.testing.io, false, .{
+        .runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+        .terminal = .{ .env_map = &env },
+    });
+
+    // Check complete rows together with their cursor positions, not only the
+    // presence of sentinels. A wide cell crossing a boundary skips their bytes.
+    const rows = "\x1b[1;1H#abc#S##" ++
+        "\x1b[2;1HN######R" ++
+        "\x1b[3;1HM#######" ++
+        "\x1b[4;1H#abc#Sx#" ++
+        "\x1b[5;1HNあ##Sあ";
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), rows) != null);
+}
+
 test "Program init and effect errors clean pending owners before App deinit" {
     const State = struct {
         task_cleaned: usize = 0,

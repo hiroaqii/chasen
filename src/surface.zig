@@ -129,6 +129,9 @@ pub const Surface = struct {
     }
 
     /// Print borrowed styled text at `col`, `row` without wrapping.
+    /// Stop before the first grapheme that exceeds the remaining cell width.
+    /// The result position follows the printed prefix; clipping or LF sets
+    /// `overflow`, while text that ends exactly at the right edge does not.
     ///
     /// This is the explicit borrowed-text escape hatch. The string is not
     /// copied, so the caller must guarantee that `str` stays valid until the
@@ -140,14 +143,31 @@ pub const Surface = struct {
     /// before render completion. For text created during `view`, prefer
     /// `copyTextAt` or `printAt`.
     pub fn borrowTextAt(self: *Surface, col: u16, row: u16, str: []const u8, ts: TextStyle) PrintResult {
-        return .fromVaxis(self.vaxisWindow().printSegment(.{
-            .text = str,
+        const win = self.vaxisWindow();
+        var prefix = str;
+        var remaining = win.width -| col;
+        var iter = text.graphemeIterator(str);
+        while (iter.next()) |grapheme| {
+            const bytes = grapheme.bytes(str);
+            // Let the backend retain its existing full-row and LF terminals.
+            if (remaining == 0 or std.mem.eql(u8, bytes, "\n")) break;
+            const width = win.gwidth(bytes);
+            if (width > remaining) {
+                prefix = str[0 .. @intFromPtr(bytes.ptr) - @intFromPtr(str.ptr)];
+                break;
+            }
+            remaining -= width;
+        }
+        var result: PrintResult = .fromVaxis(win.printSegment(.{
+            .text = prefix,
             .style = vaxis_convert.textStyleToVaxis(ts),
         }, .{
             .col_offset = col,
             .row_offset = row,
             .wrap = .none,
         }));
+        result.overflow = result.overflow or prefix.len < str.len;
+        return result;
     }
 
     /// Copy `str` into the frame allocator and return the copied text.
@@ -311,6 +331,8 @@ pub const Column = struct {
     /// rows from the last text row. Filling a row exactly adds no extra row.
     /// Empty text still advances by `gap`; explicit trailing newlines retain
     /// their line movement. Text beyond the available height is not drawn.
+    /// A grapheme that exceeds the remaining cells wraps before it is drawn.
+    /// If it exceeds the entire column width, it and later text are not drawn.
     ///
     /// This has the same lifetime requirement as `Surface.borrowTextAt`: the
     /// text is not copied, and the caller must keep it alive until the current
@@ -318,10 +340,45 @@ pub const Column = struct {
     /// component-owned text. Use `copyText` or `print` for text created during
     /// `view`.
     pub fn borrowText(self: *Column, str: []const u8, ts: TextStyle) void {
-        const result = self.vaxisWindow().printSegment(.{
-            .text = str,
-            .style = vaxis_convert.textStyleToVaxis(ts),
-        }, .{ .row_offset = self.row });
+        const result: vaxis.Window.PrintResult = result: {
+            const win = self.vaxisWindow();
+            const text_style = vaxis_convert.textStyleToVaxis(ts);
+            var row = self.row;
+            var col: u16 = 0;
+            var iter = text.graphemeIterator(str);
+            const overflow = while (iter.next()) |grapheme| {
+                if (col >= win.width) {
+                    row += 1;
+                    col = 0;
+                }
+                if (row >= win.height) break true;
+                const bytes = grapheme.bytes(str);
+                if (std.mem.eql(u8, bytes, "\n")) {
+                    row +|= 1;
+                    col = 0;
+                    continue;
+                }
+                const width = win.gwidth(bytes);
+                if (width == 0) continue;
+                if (width > win.width) break true;
+                if (width > win.width - col) {
+                    row += 1;
+                    col = 0;
+                    if (row >= win.height) break true;
+                }
+                win.writeCell(col, row, .{
+                    .char = .{ .grapheme = bytes, .width = @intCast(width) },
+                    .style = text_style,
+                    .wrapped = col + width >= win.width,
+                });
+                col += width;
+            } else false;
+            if (col >= win.width) {
+                row += 1;
+                col = 0;
+            }
+            break :result .{ .row = row, .col = col, .overflow = overflow };
+        };
         var last_row = result.row;
         if (!result.overflow and result.col == 0 and result.row > self.row) {
             // The backend also returns col=0 after LF. Only discount an unused
@@ -481,6 +538,59 @@ test "Column height exhaustion does not draw outside the child" {
     }
 }
 
+test "Column text APIs wrap wide graphemes within the child" {
+    inline for (.{ .borrow, .copy, .format }) |api| {
+        var ts = try testSurface(6, 5);
+        ts.bind();
+        defer ts.deinit();
+        ts.surface.fillAll(.{ .char = .{ .grapheme = "#", .width = 1 } });
+        var child = ts.surface.child(.{ .col = 1, .row = 1, .width = 4, .height = 3 });
+        var column = child.column(.{});
+        const str = "abcあe\u{301}!";
+        switch (api) {
+            .borrow => column.borrowText(str, .{}),
+            .copy => try column.copyText(str, .{}),
+            .format => try column.print("{s}", .{str}),
+            else => unreachable,
+        }
+        column.borrowText("x", .{});
+        const expected = [_][6][]const u8{
+            .{ "#", "#", "#", "#", "#", "#" },
+            .{ "#", "a", "b", "c", "#", "#" },
+            .{ "#", "あ", "#", "e\u{301}", "!", "#" },
+            .{ "#", "x", "#", "#", "#", "#" },
+            .{ "#", "#", "#", "#", "#", "#" },
+        };
+        for (expected, 0..) |row, y| {
+            for (row, 0..) |grapheme, x| {
+                try std.testing.expectEqualStrings(grapheme, ts.surface.readCell(@intCast(x), @intCast(y)).?.char.grapheme);
+            }
+        }
+        try std.testing.expectEqual(@as(u8, 2), child.readCell(0, 1).?.char.width);
+    }
+}
+
+test "Column stops wide text at insufficient width or height" {
+    inline for (.{ .{ 1, 2, "あx" }, .{ 4, 1, "abcあx" } }) |case| {
+        var ts = try testSurface(6, 4);
+        ts.bind();
+        defer ts.deinit();
+        ts.surface.fillAll(.{ .char = .{ .grapheme = "#", .width = 1 } });
+        var child = ts.surface.child(.{ .col = 1, .row = 1, .width = case[0], .height = case[1] });
+        var column = child.column(.{});
+        column.borrowText(case[2], .{ .bold = true });
+        for (0..4) |row| {
+            for (0..6) |col| {
+                const drawn = case[0] == 4 and row == 1 and col >= 1 and col <= 3;
+                const expected = if (drawn) "abc"[col - 1 .. col] else "#";
+                const cell = ts.surface.readCell(@intCast(col), @intCast(row)).?;
+                try std.testing.expectEqualStrings(expected, cell.char.grapheme);
+                try std.testing.expectEqual(drawn, cell.style.bold);
+            }
+        }
+    }
+}
+
 test "Surface.size returns window dimensions" {
     var ts = try testSurface(12, 7);
     ts.bind();
@@ -626,6 +736,53 @@ test "Surface.borrowTextAt prints unwrapped styled text at coordinates" {
     try std.testing.expectEqualStrings("a", a.char.grapheme);
     try std.testing.expectEqualStrings("c", c.char.grapheme);
     try std.testing.expect(a.style.fg.eql(.{ .index = 2 }));
+}
+
+test "Surface text APIs clip whole graphemes at the child right edge" {
+    const Case = struct {
+        col: u16,
+        str: []const u8,
+        end: u16,
+        overflow: bool,
+        cells: [4][]const u8 = .{ "#", "#", "#", "#" },
+        api: enum { borrow, copy, format } = .borrow,
+    };
+    const cases = [_]Case{
+        .{ .col = 4, .str = "x", .end = 4, .overflow = true },
+        .{ .col = 3, .str = "x", .end = 4, .overflow = false, .cells = .{ "#", "#", "#", "x" } },
+        .{ .col = 2, .str = "あ", .end = 4, .overflow = false, .cells = .{ "#", "#", "あ", "#" } },
+        .{ .col = 3, .str = "あ", .end = 3, .overflow = true },
+        .{ .col = 1, .str = "abあ", .end = 3, .overflow = true, .cells = .{ "#", "a", "b", "#" }, .api = .copy },
+        .{ .col = 1, .str = "abあ", .end = 3, .overflow = true, .cells = .{ "#", "a", "b", "#" }, .api = .format },
+        .{ .col = 3, .str = "e\u{301}x", .end = 4, .overflow = true, .cells = .{ "#", "#", "#", "e\u{301}" } },
+        .{ .col = 0, .str = "", .end = 0, .overflow = false },
+        .{ .col = 0, .str = "\nX", .end = 0, .overflow = true },
+        .{ .col = 0, .str = "\u{200b}", .end = 0, .overflow = false },
+        .{ .col = 3, .str = "x\u{200b}", .end = 4, .overflow = true, .cells = .{ "#", "#", "#", "x" } },
+        .{ .col = 5, .str = "x", .end = 5, .overflow = true },
+    };
+    for (cases) |case| {
+        var ts = try testSurface(6, 3);
+        ts.bind();
+        defer ts.deinit();
+        ts.surface.fillAll(.{ .char = .{ .grapheme = "#", .width = 1 } });
+        var child = ts.surface.child(.{ .col = 1, .row = 1, .width = 4, .height = 1 });
+        const result = switch (case.api) {
+            .borrow => child.borrowTextAt(case.col, 0, case.str, .{ .bold = true }),
+            .copy => try child.copyTextAt(case.col, 0, case.str, .{ .bold = true }),
+            .format => try child.printAt(case.col, 0, .{ .bold = true }, "{s}", .{case.str}),
+        };
+        try std.testing.expectEqual(PrintResult{ .col = case.end, .row = 0, .overflow = case.overflow }, result);
+        for (0..3) |row| {
+            for (0..6) |col| {
+                const expected = if (row == 1 and col >= 1 and col <= 4) case.cells[col - 1] else "#";
+                const cell = ts.surface.readCell(@intCast(col), @intCast(row)).?;
+                try std.testing.expectEqualStrings(expected, cell.char.grapheme);
+                try std.testing.expectEqual(!std.mem.eql(u8, expected, "#"), cell.style.bold);
+                if (cell.style.bold) try std.testing.expect(cell.char.width <= 5 - col);
+            }
+        }
+    }
 }
 
 test "Surface.copyText copies text into the frame allocator" {
