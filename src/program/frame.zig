@@ -84,7 +84,7 @@ fn FrameHelper(comptime Msg: type) type {
         ) void {
             frame_io.sleep(.fromNanoseconds(@intCast(after_ns)), .awake) catch return;
             if (suspended.load(.seq_cst)) {
-                types.postPlainUntilShutdown(Msg, .frame_canceled, frame_io, loop_ptr, shutting_down);
+                types.postPlainUntilShutdown(Msg, .frame_canceled, frame_io, loop_ptr, shutting_down) catch return;
                 return;
             }
             const now_ns = timestampNs(frame_io);
@@ -92,7 +92,7 @@ fn FrameHelper(comptime Msg: type) type {
                 .now_ns = now_ns,
                 .delta_ns = deltaNs(last_frame_ns, now_ns),
                 .index = index,
-            } }, frame_io, loop_ptr, shutting_down);
+            } }, frame_io, loop_ptr, shutting_down) catch return;
         }
     };
 }

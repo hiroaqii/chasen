@@ -154,18 +154,45 @@ test "InternalEvent instantiation" {
 
 /// Post a plain/copy-safe internal event without blocking shutdown behind a
 /// full queue. Timer events contain non-owning notices, never generated Msgs.
+/// Propagate cancellation so a repeating producer exits instead of retrying.
 pub fn postPlainUntilShutdown(
     comptime Msg: type,
     event: InternalEvent(Msg),
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
     shutting_down: *const std.atomic.Value(bool),
-) void {
+) std.Io.Cancelable!void {
     while (!shutting_down.load(.seq_cst)) {
-        const posted = loop.tryPostEvent(event) catch return;
+        const posted = try loop.tryPostEvent(event);
         if (posted) return;
-        io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake) catch return;
+        try io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake);
     }
+}
+
+test "postPlainUntilShutdown propagates cancellation from the queue mutex" {
+    const CancelWait = struct {
+        fn wait(_: ?*anyopaque, _: *const u32, _: u32, _: std.Io.Timeout) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.futexWait = CancelWait.wait;
+    io.vtable = &vtable;
+    const Msg = enum { noop };
+    var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
+    var shutting_down: std.atomic.Value(bool) = .init(false);
+    try std.testing.expect(try loop.tryPostEvent(.frame_canceled));
+    {
+        // Force tryPostEvent to reach its cancellable lock wait, independently
+        // of the retry-sleep cancellation exercised by the real timer worker.
+        loop.queue.mutex.lockUncancelable(io);
+        defer loop.queue.mutex.unlock(io);
+        try std.testing.expectError(error.Canceled, postPlainUntilShutdown(Msg, .continue_effect_drain, io, &loop, &shutting_down));
+    }
+    try std.testing.expect(!shutting_down.load(.seq_cst));
+    try std.testing.expect((try loop.tryEvent()).? == .frame_canceled);
+    try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try loop.tryEvent());
 }
 
 // Shared synchronous observation helpers; no runtime owner is borrowed.

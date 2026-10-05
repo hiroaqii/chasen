@@ -101,7 +101,7 @@ pub fn TimerRuntime(comptime Msg: type) type {
             while (!shutting_down.load(.seq_cst)) {
                 io.sleep(.fromNanoseconds(entry.duration_ns), .awake) catch return;
                 if (repeating and suspended.?.load(.seq_cst)) continue;
-                types.postPlainUntilShutdown(Msg, .{ .timer_notification = entry.notification }, io, loop, shutting_down);
+                types.postPlainUntilShutdown(Msg, .{ .timer_notification = entry.notification }, io, loop, shutting_down) catch return;
                 if (!repeating) return;
             }
         }
@@ -372,6 +372,108 @@ test "timer runtime shutdown cancels notice producers behind a full queue" {
         timers.shutdown();
         try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
         while (try loop.tryEvent()) |event| try std.testing.expect(event == .continue_effect_drain or event == .timers_completed);
+    }
+}
+
+test "timer full-queue retry cancellation ends every before cancel or replacement returns" {
+    const RetryProbe = struct {
+        threaded: std.Io.Threaded,
+        entered: std.Io.Event = .unset,
+        canceled: bool = false,
+        resumed: bool = false,
+        timed_out: bool = false,
+
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            if (self.canceled) {
+                // Rescue the broken loop without shutdown or an unbounded join.
+                // This second cancellation is test-only and must fail the assertion.
+                self.resumed = true;
+                return error.Canceled;
+            }
+            if (timeout == .duration and timeout.duration.raw.nanoseconds == 100 * std.time.ns_per_us) {
+                self.entered.set(threaded.io());
+                // Hold the retry cancellation point open on the real backend.
+                // Event synchronization, not elapsed time, admits the cancellation.
+                threaded.io().sleep(.fromSeconds(5), .awake) catch |err| {
+                    self.canceled = true;
+                    return err;
+                };
+                self.timed_out = true;
+                self.canceled = true;
+                return error.Canceled;
+            }
+            return threaded.io().vtable.sleep(userdata, timeout);
+        }
+    };
+    const Action = enum { cancel, every, tick };
+    for ([_]Action{ .cancel, .every, .tick }) |action| {
+        const allocator = std.testing.allocator;
+        var probe: RetryProbe = .{ .threaded = .init(allocator, .{}) };
+        defer probe.threaded.deinit();
+        const io = probe.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.sleep = RetryProbe.sleep;
+        const worker_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+        defer requests.deinit();
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var suspended: std.atomic.Value(bool) = .init(false);
+        var timers = TimerRuntime(TestMsg).init(allocator, worker_io);
+        defer {
+            shutting_down.store(true, .seq_cst);
+            timers.shutdown();
+        }
+        var old_completed: std.Io.Event = .unset;
+        var hooks: TestHooks = .{ .after_wake = &old_completed };
+        timers.test_hooks = &hooks;
+        var completions: types.RuntimeCompletionBuffer(TestMsg) = .{};
+        try completions.init(allocator);
+        defer completions.deinitUndelivered(allocator);
+        var loop = vaxis.Loop(InternalEvent(TestMsg)).init(io, undefined, undefined);
+        // A notice already posted before cancellation remains independent of its node.
+        try std.testing.expect(try loop.tryPostEvent(.{ .timer_notification = .{ .notice = .old, .notify = TestMsg.notify } }));
+        var queued: usize = 1;
+        while (try loop.tryPostEvent(.continue_effect_drain)) queued += 1;
+        try requests.timer().every("full", 1, .old, TestMsg.notify);
+        try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
+        try waitForTestEvent(&probe.entered, io);
+
+        // Only the old worker uses the probe; cancellation and replacements use
+        // the same real backend, and the replacement has no test hooks.
+        timers.io = io;
+        timers.test_hooks = null;
+        switch (action) {
+            .cancel => {
+                try requests.timer().cancel("full");
+                timers.cancelPending(&requests);
+            },
+            .every => {
+                try requests.timer().every("full", std.time.ns_per_ms, .replacement, TestMsg.notify);
+                try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
+            },
+            .tick => {
+                try requests.timer().tick("full", 0, .replacement, TestMsg.notify);
+                try timers.startTicks(&requests, &completions, &loop, &shutting_down);
+            },
+        }
+        // cancel/startEntry has joined the old worker before reading its probe.
+        try std.testing.expect(probe.canceled and !probe.resumed and !probe.timed_out);
+        try std.testing.expect(old_completed.isSet());
+        try std.testing.expect(!shutting_down.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
+        try std.testing.expectEqual(@as(usize, if (action == .cancel) 0 else 1), timers.running.items.len);
+        const old = (try loop.tryEvent()).?.timer_notification;
+        try std.testing.expectEqual(TestMsg.TimerNotice.old, old.message(.fired, allocator).?.fired);
+        for (1..queued) |_| try std.testing.expect((try loop.tryEvent()).? == .continue_effect_drain);
+        if (action != .cancel) {
+            try expectReplacement(&loop, io);
+            try requests.timer().cancel("full");
+            timers.cancelPending(&requests);
+            try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
+        }
+        try std.testing.expect(!shutting_down.load(.seq_cst));
     }
 }
 
