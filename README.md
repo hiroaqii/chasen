@@ -195,6 +195,7 @@ heap-owning results; see [Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERS
 
 | Purpose | API | Guide |
 | --- | --- | --- |
+| Configure the runtime | `chasen.run`, `chasen.runWith` | [Runtime allocator requirements](docs/RUNTIME.md#runtime-configuration) |
 | Quit or control redraw | `ctx.quit()`, `ctx.redraw().skip()` | [Runtime](docs/RUNTIME.md) |
 | Timers and animation frames | `ctx.timer().tick/every/cancel`, `ctx.frame().request()` | [Timing](docs/RUNTIME.md#timers-and-frames) |
 | Background work | `ctx.task().spawn/spawnOwned/requestCancel` | [Task ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md#task-context-and-cancellation) |
@@ -219,7 +220,8 @@ and [timer timing and lifecycle](docs/RUNTIME.md#timers-and-frames).
 For text created during `view`, use `printAt` or `copyTextAt`. Borrowed text must
 remain valid until rendering finishes; do not borrow local stack buffers.
 Image path loads require a configured `runWith` image loader; the default reports
-`.unsupported`. Foreground execution is implemented for Linux and macOS.
+`.unsupported`. See [foreground commands](docs/RUNTIME.md#foreground-commands)
+for target OS requirements and terminal stdio routing.
 
 ## Examples
 

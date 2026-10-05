@@ -83,6 +83,23 @@ inside Program owns the reusable frame arena and keeps view and terminal paint
 timings separate. Program retains event/frame counters, effect-drain boundaries,
 forced resize redraws, and the final stats callback for each turn.
 
+## Runtime Configuration
+
+`chasen.run(init, app)` uses `init.gpa` and `init.io`. For explicit configuration,
+`chasen.runWith` takes `runtime.allocator`, `runtime.io`, and terminal options.
+
+The runtime allocator is shared by the runtime thread, application callbacks
+(through `ctx.allocator()`), and task workers. Choose an allocator whose
+implementation and configuration support concurrent allocation and freeing.
+The `std.mem.Allocator` type alone does not guarantee thread safety, and Chasen
+does not add synchronization around it. The caller must keep the allocator alive
+until `runWith` returns, including shutdown cleanup.
+
+`Surface.frameAllocator()` is separate frame-scoped scratch storage for `view`.
+Its memory is reset for the next frame; do not retain it or its allocations in
+tasks or persistent application state. A thread-safe runtime allocator does not
+make this frame arena safe for worker use. See [text lifetimes](SURFACE.md#text-lifetimes).
+
 ## Input and Messages
 
 The internal `TerminalSession` is initialized in its final storage and owns the
@@ -437,9 +454,24 @@ this API does not keep resumable shell jobs. Cleanup or terminal-restoration
 failures are fatal to the runtime; their callback messages are disposed as
 undelivered rather than passed to `update`.
 
-Commands execute the supplied argv directly, without shell parsing. Foreground
-execution is implemented for Linux and macOS; Windows reports an unsupported
-completion. See the [foreground command example](../examples/foreground_command/main.zig).
+Commands execute the supplied argv directly, without shell parsing. On Linux and
+macOS, the terminal runtime opens the application's controlling terminal
+(`/dev/tty`) through libvaxis. The child's stdin, stdout, and stderr all connect
+to that tty; they do not inherit the parent's stdin/stdout/stderr redirections.
+
+Foreground execution requires a build target whose minimum OS version is Linux
+5.10 or later, or macOS 13 or later. This check uses the configured target's
+minimum version, not the running OS's version string. Linux also probes
+`close_range` at runtime: the syscall must be available and permitted. A missing
+syscall or a sandbox policy that rejects the probe makes execution unsupported.
+macOS does not require `close_range`.
+
+Other target OSes, including Windows, are unsupported. When the support check
+rejects execution, no child is launched and the `finished` callback receives a
+result whose outcome is `.failed` with `.stage = .unsupported` and
+`.error_name = "Unsupported"`. These OS requirements apply specifically to
+foreground commands. See the
+[foreground command example](../examples/foreground_command/main.zig).
 
 Arguments are copied while queueing. The default cwd and environment are inherited
 at spawn time. A `.cwd = .{ .path = path }` copies the path but resolves it at

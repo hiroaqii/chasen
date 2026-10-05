@@ -92,6 +92,11 @@ pub const AppDeinitContext = struct {
 
 /// Backend-independent runtime options.
 pub const RuntimeOptions = struct {
+    /// Shared by the runtime thread, app callbacks, and task workers. Must
+    /// support concurrent allocation and freeing; `std.mem.Allocator` alone
+    /// does not guarantee thread safety. Chasen adds no synchronization.
+    /// Keep it alive through runtime shutdown. This is not the frame-scoped
+    /// allocator exposed by `Surface.frameAllocator()`.
     allocator: std.mem.Allocator,
     io: std.Io,
     /// Optional callback called after each runtime event loop iteration.

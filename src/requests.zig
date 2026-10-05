@@ -449,7 +449,16 @@ pub fn Requests(comptime Msg: type) type {
             /// Queue an interactive terminal foreground command.
             ///
             /// The runtime temporarily restores the terminal, runs the child
-            /// connected to `/dev/tty`, then re-enters Chasen's terminal mode.
+            /// with stdin/stdout/stderr connected to the app's `/dev/tty`, then
+            /// re-enters Chasen's terminal mode. Parent stdio redirections are
+            /// not inherited.
+            ///
+            /// Execution requires a build target minimum OS version of Linux
+            /// 5.10+ or macOS 13+. Linux also requires an available,
+            /// permitted `close_range` syscall at runtime. A failed support
+            /// check completes accepted requests with
+            /// `failed = .{ .stage = .unsupported, .error_name = "Unsupported" }`.
+            ///
             /// argv, `.path` cwd bytes, and every `.replace` environment key
             /// and value are copied while queueing because effects are drained
             /// after `update` returns. The caller must keep a replacement map
@@ -462,10 +471,8 @@ pub fn Requests(comptime Msg: type) type {
             /// available on every supported target, while `.dir` is accepted
             /// on Linux and macOS. Replacement maps are cloned, owned, and
             /// cleaned up on every compiled target, but do not expand execution
-            /// support; Windows still completes accepted requests with
-            /// `failed = .{ .stage = .unsupported, .error_name = "Unsupported" }`.
-            /// Chasen transports replacement
-            /// maps without adding secret-specific handling.
+            /// support. Chasen transports replacement maps without adding
+            /// secret-specific handling.
             ///
             /// A follow-up foreground command queued from `finished` is
             /// processed by bounded drain rounds without waiting for unrelated
