@@ -5,10 +5,9 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vaxis = .{
-            // Includes the POSIX input-loop fixes that preserve escape
-            // sequences split across terminal reads without delaying a lone Esc.
-            .url = "git+https://github.com/rockorager/libvaxis.git#6cab03f8a3faeb58bddf334343889a7f685ba7a7",
-            .hash = "vaxis-0.6.0-BWNV_FcoCgB3Q_LTiQet_GeS23Bd7e224eHloS8PanKZ",
+            // Input errors close the queue; normal restart preserves its buffer.
+            .url = "git+https://github.com/rockorager/libvaxis.git#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
+            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
         },
     },
     .paths = .{

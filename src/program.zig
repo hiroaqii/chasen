@@ -273,6 +273,12 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
         }
     }
 
+    // A buffered quit may precede the queue's input failure. Publish the
+    // producer barrier before joining, then preserve that failure on return.
+    runtime_shutting_down.store(true, .seq_cst);
+    tasks.requestShutdown();
+    terminal.stopReader();
+    try terminal.checkInputFailure();
     trace(opts, .shutdown);
 }
 
@@ -300,8 +306,7 @@ fn shutdownRuntime(
     tasks.requestShutdown();
     app_ctx.requests.discardPendingTasks();
 
-    // Do not call Loop.stop here: its DSR wake + await can block behind a full
-    // queue or a terminal that does not answer the query. Canceling the
+    // Join before close preserves a racing input failure. Canceling the
     // existing reader future interrupts both tty reads and queue waits.
     terminal.stopReader();
     drainInternalEventsForShutdown(App.Msg, &terminal.loop, allocator);
@@ -451,7 +456,7 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
         try std.testing.expectEqual(@as(usize, 1), slow.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), fast.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), tasks.pending.items.len);
-        try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try terminal.loop.tryEvent());
+        try std.testing.expectError(error.Closed, terminal.loop.tryEvent());
     }
 }
 

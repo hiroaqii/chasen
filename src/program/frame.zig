@@ -224,7 +224,79 @@ test "frame runtime start failure consumes only the request and leaves timeline 
     }
 }
 
-test "frame runtime shutdown cancels a producer behind a full queue" {
+test "frame worker retains generated notifications across normal close and exits on input failure" {
+    const Probe = struct {
+        threaded: std.Io.Threaded,
+        loop: *vaxis.Loop(InternalEvent(TestMsg)) = undefined,
+        suspended: *std.atomic.Value(bool) = undefined,
+        resumed: std.Io.Event = .unset,
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            if (timeout == .duration and timeout.duration.raw.nanoseconds == 100 * std.time.ns_per_us) {
+                // Change suspension only after the notification was generated.
+                self.suspended.store(!self.suspended.load(.seq_cst), .seq_cst);
+                self.loop.queue.reopen();
+                self.resumed.set(threaded.io());
+            }
+            return threaded.io().vtable.sleep(userdata, timeout);
+        }
+    };
+    const Case = enum { frame, canceled, input_failure };
+    for (std.enums.values(Case)) |case| {
+        const canceled = case == .canceled;
+        const allocator = std.testing.allocator;
+        var probe: Probe = .{ .threaded = .init(allocator, .{}) };
+        defer probe.threaded.deinit();
+        var io = probe.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.sleep = Probe.sleep;
+        io.vtable = &vtable;
+        var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+        defer requests.deinit();
+        var loop = vaxis.Loop(InternalEvent(TestMsg)).init(io, undefined, undefined);
+        probe.loop = &loop;
+        var suspended: std.atomic.Value(bool) = .init(canceled);
+        probe.suspended = &suspended;
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var frames = FrameRuntime(TestMsg).init(io);
+        defer frames.shutdown();
+        frames.last_frame_ns = 0;
+        loop.queue.close(if (case == .input_failure) error.EndOfStream else error.Closed);
+        requests.frame().request();
+        frames.startRequested(&requests, &loop, &suspended, &shutting_down);
+        if (case == .input_failure) {
+            frames.future.?.await(io);
+            frames.shutdown();
+            try std.testing.expectError(error.EndOfStream, loop.tryEvent());
+            try std.testing.expectEqual(@as(u64, 0), frames.last_frame_ns);
+            try std.testing.expectEqual(@as(u64, 0), frames.next_index);
+            continue;
+        }
+        for (0..2000) |_| {
+            if (probe.resumed.isSet()) break;
+            try probe.threaded.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(probe.resumed.isSet());
+        const event = try nextFrameEvent(&loop, probe.threaded.io());
+        if (canceled) {
+            try std.testing.expect(event == .frame_canceled);
+            frames.receiveCanceled(&requests);
+            try std.testing.expectEqual(@as(u64, 0), frames.last_frame_ns);
+            try std.testing.expectEqual(@as(u64, 0), frames.next_index);
+            try std.testing.expect(requests.takeFrameRequest());
+        } else {
+            const frame = frames.receiveFrame(event.frame);
+            try std.testing.expectEqual(frame.now_ns, frame.delta_ns);
+            try std.testing.expectEqual(@as(u64, 0), frame.index);
+            try std.testing.expectEqual(frame.now_ns, frames.last_frame_ns);
+            try std.testing.expectEqual(@as(u64, 1), frames.next_index);
+        }
+        try std.testing.expectEqual(@as(?InternalEvent(TestMsg), null), try loop.tryEvent());
+    }
+}
+
+test "frame runtime shutdown cancels a producer behind a stopped full queue" {
     const allocator = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{ .concurrent_limit = .limited(1) });
     defer threaded.deinit();
@@ -237,6 +309,7 @@ test "frame runtime shutdown cancels a producer behind a full queue" {
     var frames = FrameRuntime(TestMsg).init(io);
     defer frames.shutdown();
     while (try loop.tryPostEvent(.continue_effect_drain)) {}
+    loop.queue.close(error.Closed);
     frames.last_frame_ns = 0;
     requests.frame().request();
     frames.startRequested(&requests, &loop, &suspended, &shutting_down);
@@ -245,7 +318,9 @@ test "frame runtime shutdown cancels a producer behind a full queue" {
     try std.testing.expect(!frames.in_flight and frames.future == null);
     try std.testing.expectEqual(@as(u64, 0), frames.last_frame_ns);
     try std.testing.expectEqual(@as(u64, 0), frames.next_index);
-    while (try loop.tryEvent()) |event| try std.testing.expect(event == .continue_effect_drain);
+    while (loop.tryEvent() catch null) |event| try std.testing.expect(event == .continue_effect_drain);
+    try std.testing.expectError(error.Closed, loop.tryEvent());
+    loop.queue.reopen();
     // Reusing the only concurrent slot proves that shutdown joined the worker.
     requests.frame().request();
     frames.startRequested(&requests, &loop, &suspended, &shutting_down);

@@ -164,7 +164,7 @@ fn PendingTask(comptime Msg: type) type {
 /// Transfer one worker-produced message without entering vaxis' blocking push.
 ///
 /// The worker keeps the only owner until `tryPostEvent` succeeds. Shutdown or a
-/// queue error returns that owner through the future so the runtime thread can
+/// input error returns that owner through the future so the runtime thread can
 /// dispose it. This makes `.posted` and `.undelivered` mutually exclusive.
 fn transferTaskMessage(
     comptime Msg: type,
@@ -174,8 +174,9 @@ fn transferTaskMessage(
     shutting_down: *const std.atomic.Value(bool),
 ) TaskDelivery(Msg) {
     while (!shutting_down.load(.seq_cst)) {
-        const posted = loop.tryPostEvent(.{ .user_msg = msg }) catch {
-            return .{ .undelivered = msg };
+        const posted = loop.tryPostEvent(.{ .user_msg = msg }) catch |err| switch (err) {
+            error.Closed => false, // Retain ownership across normal stop/start.
+            else => return .{ .undelivered = msg },
         };
         if (posted) return .posted;
         io.sleep(.fromNanoseconds(delivery_retry_ns), .awake) catch {
@@ -375,7 +376,7 @@ test "task reclamation bounds repeated plain and owned tasks results including e
     if (seconds > 0) std.debug.print("task soak: tasks={d}, peak_retained=4, final_retained={d}\n", .{ counts.payloads, tasks.pending.items.len });
 }
 
-test "task reclamation skips running work and shutdown owns only remaining full-queue results" {
+test "task reclamation skips running work and shutdown owns only remaining stopped-queue results" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
@@ -403,6 +404,7 @@ test "task reclamation skips running work and shutdown owns only remaining full-
     while (try loop.tryEvent()) |event| try app.update(event.user_msg, &ctx);
     try std.testing.expectEqual(@as(usize, 2), app.updates);
     while (try loop.tryPostEvent(.continue_effect_drain)) {}
+    loop.queue.close(error.Closed);
     shutting_down.store(true, .seq_cst);
     gate.set(io);
     tasks.requestShutdown();
@@ -412,6 +414,65 @@ test "task reclamation skips running work and shutdown owns only remaining full-
     try std.testing.expectEqual(@as(usize, 0), tasks.pending.items.len);
     try std.testing.expectEqual(@as(usize, 3), counts.payloads);
     try std.testing.expectEqual(@as(usize, 3), counts.contexts.load(.monotonic));
+}
+
+test "task worker retains one result across normal close and reclaims it on input failure" {
+    const Msg = OwnershipTestMsg;
+    const Loop = vaxis.Loop(InternalEvent(Msg));
+    const Resume = struct {
+        threaded: std.Io.Threaded,
+        loop: *Loop = undefined,
+        retries: usize = 0,
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            self.retries += 1;
+            self.loop.queue.reopen();
+            return threaded.io().vtable.sleep(userdata, timeout);
+        }
+    };
+    for ([_]bool{ false, true }) |failure| {
+        const allocator = std.testing.allocator;
+        var probe: Resume = .{ .threaded = .init(allocator, .{}) };
+        defer probe.threaded.deinit();
+        var io = probe.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.sleep = Resume.sleep;
+        io.vtable = &vtable;
+        var requests = requests_mod.Requests(Msg).init(allocator, io);
+        defer requests.deinit();
+        var ctx = ctx_mod.Ctx(Msg).init(&requests);
+        var tasks = TaskRuntime(Msg).init(allocator, io);
+        defer tasks.join(&requests);
+        var completions: RuntimeCompletionBuffer(Msg) = .{};
+        try completions.init(allocator);
+        defer completions.deinitUndelivered(allocator);
+        var loop = Loop.init(io, undefined, undefined);
+        probe.loop = &loop;
+        defer drainTestQueue(Msg, &loop, allocator);
+        try std.testing.expect(try loop.tryPostEvent(.continue_effect_drain));
+        loop.queue.close(if (failure) error.EndOfStream else error.Closed);
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        var counts: ReapingTestTask.Counts = .{};
+        _ = try ctx.task().spawnOwned(try ReapingTestTask.create(&counts), .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
+        try tasks.startPending(&requests, &completions, &loop, &shutting_down);
+        // Await the real supervisor, which owns the worker and its outcome.
+        tasks.join(&requests);
+        try std.testing.expectEqual(@as(usize, 1), counts.runs.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), counts.contexts.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), counts.failures);
+        try std.testing.expectEqual(@as(usize, if (failure) 0 else 1), probe.retries);
+        try std.testing.expect((try loop.tryEvent()).? == .continue_effect_drain);
+        if (failure) {
+            try std.testing.expectError(error.EndOfStream, loop.tryEvent());
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), counts.payloads);
+            var app: ReapingTestTask.App = .{};
+            try app.update((try loop.tryEvent()).?.user_msg, &ctx);
+            try std.testing.expectEqual(@as(?InternalEvent(Msg), null), try loop.tryEvent());
+        }
+        try std.testing.expectEqual(@as(usize, 1), counts.payloads);
+    }
 }
 
 test "task reclamation start failures consume context and payload once" {
@@ -462,7 +523,7 @@ test "task reclamation start failures consume context and payload once" {
     }
 }
 
-test "task cancel and completion races preserve moved results on runtime including full queue" {
+test "task cancel and completion races reclaim moved results with full or closed queues" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
@@ -479,7 +540,9 @@ test "task cancel and completion races preserve moved results on runtime includi
     var counts: ReapingTestTask.Counts = .{};
     for (0..128) |i| {
         const full = i % 3 == 0;
+        const closed = i % 3 == 2;
         if (full) while (try loop.tryPostEvent(.continue_effect_drain)) {};
+        if (closed) loop.queue.close(error.Closed);
         const task = try ReapingTestTask.create(&counts);
         const id = try ctx.task().spawnOwned(task, .{ .run = ReapingTestTask.run, .failed = ReapingTestTask.failed, .cleanup = ReapingTestTask.cleanup });
         try tasks.startPending(ctx.requests, &completions, &loop, &shutting_down);
@@ -489,8 +552,9 @@ test "task cancel and completion races preserve moved results on runtime includi
         ctx.task().requestCancel(id);
         while (!tasks.pending.items[0].completed.load(.acquire)) try std.Thread.yield();
         tasks.reap();
-        if (full) try std.testing.expectEqual(i + 1, counts.payloads);
+        if (full or closed) try std.testing.expectEqual(i + 1, counts.payloads);
         drainTestQueue(Msg, &loop, allocator);
+        if (closed) loop.queue.reopen();
         try std.testing.expectEqual(i + 1, counts.payloads);
         try std.testing.expectEqual(i + 1, counts.contexts.load(.acquire));
         ctx.task().requestCancel(id); // absent after reaping

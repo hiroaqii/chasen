@@ -161,9 +161,12 @@ pub fn postPlainUntilShutdown(
     io: std.Io,
     loop: *vaxis.Loop(InternalEvent(Msg)),
     shutting_down: *const std.atomic.Value(bool),
-) std.Io.Cancelable!void {
+) !void {
     while (!shutting_down.load(.seq_cst)) {
-        const posted = try loop.tryPostEvent(event);
+        const posted = loop.tryPostEvent(event) catch |err| switch (err) {
+            error.Closed => false, // A normal reader stop retains this event.
+            else => return err,
+        };
         if (posted) return;
         try io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake);
     }

@@ -81,6 +81,10 @@ pub fn TerminalSession(comptime Msg: type) type {
             stopLoopReader(&self.loop, self.io);
         }
 
+        pub fn checkInputFailure(self: *Self) !void {
+            try checkLoopInputFailure(&self.loop);
+        }
+
         pub fn stopAndDrain(self: *Self) void {
             stopLoopAndDrain(Msg, &self.loop, self.allocator, self.io);
         }
@@ -163,6 +167,7 @@ pub fn TerminalSession(comptime Msg: type) type {
             suspended.store(true, .seq_cst);
             defer suspended.store(false, .seq_cst);
             stopLoopReader(loop, io);
+            self.checkInputFailure() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
             const saved = modes.snapshot(vx);
             modes.leave(vx, tty.writer(), mouse_policy) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
             const outcome = foreground_job.run(&prepared, terminal, &tty.termios);
@@ -171,7 +176,8 @@ pub fn TerminalSession(comptime Msg: type) type {
             const size = tty.getWinsize() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
             vx.resize(allocator, tty.writer(), size) catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
             useUnicodeWidth(vx);
-            loop.start() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
+            var reader = loopReader(loop, io);
+            reader.start() catch |err| return foreground_job.failure(.restore_tui, @errorName(err));
             vx.queueRefresh();
             return outcome;
         }
@@ -199,9 +205,9 @@ fn ResizePollState(comptime Msg: type) type {
             self.initial = winsize;
         }
 
-        /// Poll outside std.Io's bounded concurrency pool. This preserves the
-        /// supported concurrency-limit-1 configuration, where the vaxis tty
-        /// reader already owns the only std.Io concurrent slot.
+        /// Poll outside std.Io's bounded concurrency pool. The POSIX terminal
+        /// baseline is two slots: libvaxis SIGWINCH handling and its tty reader.
+        /// Joining the reader does not promise immediate backend slot reuse.
         fn run(self: *Self) void {
             var last = self.initial;
             while (!self.stopping.load(.acquire)) {
@@ -322,6 +328,7 @@ fn LoopReader(comptime Loop: type) type {
         }
 
         pub fn start(self: *@This()) !void {
+            try checkLoopInputFailure(self.loop);
             try self.loop.start();
         }
     };
@@ -334,22 +341,25 @@ fn loopReader(loop: anytype, io: std.Io) LoopReader(@TypeOf(loop.*)) {
     };
 }
 
-/// Cancel the already-started vaxis reader future in place.
-///
-/// `vaxis.Loop.stop` wakes the tty with a device-status query and then awaits
-/// the reader. Chasen cannot use that blocking sequence when the reader may be
-/// waiting to push into a full event queue, and allocating a helper future at
-/// shutdown is not total for bounded or non-concurrent `std.Io` instances.
-/// `Future.cancel` instead interrupts both tty reads and queue condition waits,
-/// which are cancellation points in the supported concurrent Io contract.
-/// No second concurrency slot and no terminal DSR response are required.
+/// Inspect the retained reason without consuming buffered events. Restart calls
+/// this after the previous reader has joined, before start reopens the queue.
+fn checkLoopInputFailure(loop: anytype) !void {
+    try loop.queue.lock();
+    defer loop.queue.unlock();
+    if (loop.queue.closed) |err| {
+        if (err != error.Closed) return err;
+    }
+}
+
+/// Join before normal close so a racing input failure can retain its reason.
+/// Cancel interrupts tty reads and full-queue waits without another Io slot.
 fn stopLoopReader(loop: anytype, io: std.Io) void {
-    loop.should_quit = true;
     if (loop.thread) |*future| {
+        if (builtin.os.tag == .windows and !builtin.is_test) loop.tty.interruptInput();
         _ = future.cancel(io);
         loop.thread = null;
     }
-    loop.should_quit = false;
+    loop.queue.close(error.Closed);
 }
 
 pub fn drainInternalEventsForShutdown(
@@ -454,16 +464,16 @@ test "resize poll survives a stopped reader until the next loop turn" {
     };
     const Event = InternalEvent(TestMsg);
 
-    // A foreground handoff stops only the tty reader; the queue and coalesced
-    // state remain live. Publishing while thread is null models a poll during
-    // the child process, before restoreTerminalAfterForeground restarts it.
+    // During foreground execution the queue rejects wakes with Closed, while
+    // the latest coalesced dimensions survive for the next runtime turn.
     var loop = vaxis.Loop(Event).init(std.testing.io, undefined, undefined);
     var resize_poll = ResizePollState(TestMsg).init(undefined, &loop);
+    stopLoopReader(&loop, std.testing.io);
     try std.testing.expect(loop.thread == null);
 
     resize_poll.publish(.{ .rows = 50, .cols = 160, .x_pixel = 1600, .y_pixel = 1000 });
-    const wake = (try loop.tryEvent()).?;
-    try std.testing.expect(wake == .resize_pending);
+    try std.testing.expectError(error.Closed, loop.tryEvent());
+    loop.queue.reopen();
 
     const latest = resize_poll.takeLatest().?;
     try std.testing.expectEqual(@as(u16, 50), latest.rows);
@@ -552,6 +562,40 @@ test "loop reader stop needs no extra concurrency slot on full queue" {
 
     try std.testing.expect(loop.thread == null);
     drainInternalEventsForShutdown(TestMsg, &loop, std.testing.allocator);
+}
+
+test "loop reader refuses restart after failure before or during stop without consuming buffered input" {
+    const Msg = enum {
+        noop,
+        pub const undelivered_policy = .plain;
+    };
+    const Loop = vaxis.Loop(InternalEvent(Msg));
+    const Reader = struct {
+        fn run(loop: *Loop, started: *std.Io.Event, io: std.Io) void {
+            var wait: std.Io.Event = .unset;
+            started.set(io);
+            wait.wait(io) catch {
+                // Deterministically return an input failure during cancel/join.
+                loop.queue.close(error.EndOfStream);
+                return;
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |already_failed| {
+        const io = std.testing.io;
+        var loop = Loop.init(io, undefined, undefined);
+        try std.testing.expect(try loop.tryPostEvent(.{ .key_press = .{ .codepoint = 'q' } }));
+        var started: std.Io.Event = .unset;
+        loop.thread = try io.concurrent(Reader.run, .{ &loop, &started, io });
+        started.waitUncancelable(io);
+        if (already_failed) loop.queue.close(error.EndOfStream);
+        var reader = loopReader(&loop, io);
+        reader.stop();
+        try std.testing.expect(loop.thread == null);
+        try std.testing.expectError(error.EndOfStream, reader.start());
+        try std.testing.expectEqual(@as(u21, 'q'), (try loop.tryEvent()).?.key_press.codepoint);
+        try std.testing.expectError(error.EndOfStream, loop.tryEvent());
+    }
 }
 
 /// Wire ownership, distinct from capability responses in vx.state. This record

@@ -88,6 +88,19 @@ forced resize redraws, and the final stats callback for each turn.
 `chasen.run(init, app)` uses `init.gpa` and `init.io`. For explicit configuration,
 `chasen.runWith` takes `runtime.allocator`, `runtime.io`, and terminal options.
 
+The terminal requires a concurrent `std.Io` whose reads, waits, and sleeps can
+be canceled. With the pinned libvaxis, a POSIX terminal needs at least two
+concurrent slots: one for libvaxis' SIGWINCH handler and one for input. Tasks
+(worker and supervisor), timers, and frames require additional capacity.
+Two slots are the simultaneous terminal baseline. Joining a reader does not
+guarantee that a finite backend can immediately reuse its slot; start/restart
+can still fail with insufficient capacity. Chasen cleans up and returns the
+failure without retrying admission. Use the default Threaded configuration for
+ordinary operation, and allow additional capacity for application work.
+The SIGWINCH future lives from Tty initialization through terminal teardown,
+including foreground commands; stopping the input reader joins only that reader.
+Keep the Io alive until `runWith` returns and all terminal cleanup has finished.
+
 The runtime allocator is shared by the runtime thread, application callbacks
 (through `ctx.allocator()`), and task workers. Choose an allocator whose
 implementation and configuration support concurrent allocation and freeing.

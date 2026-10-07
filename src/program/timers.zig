@@ -375,6 +375,66 @@ test "timer runtime shutdown cancels notice producers behind a full queue" {
     }
 }
 
+test "timer generated notices survive normal close and input failure ends the worker" {
+    const Probe = struct {
+        threaded: std.Io.Threaded,
+        loop: *vaxis.Loop(InternalEvent(TestMsg)) = undefined,
+        suspended: *std.atomic.Value(bool) = undefined,
+        resumed: std.Io.Event = .unset,
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            if (timeout == .duration and timeout.duration.raw.nanoseconds == 100 * std.time.ns_per_us) {
+                self.suspended.store(true, .seq_cst);
+                self.loop.queue.reopen();
+                self.resumed.set(threaded.io());
+            }
+            return threaded.io().vtable.sleep(userdata, timeout);
+        }
+    };
+    const Case = enum { tick, every, input_failure };
+    for (std.enums.values(Case)) |case| {
+        const failure = case == .input_failure;
+        const allocator = std.testing.allocator;
+        var probe: Probe = .{ .threaded = .init(allocator, .{}) };
+        defer probe.threaded.deinit();
+        var io = probe.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.sleep = Probe.sleep;
+        io.vtable = &vtable;
+        var requests = requests_mod.Requests(TestMsg).init(allocator, io);
+        defer requests.deinit();
+        var timers = TimerRuntime(TestMsg).init(allocator, io);
+        defer timers.shutdown();
+        var hooks: TestHooks = .{ .after_wake = &probe.resumed };
+        if (failure) timers.test_hooks = &hooks;
+        var completions: types.RuntimeCompletionBuffer(TestMsg) = .{};
+        try completions.init(allocator);
+        defer completions.deinitUndelivered(allocator);
+        var loop = vaxis.Loop(InternalEvent(TestMsg)).init(io, undefined, undefined);
+        probe.loop = &loop;
+        var suspended: std.atomic.Value(bool) = .init(false);
+        probe.suspended = &suspended;
+        var shutting_down: std.atomic.Value(bool) = .init(false);
+        try std.testing.expect(try loop.tryPostEvent(.continue_effect_drain));
+        loop.queue.close(if (failure) error.EndOfStream else error.Closed);
+        if (case != .tick) try requests.timer().every("retained", 1, .replacement, TestMsg.notify) else try requests.timer().tick("retained", 0, .replacement, TestMsg.notify);
+        try timers.startTicks(&requests, &completions, &loop, &shutting_down);
+        try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
+        try waitForTestEvent(&probe.resumed, probe.threaded.io());
+        try std.testing.expect((try loop.tryEvent()).? == .continue_effect_drain);
+        if (failure) {
+            try std.testing.expectError(error.EndOfStream, loop.tryEvent());
+            timers.reapCompleted();
+            try std.testing.expectEqual(@as(usize, 0), timers.running.items.len);
+            continue;
+        }
+        try expectReplacement(&loop, probe.threaded.io());
+        timers.shutdown();
+        while (try loop.tryEvent()) |event| try std.testing.expect(event == .timers_completed);
+    }
+}
+
 test "timer full-queue retry cancellation ends every before cancel or replacement returns" {
     const RetryProbe = struct {
         threaded: std.Io.Threaded,
@@ -407,8 +467,8 @@ test "timer full-queue retry cancellation ends every before cancel or replacemen
             return threaded.io().vtable.sleep(userdata, timeout);
         }
     };
-    const Action = enum { cancel, every, tick };
-    for ([_]Action{ .cancel, .every, .tick }) |action| {
+    const Action = enum { cancel, every, tick, closed_cancel };
+    for ([_]Action{ .cancel, .every, .tick, .closed_cancel }) |action| {
         const allocator = std.testing.allocator;
         var probe: RetryProbe = .{ .threaded = .init(allocator, .{}) };
         defer probe.threaded.deinit();
@@ -436,6 +496,7 @@ test "timer full-queue retry cancellation ends every before cancel or replacemen
         try std.testing.expect(try loop.tryPostEvent(.{ .timer_notification = .{ .notice = .old, .notify = TestMsg.notify } }));
         var queued: usize = 1;
         while (try loop.tryPostEvent(.continue_effect_drain)) queued += 1;
+        if (action == .closed_cancel) loop.queue.close(error.Closed);
         try requests.timer().every("full", 1, .old, TestMsg.notify);
         try timers.startEvery(&requests, &completions, &loop, &suspended, &shutting_down);
         try waitForTestEvent(&probe.entered, io);
@@ -445,7 +506,7 @@ test "timer full-queue retry cancellation ends every before cancel or replacemen
         timers.io = io;
         timers.test_hooks = null;
         switch (action) {
-            .cancel => {
+            .cancel, .closed_cancel => {
                 try requests.timer().cancel("full");
                 timers.cancelPending(&requests);
             },
@@ -463,11 +524,12 @@ test "timer full-queue retry cancellation ends every before cancel or replacemen
         try std.testing.expect(old_completed.isSet());
         try std.testing.expect(!shutting_down.load(.seq_cst));
         try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
-        try std.testing.expectEqual(@as(usize, if (action == .cancel) 0 else 1), timers.running.items.len);
+        try std.testing.expectEqual(@as(usize, if (action == .cancel or action == .closed_cancel) 0 else 1), timers.running.items.len);
         const old = (try loop.tryEvent()).?.timer_notification;
         try std.testing.expectEqual(TestMsg.TimerNotice.old, old.message(.fired, allocator).?.fired);
         for (1..queued) |_| try std.testing.expect((try loop.tryEvent()).? == .continue_effect_drain);
-        if (action != .cancel) {
+        if (action == .closed_cancel) try std.testing.expectError(error.Closed, loop.tryEvent());
+        if (action == .every or action == .tick) {
             try expectReplacement(&loop, io);
             try requests.timer().cancel("full");
             timers.cancelPending(&requests);

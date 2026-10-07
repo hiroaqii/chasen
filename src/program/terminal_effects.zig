@@ -29,7 +29,10 @@ pub const TerminalEffects = struct {
                 return runner.session.runForeground(entry);
             }
         };
-        return processPendingForegroundCommandsWithRunner(App, app, ctx, session.allocator, session.io, stats, opts, Runner{ .session = session });
+        return processPendingForegroundCommandsWithRunner(App, app, ctx, session.allocator, session.io, stats, opts, Runner{ .session = session }) catch |err| {
+            try session.checkInputFailure();
+            return err;
+        };
     }
 
     pub fn processClipboard(self: *TerminalEffects, comptime App: type, app: *App, ctx: *ctx_mod.Ctx(App.Msg), session: *TerminalSession(App.Msg), stats: *?runtime.RuntimeStats, opts: types.RunOptions) !bool {

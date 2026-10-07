@@ -41,6 +41,8 @@ const App = struct {
     executable: []const u8,
     mode: []const u8,
     count: usize = 0,
+    input_failure: ?*InputFailure = null,
+    cleaned: ?*bool = null,
     pub const Msg = union(enum) {
         pub const undelivered_policy = .plain;
         run,
@@ -48,8 +50,13 @@ const App = struct {
         quit,
         done: chasen.ForegroundCommandResult,
     };
-    pub fn init(_: *App, _: *chasen.Ctx(Msg)) !void {
+    pub fn init(self: *App, _: *chasen.Ctx(Msg)) !void {
+        if (std.mem.eql(u8, self.mode, "init-failure")) return error.ExpectedInitFailure;
+        if (self.input_failure) |fault| fault.armed.store(true, .release);
         marker("\nREADY\n", .{});
+    }
+    pub fn deinit(self: *App, _: chasen.AppDeinitContext) void {
+        if (self.cleaned) |cleaned| cleaned.* = true;
     }
     pub fn handleEvent(_: *App, event: chasen.Event) ?Msg {
         return switch (event) {
@@ -63,6 +70,11 @@ const App = struct {
         };
     }
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.input_failure) |fault| {
+            // The real reader has returned EOF before quit/foreground can stop
+            // it. Joining must retain that reason, even with this queued key.
+            if (fault.buffered and (msg == .run or msg == .quit)) try fault.failure_read.wait(ctx.io());
+        }
         switch (msg) {
             .run => {
                 if (std.mem.eql(u8, self.mode, "cwd-env")) {
@@ -282,10 +294,11 @@ fn runCase(executable: [:0]const u8, mode: [:0]const u8, enhanced: bool, resize_
         }
         if (len == output.len) return error.ExcessiveOutput;
         try wire.consume(master, output[0..len], resize_response);
+        if (std.mem.indexOf(u8, output[0..len], "FAILURE-CLEAN") != null) phase = .done;
         const recent = output[phase_start..len];
         switch (phase) {
             .ready => if (std.mem.indexOf(u8, recent, "READY") != null) {
-                try write(master, "r");
+                try write(master, if (std.mem.eql(u8, mode, "quit-failure")) "q" else "r");
                 phase = .child;
                 phase_start = len;
             },
@@ -365,7 +378,47 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--child")) runChild(args[2]);
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--app")) {
-        try chasen.runWith(.{ .runtime = .{ .allocator = init.gpa, .io = init.io }, .terminal = .{ .env_map = init.environ_map, .mouse = true, .keyboard_protocol = if (std.mem.eql(u8, args[3], "kitty")) .kitty else .legacy } }, App{ .executable = args[0], .mode = args[2] });
+        const original = try std.posix.tcgetattr(0);
+        if (std.mem.eql(u8, args[2], "exit") and std.mem.eql(u8, args[3], "legacy")) {
+            for (0..2) |limit| {
+                var small: std.Io.Threaded = .init(init.gpa, .{ .concurrent_limit = .limited(limit) });
+                defer small.deinit();
+                if (chasen.runWith(.{ .runtime = .{ .allocator = init.gpa, .io = small.io() }, .terminal = .{ .env_map = init.environ_map } }, App{ .executable = args[0], .mode = "init-failure" })) |_| {
+                    return error.ExpectedCapacityFailure;
+                } else |err| if (err != error.ConcurrencyUnavailable) return err;
+                if (!std.meta.eql(original, try std.posix.tcgetattr(0))) return error.TermiosLeaked;
+                try expectFreeSlots(small.io(), limit);
+            }
+        }
+        const fail_restart = std.mem.eql(u8, args[2], "restart-failure");
+        const buffered_failure = std.mem.eql(u8, args[2], "quit-failure") or std.mem.eql(u8, args[2], "foreground-failure");
+        var probe: InputFailure = .{
+            .threaded = .init(init.gpa, .{ .concurrent_limit = if (fail_restart) .limited(2) else .unlimited }),
+            .fail_restart = fail_restart,
+            .buffered = buffered_failure,
+        };
+        defer probe.threaded.deinit();
+        var io = probe.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.operate = InputFailure.operate;
+        vtable.concurrent = InputFailure.concurrent;
+        io.vtable = &vtable;
+        var cleaned = false;
+        const fail_input = std.mem.eql(u8, args[2], "input-failure") or buffered_failure;
+        const result = chasen.runWith(.{ .runtime = .{ .allocator = init.gpa, .io = io }, .terminal = .{ .env_map = init.environ_map, .mouse = true, .keyboard_protocol = if (std.mem.eql(u8, args[3], "kitty")) .kitty else .legacy } }, App{ .executable = args[0], .mode = args[2], .input_failure = if (fail_input) &probe else null, .cleaned = &cleaned });
+        if (fail_restart) {
+            if (result) |_| return error.ExpectedRestartFailure else |err| if (err != error.ConcurrencyUnavailable) return err;
+            if (probe.admissions != 3 or cleaned) return error.WrongFailureBoundary;
+        } else if (fail_input) {
+            if (result) |_| return error.ExpectedInputFailure else |err| if (err != error.EndOfStream) return err;
+        } else try result;
+        if (!fail_restart and !cleaned) return error.AppNotCleaned;
+        if (!std.meta.eql(original, try std.posix.tcgetattr(0))) return error.TermiosLeaked;
+        // Limit the same backend after return so leaked resident futures cannot
+        // hide behind the default unlimited admission used for normal restarts.
+        probe.threaded.concurrent_limit = .limited(2);
+        try expectFreeSlots(probe.threaded.io(), 2);
+        if (fail_input or fail_restart) marker("\nFAILURE-CLEAN\n", .{});
         return;
     }
     if (c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) return error.SubreaperFailed;
@@ -379,5 +432,67 @@ pub fn main(init: std.process.Init) !void {
         for ([_]bool{ false, true }) |enhanced| try runCase(executable, mode, enhanced, enhanced, cwd);
     }
     try runCase(executable, "cwd-env", false, false, cwd);
-    std.debug.print("foreground PTY: 11 cases / 22 commands passed (including renamed cwd, closed caller and empty env)\n", .{});
+    for ([_][:0]const u8{ "input-failure", "quit-failure", "foreground-failure", "restart-failure" }) |mode| try runCase(executable, mode, false, false, cwd);
+    std.debug.print("foreground PTY: 15 cases / 22 commands passed (capacity failures, EOF/quit/foreground error return, cleanup and slot reuse)\n", .{});
+}
+
+// Inject EOF after startup at the real tty read boundary, leaving the signal
+// pipe and libvaxis reader/error propagation/teardown paths intact.
+const InputFailure = struct {
+    threaded: std.Io.Threaded,
+    armed: std.atomic.Value(bool) = .init(false),
+    buffered: bool = false,
+    next_eof: bool = false, // Reader-owned; preserves one real key before EOF.
+    failure_read: std.Io.Event = .unset,
+    fail_restart: bool = false,
+    admissions: usize = 0, // Only the runtime thread admits these terminal futures.
+    fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+        const self: *@This() = @fieldParentPtr("threaded", threaded);
+        self.admissions += 1;
+        // Signal owner, initial reader, then query restart. This proof must not
+        // depend on Threaded's scheduling-dependent busy_count release timing.
+        if (self.fail_restart and self.admissions == 3) return error.ConcurrencyUnavailable;
+        return threaded.io().vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+    }
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
+        const self: *@This() = @fieldParentPtr("threaded", threaded);
+        const tty_read = operation == .file_read_streaming and c.isatty(operation.file_read_streaming.file.handle) == 1;
+        if (tty_read and self.next_eof) {
+            self.failure_read.set(threaded.io());
+            return .{ .file_read_streaming = 0 };
+        }
+        const result = try threaded.io().vtable.operate(userdata, operation);
+        if (tty_read and self.armed.load(.acquire)) {
+            if (self.buffered) self.next_eof = true else return .{ .file_read_streaming = 0 };
+        }
+        return result;
+    }
+};
+
+fn expectFreeSlots(io: std.Io, count: usize) !void {
+    const Probe = struct {
+        fn run(gate: *std.Io.Event, worker_io: std.Io) void {
+            gate.wait(worker_io) catch {};
+        }
+    };
+    var gate: std.Io.Event = .unset;
+    var futures: [2]?std.Io.Future(void) = .{ null, null };
+    defer {
+        gate.set(io);
+        for (&futures) |*future| if (future.*) |*f| f.await(io);
+    }
+    for (futures[0..count]) |*future| {
+        // Threaded may release busy_count just after publishing a Future result.
+        // Bound that backend scheduling lag while requiring simultaneous slots.
+        for (0..2000) |_| {
+            future.* = io.concurrent(Probe.run, .{ &gate, io }) catch {
+                try io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            };
+            break;
+        }
+        if (future.* == null) return error.ConcurrentSlotLeaked;
+    }
 }

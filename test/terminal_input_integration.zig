@@ -70,12 +70,7 @@ const PtyFixture = struct {
     }
 
     fn deinit(self: *PtyFixture) void {
-        self.loop.should_quit = true;
-        if (self.loop.thread) |*future| {
-            _ = future.cancel(self.io);
-            self.loop.thread = null;
-        }
-        self.loop.should_quit = false;
+        self.loop.stop();
         self.tty.deinit();
         self.master.close(self.io);
     }
