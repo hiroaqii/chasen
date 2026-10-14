@@ -264,8 +264,8 @@ test "runtime completion holds task16 tick8 every8 image8 failures with full que
         pub fn update(self: *@This(), msg: TestMsg, ctx: *ctx_mod.Ctx(TestMsg)) !void {
             if (self.total == 0) try std.testing.expectEqual(@as(usize, 40), self.completions.items.items.len);
             self.total += 1;
-            self.counts[@intFromEnum(msg)] += 1;
-            if (msg == .tick_failed and self.counts[@intFromEnum(msg)] == 1)
+            self.counts[@backingInt(msg)] += 1;
+            if (msg == .tick_failed and self.counts[@backingInt(msg)] == 1)
                 try ctx.timer().tick("followup", 0, .followup, Callbacks.timer);
         }
     };

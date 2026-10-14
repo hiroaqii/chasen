@@ -29,7 +29,7 @@ pub const TraceEvent = enum {
 pub const TraceFn = *const fn (context: ?*anyopaque, event: TraceEvent) void;
 
 test "TraceEvent exposes lifecycle boundaries" {
-    try std.testing.expectEqual(@as(usize, 13), @typeInfo(TraceEvent).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 13), @typeInfo(TraceEvent).@"enum".field_names.len);
     try std.testing.expectEqualStrings("startup", @tagName(TraceEvent.startup));
     try std.testing.expectEqualStrings("render_end", @tagName(TraceEvent.render_end));
 }

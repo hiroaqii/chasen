@@ -230,7 +230,7 @@ pub fn Requests(comptime Msg: type) type {
             pub fn spawnOwned(self: TaskEffects, context: anytype, comptime opts: anytype) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
                 const Pointer = @TypeOf(context);
                 comptime {
-                    if (@typeInfo(Pointer) != .pointer or @typeInfo(Pointer).pointer.size != .one or @typeInfo(Pointer).pointer.is_const)
+                    if (@typeInfo(Pointer) != .pointer or @typeInfo(Pointer).pointer.size != .one or @typeInfo(Pointer).pointer.attrs.@"const")
                         @compileError("task context must be a mutable single-item pointer");
                 }
                 const Adapter = struct {
@@ -258,7 +258,7 @@ pub fn Requests(comptime Msg: type) type {
             fn enqueue(self: TaskEffects, callbacks: Callbacks) error{ TaskLimitExceeded, TaskIdExhausted }!TaskId {
                 if (self.requests._pending_tasks_len >= max_tasks) return error.TaskLimitExceeded;
                 if (self.requests._next_task_id == 0) return error.TaskIdExhausted;
-                const id: TaskId = @enumFromInt(self.requests._next_task_id);
+                const id: TaskId = @fromBackingInt(@intCast(self.requests._next_task_id));
                 self.requests._next_task_id +%= 1;
                 self.requests._pending_tasks[self.requests._pending_tasks_len] = TaskEntry.init(id, callbacks);
                 self.requests._pending_tasks_len += 1;
@@ -1814,7 +1814,7 @@ test "task shared admission limit and exhausted identities preserve caller owner
     try std.testing.expectEqual(@as(usize, 6), cleanups);
     ctx._next_task_id = std.math.maxInt(u64);
     const last = try ctx.task().spawnOwned(&cleanups, opts);
-    try std.testing.expectEqual(std.math.maxInt(u64), @intFromEnum(last));
+    try std.testing.expectEqual(std.math.maxInt(u64), @backingInt(last));
     try std.testing.expectError(error.TaskIdExhausted, ctx.task().spawnOwned(&cleanups, opts));
     ctx.discardPendingTasks();
     try std.testing.expectEqual(@as(usize, 7), cleanups);

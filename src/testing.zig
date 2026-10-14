@@ -555,8 +555,8 @@ test "task reset and explicit discard share ownership and preserve identity" {
         const capture = try std.testing.allocator.create(Capture);
         capture.* = .{ .cleanups = &count };
         const id = try tc.ctx.task().spawnOwned(capture, .{ .run = Capture.run, .failed = Capture.failed, .cleanup = Capture.cleanup });
-        try std.testing.expect(@intFromEnum(id) > previous);
-        previous = @intFromEnum(id);
+        try std.testing.expect(@backingInt(id) > previous);
+        previous = @backingInt(id);
         if (i == 0) tc.resetTransient() else tc.discardPendingTasks();
         try std.testing.expectEqual(i + 1, count);
     }

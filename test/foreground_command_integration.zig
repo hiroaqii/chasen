@@ -2,22 +2,7 @@
 //! production foreground commands execute their requested argv directly.
 const std = @import("std");
 const chasen = @import("chasen");
-const c = @cImport({
-    @cInclude("pty.h");
-    @cInclude("errno.h");
-    @cInclude("sys/resource.h");
-    @cInclude("unistd.h");
-    @cInclude("signal.h");
-    @cInclude("sys/wait.h");
-    @cInclude("sys/prctl.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("poll.h");
-    @cInclude("fcntl.h");
-    @cInclude("time.h");
-    @cInclude("stdlib.h");
-    @cInclude("stdio.h");
-    @cInclude("sys/stat.h");
-});
+const c = @import("linux_test_c");
 extern "c" var environ: [*:null]?[*:0]u8;
 
 fn write(fd: c_int, bytes: []const u8) !void {
@@ -80,8 +65,8 @@ const App = struct {
                 if (std.mem.eql(u8, self.mode, "cwd-env")) {
                     var original_buf: [64]u8 = undefined;
                     var renamed_buf: [64]u8 = undefined;
-                    const original = try std.fmt.bufPrintZ(&original_buf, "original-{d}", .{self.count});
-                    const renamed = try std.fmt.bufPrintZ(&renamed_buf, "renamed-{d}", .{self.count});
+                    const original = try std.fmt.bufPrintSentinel(&original_buf, "original-{d}", .{self.count}, 0);
+                    const renamed = try std.fmt.bufPrintSentinel(&renamed_buf, "renamed-{d}", .{self.count}, 0);
                     if (c.mkdir(original, 0o700) != 0) return error.CwdSetupFailed;
                     const fd = c.open(original, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
                     if (fd < 0) return error.CwdSetupFailed;

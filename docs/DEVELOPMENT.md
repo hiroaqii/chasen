@@ -1,6 +1,6 @@
 # Development and Testing
 
-Use Zig 0.16.0 and a repository checkout. The fetched library package excludes
+Use Zig 0.17.0 and a repository checkout. The fetched library package excludes
 `examples/` and `docs/`; run development commands from the cloned repository.
 Interactive examples need a terminal. Automated Linux PTY tests create their own
 pseudo terminals and do not need an interactive CI session.
@@ -75,7 +75,7 @@ The test resolves its own executable to an absolute path before changing cwd.
 
 macOS `zig build test` does not execute these Linux-only integration gates. To
 check their runtime behavior before pushing, use a Linux VM or container with
-Zig 0.16.0, procfs, and working PTYs, then run the same commands there. GitHub
+Zig 0.17.0, procfs, and working PTYs, then run the same commands there. GitHub
 Actions is one such environment, not a requirement of the tests.
 
 ## Focused and Cross-Compilation Checks
@@ -112,7 +112,7 @@ zig build check-osc52-ownership -Dtarget=aarch64-macos
 ## CI Coverage
 
 [CI configuration](../.github/workflows/ci.yml) runs independent jobs on
-`ubuntu-24.04` and `macos-26` with Zig 0.16.0. The matrix uses `fail-fast: false`,
+`ubuntu-24.04` and `macos-26` with Zig 0.17.0. The matrix uses `fail-fast: false`,
 so a failure on one OS does not cancel the other job. Both jobs run:
 
 1. `zig build test --summary all`, with `TMPDIR` set to `${{ runner.temp }}`
