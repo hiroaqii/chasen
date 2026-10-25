@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const module_options: std.Build.Module.CreateOptions = .{
+    const mod = b.addModule("chasen", .{
         .root_source_file = b.path("src/root.zig"),
         .optimize = optimize,
         .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
@@ -22,8 +22,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
-    };
-    const mod = b.addModule("chasen", module_options);
+    });
 
     const runtime_mod = b.addModule("chasen_runtime", .{
         .root_source_file = b.path("src/runtime.zig"),
@@ -131,16 +130,8 @@ pub fn build(b: *std.Build) void {
     const io_threaded_check_step = b.step("check-io-threaded", "Run the std.Io.Threaded smoke test");
     io_threaded_check_step.dependOn(&run_io_threaded_check.step);
 
-    const linux_test_c = if (target.result.os.tag == .linux) b.addTranslateC(.{
-        .root_source_file = b.path("test/linux_test.h"),
-        .target = target,
-        .optimize = optimize,
-    }).createModule() else null;
-    // Keep Linux fixture imports out of the public consumer module.
-    const test_mod = b.createModule(module_options);
-    if (linux_test_c) |c| test_mod.addImport("linux_test_c", c);
     const mod_tests = b.addTest(.{
-        .root_module = test_mod,
+        .root_module = mod,
         .use_llvm = true,
         .use_lld = if (target.result.os.tag == .linux) true else null,
         .filters = test_filters,
@@ -299,7 +290,6 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "vaxis", .module = vaxis.module("vaxis") },
-                    .{ .name = "linux_test_c", .module = linux_test_c.? },
                 },
             }),
             .use_llvm = true,
@@ -324,10 +314,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                .imports = &.{
-                    .{ .name = "chasen", .module = mod },
-                    .{ .name = "linux_test_c", .module = linux_test_c.? },
-                },
+                .imports = &.{.{ .name = "chasen", .module = mod }},
             }),
             .use_llvm = true,
             .use_lld = if (target.result.os.tag == .linux) true else null,

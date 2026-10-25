@@ -85,7 +85,7 @@ pub fn TaskRuntime(comptime Msg: type) type {
                     continue;
                 }
                 // The helper has finished its work, but the backend may still be
-                // completing its Future. Join before reading the result or freeing
+                // storing its return value. Join before reading the result or freeing
                 // the stable node that carries the completion flag.
                 const task = self.pending.swapRemove(index);
                 task.awaitAndDestroy(self.allocator, self.io);
@@ -98,7 +98,7 @@ pub fn TaskRuntime(comptime Msg: type) type {
         }
 
         /// Called after requestShutdown. Only supervisors own worker Futures;
-        /// joining them makes worker results safe to reclaim on this runtime thread.
+        /// joining them returns undelivered messages to this runtime thread.
         pub fn join(self: *Self, requests: *requests_mod.Requests(Msg)) void {
             for (self.pending.items) |task| task.awaitAndDestroy(self.allocator, self.io);
             self.pending.deinit(self.allocator);
@@ -121,17 +121,8 @@ fn PendingTask(comptime Msg: type) type {
         const Self = @This();
 
         id: requests_mod.TaskId = undefined,
-        // TODO(zig-0.17-future-alignment): Zig 0.17.0's Io.Threaded.Future.create
-        // can underallocate result storage when its alignment exceeds the Future's
-        // alignment (e.g. a 16-byte-aligned Msg on x86_64). Keep both Futures void
-        // and store the result in this allocator-aligned, stable node instead.
-        // Revisit after Zig fixes result padding and the large-aligned-result
-        // regression below passes without this workaround.
-        future: std.Io.Future(void) = undefined,
-        worker: ?std.Io.Future(void) = null,
-        // Written only by the worker; read only after joining the supervisor,
-        // which joins the worker. Worker admission/run failure leaves .none.
-        delivery: TaskDelivery(Msg) = .none,
+        future: std.Io.Future(TaskDelivery(Msg)) = undefined,
+        worker: ?std.Io.Future(TaskDelivery(Msg)) = null,
         published: std.Io.Event = .unset,
         wake: std.Io.Event = .unset,
         cancel_requested: std.atomic.Value(bool) = .init(false),
@@ -149,19 +140,19 @@ fn PendingTask(comptime Msg: type) type {
             self.wake.set(io);
         }
 
-        fn supervise(self: *Self, io: std.Io) void {
+        fn supervise(self: *Self, io: std.Io) TaskDelivery(Msg) {
             defer self.completed.store(true, .release);
             // Runtime never cancels this supervisor. Publication must happen
             // even after worker admission failure, before runtime can unwind.
             self.published.waitUncancelable(io);
-            const worker = if (self.worker) |*worker| worker else return;
+            const worker = if (self.worker) |*worker| worker else return .none;
             self.wake.waitUncancelable(io);
-            if (self.cancel_requested.load(.acquire)) worker.cancel(io) else worker.await(io);
+            return if (self.cancel_requested.load(.acquire)) worker.cancel(io) else worker.await(io);
         }
 
         fn awaitAndDestroy(self: *Self, allocator: std.mem.Allocator, io: std.Io) void {
-            self.future.await(io);
-            switch (self.delivery) {
+            var outcome = self.future.await(io);
+            switch (outcome) {
                 .none, .posted => {},
                 .undelivered => |*msg| runtime.deinitUndeliveredMessage(Msg, msg, allocator),
             }
@@ -173,7 +164,7 @@ fn PendingTask(comptime Msg: type) type {
 /// Transfer one worker-produced message without entering vaxis' blocking push.
 ///
 /// The worker keeps the only owner until `tryPostEvent` succeeds. Shutdown or a
-/// input error leaves that owner in the stable task node so the runtime thread can
+/// input error returns that owner through the future so the runtime thread can
 /// dispose it. This makes `.posted` and `.undelivered` mutually exclusive.
 fn transferTaskMessage(
     comptime Msg: type,
@@ -206,10 +197,10 @@ fn SpawnHelper(comptime Msg: type) type {
             loop_ptr: *vaxis.Loop(InternalEvent(Msg)),
             shutting_down: *const std.atomic.Value(bool),
             pending: *PendingTask(Msg),
-        ) void {
+        ) TaskDelivery(Msg) {
             defer pending.wake.set(spawn_io);
-            const msg = task.run(alloc, spawn_io) catch return;
-            pending.delivery = transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
+            const msg = task.run(alloc, spawn_io) catch return .none;
+            return transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
         }
     };
 }
@@ -733,88 +724,6 @@ test "task pending cancel quit and unwind discard contexts without failure messa
         try std.testing.expectEqual(@as(usize, 1), cleanups);
         try std.testing.expectEqual(@as(usize, 0), ctx.requests.detachTasks().len);
     }
-}
-
-test "task runtime preserves large aligned results through delivery cancellation and shutdown" {
-    const Msg = struct {
-        owned: OwnershipTestPayload,
-        padding: [1472]u8 align(16) = @splat(0xa5),
-
-        pub const undelivered_policy = .deinit;
-
-        pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
-            std.debug.assert(std.mem.allEqual(u8, &self.padding, 0xa5));
-            var original: OwnershipTestMsg = .{ .owned = self.owned };
-            original.deinitUndelivered(allocator);
-            self.* = undefined;
-        }
-    };
-    const Task = struct {
-        fn run(task: *ReapingTestTask, allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
-            const original = try task.run(allocator, io);
-            return .{ .owned = original.owned };
-        }
-        fn failed(task: *ReapingTestTask, reason: ctx_mod.TaskStartError, allocator: std.mem.Allocator) Msg {
-            return .{ .owned = task.failed(reason, allocator).owned };
-        }
-    };
-
-    // Match ReleaseSafe's allocator even when this test runs in Debug. Its
-    // tightly packed allocations expose an undersized, 8-byte-aligned Future.
-    var safe = std.heap.SafeAllocator.init(std.heap.page_allocator, .{
-        .stack_trace_frames = 0,
-        .check_write_after_free = false,
-    });
-    defer std.debug.assert(safe.deinit() == 0);
-    var threaded: std.Io.Threaded = .init(safe.allocator(), .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const allocator = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 16), @alignOf(Msg));
-    var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
-    var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
-    var tasks = TaskRuntime(Msg).init(allocator, io);
-    defer tasks.join(ctx.requests);
-    tasks.bind(ctx.requests);
-    var completions: RuntimeCompletionBuffer(Msg) = .{};
-    try completions.init(allocator);
-    defer completions.deinitUndelivered(allocator);
-    var loop = vaxis.Loop(InternalEvent(Msg)).init(io, undefined, undefined);
-    var shutting_down: std.atomic.Value(bool) = .init(false);
-    var counts: ReapingTestTask.Counts = .{};
-    for (0..32) |i| {
-        const full = i % 4 == 1;
-        const stopped = i % 4 == 2;
-        const failed = i % 4 == 3;
-        if (full) while (try loop.tryPostEvent(.continue_effect_drain)) {};
-        if (stopped) loop.queue.close(error.Closed);
-        if (failed) loop.queue.close(error.EndOfStream);
-        const task = try ReapingTestTask.create(&counts);
-        const id = try ctx.task().spawnOwned(task, .{
-            .run = Task.run,
-            .failed = Task.failed,
-            .cleanup = ReapingTestTask.cleanup,
-        });
-        try tasks.startPending(ctx.requests, &completions, &loop, &shutting_down);
-        if (full) ctx.task().requestCancel(id);
-        if (stopped) {
-            shutting_down.store(true, .seq_cst);
-            tasks.requestShutdown();
-        }
-        while (!tasks.pending.items[0].completed.load(.acquire)) try std.Thread.yield();
-        tasks.reap();
-        try std.testing.expectEqual(@as(usize, 0), tasks.pending.items.len);
-        // Only successfully posted messages remain owned by the queue.
-        try std.testing.expectEqual(i + @intFromBool(full or stopped or failed), counts.payloads);
-        drainTestQueue(Msg, &loop, allocator);
-        try std.testing.expectEqual(i + 1, counts.payloads);
-        try std.testing.expectEqual(i + 1, counts.contexts.load(.acquire));
-        if (stopped or failed) loop.queue.reopen();
-        shutting_down.store(false, .seq_cst);
-    }
-    try std.testing.expectEqual(@as(usize, 32), counts.runs.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), counts.failures);
-    try std.testing.expectEqual(@as(usize, 0), completions.items.items.len);
 }
 
 test "SpawnHelper instantiation" {

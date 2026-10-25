@@ -1,7 +1,9 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-const c = @import("linux_test_c");
+const c = @cImport({
+    @cInclude("pty.h");
+});
 
 const read_buffer_len = 1024;
 const filler_key: u21 = 'x';

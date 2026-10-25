@@ -29,7 +29,7 @@ pub fn failure(stage: Stage, name: []const u8) Outcome {
     return .{ .failed = .{ .stage = stage, .error_name = name } };
 }
 fn errno() c.E {
-    return @fromBackingInt(@intCast(c._errno().*));
+    return @enumFromInt(c._errno().*);
 }
 fn osFailure(stage: Stage) Outcome {
     return failure(stage, @tagName(errno()));
@@ -73,7 +73,7 @@ pub const Prepared = struct {
         } else {
             const inherited = if (darwin) _NSGetEnviron().* else environ;
             var i: usize = 0;
-            while (inherited[i]) |value| : (i += 1) try env.append(a, (try a.dupeSentinel(u8, std.mem.span(value), 0)).ptr);
+            while (inherited[i]) |value| : (i += 1) try env.append(a, (try a.dupeZ(u8, std.mem.span(value))).ptr);
         }
         const env_z = try a.allocSentinel(?[*:0]const u8, env.items.len, null);
         @memcpy(env_z, env.items);
@@ -85,9 +85,9 @@ pub const Prepared = struct {
             var dirs = std.mem.splitScalar(u8, path, ':');
             while (dirs.next()) |dir| try candidates.append(a, try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ if (dir.len == 0) "." else dir, argv[0] }, 0));
         }
-        var signals: [signal_bound]bool = @splat(false);
+        var signals = [_]bool{false} ** signal_bound;
         if (!darwin) for (1..signal_bound) |i| {
-            const sig: c.SIG = @fromBackingInt(@intCast(i));
+            const sig: c.SIG = @enumFromInt(i);
             if (sig == .KILL or sig == .STOP) continue;
             var action: c.Sigaction = undefined;
             if (c.sigaction(sig, null, &action) == 0) signals[i] = true else if (errno() != .INVAL) return error.SignalQueryFailed;
@@ -157,7 +157,7 @@ pub const Prepared = struct {
 };
 fn zString(a: std.mem.Allocator, value: []const u8) ![:0]const u8 {
     if (std.mem.indexOfScalar(u8, value, 0) != null) return error.EmbeddedNul;
-    return a.dupeSentinel(u8, value, 0);
+    return a.dupeZ(u8, value);
 }
 
 pub const Terminal = struct {
@@ -272,7 +272,7 @@ pub fn checkSupport() !void {
 fn linuxChecked(result: usize) bool {
     const err = std.os.linux.errno(result);
     if (err != .SUCCESS) {
-        c._errno().* = @backingInt(err);
+        c._errno().* = @intFromEnum(err);
         return false;
     }
     return true;
@@ -303,12 +303,12 @@ fn execute(prepared: *Prepared, terminal: ?Terminal, cooked: ?*const c.termios, 
     if (darwin) {
         if (probe.fault == .spawn) return failure(.spawn, "InjectedSpawn");
         var pid: c.pid_t = undefined;
-        var spawn_error: c_int = @backingInt(c.E.NOENT);
+        var spawn_error: c_int = @intFromEnum(c.E.NOENT);
         var denied = false;
         for (prepared.candidates) |path| {
             spawn_error = c.posix_spawn(&pid, path.ptr, &prepared.spawn_actions.?, &prepared.spawn_attr.?, prepared.argv.ptr, prepared.env.ptr);
             if (spawn_error == 0) break;
-            const err: c.E = @fromBackingInt(@intCast(spawn_error));
+            const err: c.E = @enumFromInt(spawn_error);
             switch (err) {
                 .ACCES => denied = true,
                 .NOENT, .NOTDIR => {},
@@ -405,7 +405,7 @@ fn readStatus(fd: c_int, result: Outcome) Outcome {
     if (n == 0 or (n < 0 and errno() == .AGAIN)) return result;
     if (n < 0) return osFailure(.spawn);
     if (n != @sizeOf(Status) or status.stage < 0 or status.stage > 1 or status.code <= 0 or status.code > 4095) return failure(.spawn, "InvalidChildStatus");
-    const err: c.E = @fromBackingInt(@intCast(status.code));
+    const err: c.E = @enumFromInt(status.code);
     const name = std.enums.tagName(c.E, err) orelse return failure(.spawn, "InvalidChildStatus");
     return failure(if (status.stage == 1) .handoff else .spawn, name);
 }
@@ -439,7 +439,7 @@ const Child = struct {
         // pins this PGID, whether setpgid completed before an abort or not.
         self.probe.signals += 1;
         const killed = if (self.probe.fault == .group_kill) blk: {
-            c._errno().* = @backingInt(c.E.PERM);
+            c._errno().* = @intFromEnum(c.E.PERM);
             break :blk @as(c_int, -1);
         } else c.kill(-self.pid, .KILL);
         const kill_error: ?c.E = if (killed == 0) null else errno();
@@ -493,7 +493,7 @@ fn child(prepared: *const Prepared, has_tty: bool, cooked: ?*const c.termios, st
     }
     for (prepared.signals, 0..) |valid, i| {
         if (!valid) continue;
-        const sig: c.SIG = @fromBackingInt(@intCast(i));
+        const sig: c.SIG = @enumFromInt(i);
         var action: c.Sigaction = undefined;
         if (c.sigaction(sig, null, &action) != 0) childError(status[1], 0);
         const force = for (job_signals) |job| {
@@ -508,17 +508,17 @@ fn child(prepared: *const Prepared, has_tty: bool, cooked: ?*const c.termios, st
     }
     if (has_tty) {
         if (probe.fault == .handoff) {
-            c._errno().* = @backingInt(c.E.IO);
+            c._errno().* = @intFromEnum(c.E.IO);
             childError(status[1], 1);
         }
         const pid = c.getpid();
         if (tcsetpgrp(0, pid) != 0) childError(status[1], 1);
         if (tcgetpgrp(0) != pid) {
-            c._errno().* = @backingInt(c.E.IO);
+            c._errno().* = @intFromEnum(c.E.IO);
             childError(status[1], 1);
         }
         if (probe.fault == .cooked) {
-            c._errno().* = @backingInt(c.E.IO);
+            c._errno().* = @intFromEnum(c.E.IO);
             childError(status[1], 1);
         }
         if (c.tcsetattr(0, .FLUSH, cooked.?) != 0) childError(status[1], 1);
@@ -535,7 +535,7 @@ fn child(prepared: *const Prepared, has_tty: bool, cooked: ?*const c.termios, st
             else => childError(status[1], 0),
         }
     }
-    c._errno().* = @backingInt(if (denied) c.E.ACCES else c.E.NOENT);
+    c._errno().* = @intFromEnum(if (denied) c.E.ACCES else c.E.NOENT);
     childError(status[1], 0);
 }
 fn childError(fd: c_int, stage: c_int) noreturn {
@@ -632,12 +632,16 @@ test "foreground preexec cannot run inherited WINCH or application handlers" {
     try std.testing.expectEqual(@as(c_int, 0), c.pthread_sigmask(c.SIG.SETMASK, &current, &ignored));
     probe = .{ .inject_preexec_signals = true };
     const signaled = runWithProbe(&prepared, file.handle, null, null, &probe);
-    try std.testing.expectEqual(@as(u32, @backingInt(c.SIG.USR1)), signaled.signaled);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(c.SIG.USR1)), signaled.signaled);
 }
 
 test "foreground real PTY handoff and restore faults recover authority" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const fixture = @import("linux_test_c");
+    const fixture = @cImport({
+        @cInclude("pty.h");
+        @cInclude("sys/ioctl.h");
+        @cInclude("unistd.h");
+    });
     var prepared = try Prepared.init(std.testing.allocator, &.{"/bin/true"}, .inherit, null);
     defer prepared.deinit();
     for ([_]Fault{ .none, .handoff, .cooked, .wait, .authority_lost, .restore }) |fault| {
@@ -672,7 +676,7 @@ test "foreground real PTY handoff and restore faults recover authority" {
             if (fault == .none) {
                 // A queued VINTR can reach the child after handoff; only the
                 // child may terminate, and the parent still restores below.
-                if (!((result == .exited and result.exited == 0) or (result == .signaled and result.signaled == @backingInt(c.SIG.INT)))) c._exit(94);
+                if (!((result == .exited and result.exited == 0) or (result == .signaled and result.signaled == @intFromEnum(c.SIG.INT)))) c._exit(94);
             } else if (result != .failed) c._exit(94);
             const expected: Stage = if (fault == .restore) .restore_tty else if (fault == .authority_lost) .cleanup else if (fault == .wait) .wait else .handoff;
             const cleaned: usize = if (fault == .authority_lost) 0 else 1;
@@ -695,7 +699,7 @@ test "foreground TTIN and TTOU stops have their own typed terminal" {
     if (!supported) return error.SkipZigTest;
     for ([_][]const u8{ "kill -TTIN $$", "kill -TTOU $$" }, [_]c.SIG{ .TTIN, .TTOU }) |command, sig| {
         const result = testRun(std.testing.io, &.{ "/bin/sh", "-c", command }, .inherit, null);
-        try std.testing.expectEqual(@as(u32, @backingInt(sig)), result.stopped);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(sig)), result.stopped);
     }
 }
 
@@ -727,7 +731,7 @@ test "foreground status is atomic CLOEXEC and never waits for another fork's wri
     const original: Outcome = .{ .exited = 7 };
     try std.testing.expectEqual(@as(u8, 7), readStatus(pair[0], original).exited);
     for ([_]c_int{ 0, 1 }) |stage| {
-        const record: Status = .{ .stage = stage, .code = @backingInt(c.E.ACCES) };
+        const record: Status = .{ .stage = stage, .code = @intFromEnum(c.E.ACCES) };
         try std.testing.expectEqual(@as(isize, @sizeOf(Status)), c.write(pair[1], @ptrCast(&record), @sizeOf(Status)));
         const result = readStatus(pair[0], original);
         try std.testing.expectEqual(if (stage == 0) Stage.spawn else Stage.handoff, result.failed.stage);
@@ -742,7 +746,7 @@ test "foreground status is atomic CLOEXEC and never waits for another fork's wri
     // Competing fork sees the endpoints immediately after atomic creation.
     // Its pre-exec writer stays open across the parent's completed-job read.
     var script_buf: [160]u8 = undefined;
-    const script = try std.fmt.bufPrintSentinel(&script_buf, "test ! -e /proc/self/fd/{d} && test ! -e /proc/self/fd/{d}", .{ pair[0], pair[1] }, 0);
+    const script = try std.fmt.bufPrintZ(&script_buf, "test ! -e /proc/self/fd/{d} && test ! -e /proc/self/fd/{d}", .{ pair[0], pair[1] });
     const args = [_:null]?[*:0]const u8{ "/bin/sh", "-c", script.ptr };
     const competitor = c.fork();
     if (competitor < 0) return error.ForkFailed;
@@ -775,7 +779,10 @@ fn waitForTestStop(pid: c.pid_t) void {
 }
 test "foreground Linux abort pins death before group cleanup before and after exec" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const fixture = @import("linux_test_c");
+    const fixture = @cImport({
+        @cInclude("sys/prctl.h");
+        @cInclude("unistd.h");
+    });
     const file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .read_write });
     defer file.close(std.testing.io);
     for ([_]bool{ true, false }) |before_group| {
@@ -794,7 +801,7 @@ test "foreground Linux abort pins death before group cleanup before and after ex
             const helper = c.waitpid(-1, &status, 0);
             if (before_group) {
                 if (helper != -1 or errno() != .CHILD) c._exit(95);
-            } else if (helper <= 0 or status != @backingInt(c.SIG.KILL)) c._exit(96);
+            } else if (helper <= 0 or status != @intFromEnum(c.SIG.KILL)) c._exit(96);
             c._exit(0);
         }
         var status: c_int = 0;
@@ -817,7 +824,7 @@ test "foreground macOS native suspension is admission and later STOP is a job re
     try std.testing.expectEqual(@as(usize, 1), abort.reaps);
     var resumed: Probe = .{};
     const stopped = runWithProbe(&prepared, file.handle, null, null, &resumed);
-    try std.testing.expectEqual(@as(u32, @backingInt(c.SIG.STOP)), stopped.stopped);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(c.SIG.STOP)), stopped.stopped);
     try std.testing.expectEqual(@as(usize, 1), resumed.reaps);
 }
 
@@ -831,10 +838,15 @@ test "foreground support floor rejects lower configured targets" {
 
 test "foreground missing Linux close_range fails preparation without launching" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const fixture = @import("linux_test_c");
+    const fixture = @cImport({
+        @cInclude("linux/filter.h");
+        @cInclude("linux/seccomp.h");
+        @cInclude("sys/prctl.h");
+        @cInclude("sys/syscall.h");
+    });
     var prepared = try Prepared.init(std.testing.allocator, &.{"/bin/true"}, .inherit, null);
     defer prepared.deinit();
-    for ([_]u32{ @backingInt(c.E.NOSYS), @backingInt(c.E.PERM) }) |failure_code| {
+    for ([_]u32{ @intFromEnum(c.E.NOSYS), @intFromEnum(c.E.PERM) }) |failure_code| {
         const pid = c.fork();
         if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
@@ -1071,5 +1083,5 @@ test "foreground macOS group cleanup rejects an additional live member and still
     const waited = c.waitpid(member, &status, 0);
     member_reaped = waited == member or (waited < 0 and errno() == .CHILD);
     try std.testing.expectEqual(member, waited);
-    try std.testing.expectEqual(@as(c_int, @backingInt(c.SIG.KILL)), status);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(c.SIG.KILL)), status);
 }

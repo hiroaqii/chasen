@@ -212,7 +212,7 @@ test "ComponentStateStore remove calls deinit and removes entry" {
             return .{ .counter = counter };
         }
 
-        pub fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
@@ -240,7 +240,7 @@ test "ComponentStateStore clearNamespace removes matching entries" {
             return .{ .counter = counter };
         }
 
-        pub fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
@@ -297,7 +297,7 @@ test "ComponentStateStore clearNamespace empty prefix clears all entries" {
             return .{ .counter = counter };
         }
 
-        pub fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
@@ -329,7 +329,7 @@ test "ComponentStateStore clearNamespace removes more entries than one chunk" {
             return .{ .counter = counter };
         }
 
-        pub fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
+        fn deinit(self: *@This(), _: ComponentStateDeinitContext) void {
             self.counter.* += 1;
         }
     };
@@ -363,7 +363,7 @@ test "ComponentStateStore deinit calls remaining deinit hooks" {
             return .{};
         }
 
-        pub fn deinit(_: *@This(), _: ComponentStateDeinitContext) void {
+        fn deinit(_: *@This(), _: ComponentStateDeinitContext) void {
             deinit_test_counter += 1;
         }
     };

@@ -396,9 +396,9 @@ fn queryTerminal(
     try vx.queryTerminalSend(writer);
     try std.Io.futexWaitTimeout(
         io,
-        u32,
-        &vx.query_futex.raw,
-        0,
+        std.atomic.Value(u32),
+        &vx.query_futex,
+        .init(0),
         .{
             .duration = .{
                 .clock = .real,

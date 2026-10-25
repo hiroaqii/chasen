@@ -59,7 +59,7 @@ packages layered above the core.
 
 ## Requirements
 
-- Zig **0.17.0**, the version used by CI. Compatibility with newer versions is not guaranteed.
+- Zig **0.16.0**, the version used by CI. Compatibility with newer versions is not guaranteed.
 
 ## Installation
 
