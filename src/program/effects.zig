@@ -349,7 +349,7 @@ test "watch failures coexist with task16 tick8 every8 image8 completions and a f
 }
 
 // Small in-place fixture for the actual production drain; no alternate delivery path.
-fn WatchTestRig(comptime Msg: type) type {
+fn WatchTestRig(comptime Msg: type, comptime Backend: type) type {
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
@@ -357,7 +357,7 @@ fn WatchTestRig(comptime Msg: type) type {
         ctx: ctx_mod.Ctx(Msg) = undefined,
         tasks: TaskRuntime(Msg),
         timers: TimerRuntime(Msg),
-        effects: WithWatchBackend(Msg, watchers_mod.TestBackend),
+        effects: WithWatchBackend(Msg, Backend),
         env: std.process.Environ.Map,
         terminal: TerminalSession(Msg) = undefined,
         terminal_effects: TerminalEffects = .{},
@@ -414,6 +414,82 @@ fn WatchTestRig(comptime Msg: type) type {
     };
 }
 
+test "watch linux public effect delivers native changes and terminal failures and cancels idle and active producers" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const native = @import("watch_linux.zig");
+    const App = struct {
+        pub const Msg = struct {
+            notice: runtime.WatchNotice,
+            pub const undelivered_policy = .plain;
+        };
+        last: ?runtime.WatchNotice = null,
+        count: usize = 0,
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            self.last = msg.notice;
+            self.count += 1;
+            ctx.redraw().skip();
+        }
+        fn notify(notice: runtime.WatchNotice, _: std.mem.Allocator) ?Msg {
+            return .{ .notice = notice };
+        }
+        fn wait(self: *@This(), rig: anytype, request_id: runtime.WatchRequestId, outcome: std.meta.Tag(runtime.WatchOutcome)) !void {
+            for (0..5000) |_| {
+                _ = try rig.clearWakes();
+                try rig.drain(@This(), self);
+                if (self.last) |notice| if (notice.request_id == request_id and std.meta.activeTag(notice.outcome) == outcome) return;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+            return error.WatchNoticeTimedOut;
+        }
+        fn fdCount() !usize {
+            const dir = try std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var it = dir.iterate();
+            var count: usize = 0;
+            while (try it.next(std.testing.io)) |_| count += 1;
+            return count;
+        }
+    };
+    const io = std.testing.io;
+    var fixture = try native.TestDirectory.init();
+    defer fixture.deinit();
+    try fixture.dir.createDir(io, "root", .default_dir);
+    const path = try fixture.dir.realPathFileAlloc(io, "root", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var rig: WatchTestRig(App.Msg, watchers_mod.NativeBackend) = undefined;
+    try rig.init(std.testing.allocator);
+    defer rig.deinit();
+    var app: App = .{};
+    const fd_before = try App.fdCount();
+    const first = try rig.ctx.watch().start(42, .{ .path = path, .select = "tracked" }, App.notify);
+    try app.wait(&rig, first, .ready);
+    try std.testing.expectEqual(fd_before + 2, try App.fdCount());
+    try fixture.dir.writeFile(io, .{ .sub_path = "root/tracked", .data = "native write" });
+    try app.wait(&rig, first, .changed);
+
+    // Cancel while events are pending: no old notice constructs an app message.
+    try fixture.dir.writeFile(io, .{ .sub_path = "root/tracked", .data = "pending write" });
+    const count_before = app.count;
+    rig.ctx.watch().cancel(42);
+    try rig.drain(App, &app);
+    try std.testing.expectEqual(count_before, app.count);
+    try std.testing.expectEqual(fd_before, try App.fdCount());
+    const second = try rig.ctx.watch().start(42, .{ .path = path }, App.notify);
+    try app.wait(&rig, second, .ready);
+    // Replacing an idle poll wakes and joins it before starting the new producer.
+    const third = try rig.ctx.watch().start(42, .{ .path = path }, App.notify);
+    try app.wait(&rig, third, .ready);
+    try std.testing.expectEqual(fd_before + 2, try App.fdCount());
+    try fixture.dir.rename("root", fixture.dir, "moved", io);
+    try app.wait(&rig, third, .failed);
+    try std.testing.expectEqual(runtime.WatchFailure.root_lost, app.last.?.outcome.failed);
+    try std.testing.expectEqual(fd_before, try App.fdCount());
+    const fourth = try rig.ctx.watch().start(42, .{ .path = path }, App.notify);
+    try app.wait(&rig, fourth, .failed);
+    try std.testing.expectEqual(runtime.WatchFailure.path_not_found, app.last.?.outcome.failed);
+    try std.testing.expectEqual(fd_before, try App.fdCount());
+}
+
 const WatchTestApp = struct {
     pub const Msg = struct {
         notice: runtime.WatchNotice,
@@ -451,7 +527,7 @@ const WatchTestApp = struct {
 test "watch production drain rejects stale success and failure before callbacks and supports re-request and quit" {
     const Fake = watchers_mod.TestBackend;
     Fake.reset();
-    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    var rig: WatchTestRig(WatchTestApp.Msg, watchers_mod.TestBackend) = undefined;
     try rig.init(std.testing.allocator);
     defer rig.deinit();
     var app: WatchTestApp = .{};
@@ -487,7 +563,7 @@ test "watch production drain rejects stale success and failure before callbacks 
 test "watch production drain retains closed and full queue state and bounds fair delivery across turns" {
     const Fake = watchers_mod.TestBackend;
     Fake.reset();
-    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    var rig: WatchTestRig(WatchTestApp.Msg, watchers_mod.TestBackend) = undefined;
     try rig.init(std.testing.allocator);
     defer rig.deinit();
     var app: WatchTestApp = .{};
@@ -529,7 +605,7 @@ test "watch production drain retains closed and full queue state and bounds fair
 test "watch startup failures deliver without extra allocation and release partial backend state" {
     watchers_mod.TestBackend.reset();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    var rig: WatchTestRig(WatchTestApp.Msg, watchers_mod.TestBackend) = undefined;
     try rig.init(failing.allocator());
     defer rig.deinit();
     var app: WatchTestApp = .{};
@@ -580,7 +656,7 @@ test "watch owned messages transfer to update on success and error while pending
     const Fake = watchers_mod.TestBackend;
     Fake.reset();
     App.generated = 0;
-    var rig: WatchTestRig(App.Msg) = undefined;
+    var rig: WatchTestRig(App.Msg, watchers_mod.TestBackend) = undefined;
     try rig.init(std.testing.allocator);
     defer rig.deinit();
     var app: App = .{};
