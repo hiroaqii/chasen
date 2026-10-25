@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
     });
+    if (target.result.os.tag == .macos) {
+        mod.linkFramework("CoreServices", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    }
 
     const runtime_mod = b.addModule("chasen_runtime", .{
         .root_source_file = b.path("src/runtime.zig"),

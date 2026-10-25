@@ -14,7 +14,11 @@ pub const Unsupported = struct {
     pub fn join(_: *@This()) void {}
 };
 
-pub const NativeBackend = if (@import("builtin").os.tag == .linux) @import("watch_linux.zig").Backend else Unsupported;
+pub const NativeBackend = switch (@import("builtin").os.tag) {
+    .linux => @import("watch_linux.zig").Backend,
+    .macos => @import("watch_macos.zig").Backend,
+    else => Unsupported,
+};
 
 /// Internal compile-time seam: native and deterministic producers share this
 /// exact owner and the production effect drain. Not a public runner option.

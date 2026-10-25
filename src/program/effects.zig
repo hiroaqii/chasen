@@ -490,6 +490,68 @@ test "watch linux public effect delivers native changes and terminal failures an
     try std.testing.expectEqual(fd_before, try App.fdCount());
 }
 
+test "watch macos public effect retains native changes across close and releases canceled replaced failed watches" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const native = @import("watch_macos.zig");
+    const io = std.testing.io;
+    var fixture = try native.TestDirectory.init();
+    defer fixture.deinit();
+    try fixture.dir.createDir(io, "root", .default_dir);
+    const path = try fixture.dir.realPathFileAlloc(io, "root", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var rig: WatchTestRig(WatchTestApp.Msg, watchers_mod.NativeBackend) = undefined;
+    try rig.init(std.testing.allocator);
+    defer rig.deinit();
+    var app: WatchTestApp = .{};
+    const first = try rig.ctx.watch().start(0, .{ .path = path, .select = "tracked" }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expect(app.last[0].?.outcome == .ready);
+    _ = try rig.clearWakes();
+    rig.terminal.loop.queue.close(error.Closed);
+    try fixture.dir.writeFile(io, .{ .sub_path = "root/tracked", .data = "while closed" });
+    for (0..5000) |_| {
+        if (rig.effects.watches.hasPending()) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(rig.effects.watches.hasPending());
+    rig.terminal.loop.queue.reopen();
+    try rig.drain(WatchTestApp, &app); // no new filesystem event after reopen
+    try std.testing.expectEqual(first, app.last[0].?.request_id);
+    try std.testing.expect(app.last[0].?.outcome == .changed or app.last[0].?.outcome == .rescan);
+    const count = app.counts[0];
+    try fixture.dir.writeFile(io, .{ .sub_path = "root/tracked", .data = "cancel pending" });
+    rig.ctx.watch().cancel(0);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(count, app.counts[0]);
+    try std.testing.expect(rig.effects.watches.nodes[0] == null);
+    _ = try rig.ctx.watch().start(0, .{ .path = path }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    const replacement = try rig.ctx.watch().start(0, .{ .path = path }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(replacement, app.last[0].?.request_id);
+    try std.testing.expect(app.last[0].?.outcome == .ready);
+    try fixture.dir.rename("root", fixture.dir, "moved", io);
+    for (0..5000) |_| {
+        _ = try rig.clearWakes();
+        try rig.drain(WatchTestApp, &app);
+        if (app.last[0].?.outcome == .failed) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(runtime.WatchFailure.root_lost, app.last[0].?.outcome.failed);
+    try std.testing.expect(rig.effects.watches.nodes[0] == null);
+    const missing = try rig.ctx.watch().start(0, .{ .path = path }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(missing, app.last[0].?.request_id);
+    try std.testing.expectEqual(runtime.WatchFailure.path_not_found, app.last[0].?.outcome.failed);
+    // Actual native shutdown, including an event burst with an undrained mailbox.
+    _ = try rig.ctx.watch().start(0, .{ .path = fixture.path }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    for (0..32) |_| try fixture.dir.writeFile(io, .{ .sub_path = "burst", .data = "active" });
+    rig.ctx.quit();
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expect(rig.effects.watches.nodes[0] == null);
+}
+
 const WatchTestApp = struct {
     pub const Msg = struct {
         notice: runtime.WatchNotice,
