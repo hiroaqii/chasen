@@ -18,6 +18,8 @@ pub const RuntimeEffectKind = enum {
     terminal_image_unload,
     terminal_foreground_command,
     terminal_clipboard_copy,
+    watch_start,
+    watch_cancel,
 };
 
 pub const EffectSupport = enum {
@@ -51,6 +53,8 @@ pub const BrowserInitialEffects = struct {
             .terminal_image_unload,
             .terminal_foreground_command,
             .terminal_clipboard_copy,
+            .watch_start,
+            .watch_cancel,
             => .unsupported,
         };
     }
@@ -71,6 +75,8 @@ test "browser initial effects support update-sharing subset" {
 }
 
 test "browser initial effects reject deferred effects" {
+    try std.testing.expect(!BrowserInitialEffects.isSupported(.watch_start));
+    try std.testing.expect(!BrowserInitialEffects.isSupported(.watch_cancel));
     try std.testing.expect(!BrowserInitialEffects.isSupported(.spawn));
     try std.testing.expect(!BrowserInitialEffects.isSupported(.spawn_with));
     try std.testing.expect(!BrowserInitialEffects.isSupported(.terminal_image_load_path));

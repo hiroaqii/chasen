@@ -8,6 +8,12 @@ pub const TaskId = ctx.TaskId;
 pub const Borrowed = @import("timer.zig").Borrowed;
 pub const TimerStartError = @import("timer.zig").TimerStartError;
 pub const TimerOutcome = @import("timer.zig").TimerOutcome;
+pub const WatchRequestId = @import("watch.zig").WatchRequestId;
+pub const WatchOptions = @import("watch.zig").WatchOptions;
+pub const WatchExclusion = @import("watch.zig").WatchExclusion;
+pub const WatchNotice = @import("watch.zig").WatchNotice;
+pub const WatchOutcome = @import("watch.zig").WatchOutcome;
+pub const WatchFailure = @import("watch.zig").WatchFailure;
 
 pub const stats = @import("stats.zig");
 pub const RuntimeEventKind = stats.RuntimeEventKind;

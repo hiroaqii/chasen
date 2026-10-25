@@ -5,3 +5,4 @@ pub const max_tasks: usize = 16;
 pub const max_ticks: usize = 8;
 pub const max_everys: usize = 8;
 pub const max_terminal_image_loads: usize = 8;
+pub const max_watches: usize = 8;

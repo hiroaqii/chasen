@@ -5,6 +5,7 @@ const foreground_command = @import("foreground_command.zig");
 const clipboard_types = @import("clipboard.zig");
 const runtime_limits = @import("runtime_limits.zig");
 const timer_contract = @import("timer.zig");
+const watch_contract = @import("watch.zig");
 
 const foreground_command_duplicate_min_fd = foreground_command.foreground_command_duplicate_min_fd;
 const DuplicateForegroundCommandDirResult = foreground_command.DuplicateForegroundCommandDirResult;
@@ -43,6 +44,13 @@ pub fn Requests(comptime Msg: type) type {
         pub const TerminalImageFailedFn = *const fn (terminal_image.TerminalImageRequestId, terminal_image.LoadError) Msg;
         pub const ForegroundCommandFinishedFn = *const fn (foreground_command.ForegroundCommandResult) Msg;
         pub const ClipboardCopyFinishedFn = *const fn (clipboard_types.ClipboardCopyResult) Msg;
+        pub const WatchNotifyFn = *const fn (watch_contract.WatchNotice, std.mem.Allocator) ?Msg;
+        pub const WatchSlot = struct {
+            id: u64,
+            request_id: watch_contract.WatchRequestId,
+            notify: WatchNotifyFn,
+            pending: ?watch_contract.OwnedInput,
+        };
 
         pub const SpawnOptions = struct {
             run: TaskFn,
@@ -174,6 +182,10 @@ pub fn Requests(comptime Msg: type) type {
         _next_clipboard_copy_request_id: u64 = 1,
         _redraw_suppressed: bool = false,
         _frame_requested: bool = false,
+        // Desired generations are runtime-thread-only. Live/native ownership
+        // lives in WatchRuntime and never borrows pending storage.
+        _watches: [runtime_limits.max_watches]?WatchSlot = @splat(null),
+        _next_watch_id: u64 = 1,
 
         /// Initialize before binding a Ctx. Keep stable storage after binding.
         pub fn init(gpa: std.mem.Allocator, io_: std.Io) Self {
@@ -187,6 +199,61 @@ pub fn Requests(comptime Msg: type) type {
         }
 
         // Request admission.
+
+        pub const WatchEffects = struct {
+            requests: *Self,
+
+            /// Copy input, then atomically replace this caller id's desired
+            /// generation. Success means accepted, not native coverage ready.
+            pub fn start(
+                self: WatchEffects,
+                id: u64,
+                options: watch_contract.WatchOptions,
+                notify: WatchNotifyFn,
+            ) (watch_contract.OwnedInput.Error || error{ WatchRuntimeStopped, WatchLimitExceeded, WatchIdExhausted })!watch_contract.WatchRequestId {
+                const requests = self.requests;
+                if (requests._should_quit) return error.WatchRuntimeStopped;
+                if (requests._next_watch_id == std.math.maxInt(u64)) return error.WatchIdExhausted;
+                var available: ?usize = null;
+                for (requests._watches, 0..) |slot, i| {
+                    if (slot) |desired| {
+                        if (desired.id == id) {
+                            available = i;
+                            break;
+                        }
+                    } else if (available == null) available = i;
+                }
+                const index = available orelse return error.WatchLimitExceeded;
+                const input = try watch_contract.OwnedInput.init(requests._allocator, options);
+                const request_id: watch_contract.WatchRequestId = @enumFromInt(requests._next_watch_id);
+                if (requests._watches[index]) |*old| if (old.pending) |*pending| pending.deinit(requests._allocator);
+                requests._watches[index] = .{ .id = id, .request_id = request_id, .notify = notify, .pending = input };
+                requests._next_watch_id += 1;
+                return request_id;
+            }
+
+            /// Invalidate immediately; the next drain stops/joins the producer.
+            /// No allocation and no callback for an invalidated generation.
+            pub fn cancel(self: WatchEffects, id: u64) void {
+                for (&self.requests._watches) |*slot| if (slot.*) |*desired| {
+                    if (desired.id != id) continue;
+                    if (desired.pending) |*pending| pending.deinit(self.requests._allocator);
+                    slot.* = null;
+                    return;
+                };
+            }
+        };
+
+        pub fn watch(self: *Self) WatchEffects {
+            return .{ .requests = self };
+        }
+
+        pub fn discardWatches(self: *Self) void {
+            for (&self._watches) |*slot| {
+                if (slot.*) |*desired| if (desired.pending) |*pending| pending.deinit(self._allocator);
+                slot.* = null;
+            }
+        }
 
         pub const FrameEffects = struct {
             requests: *Self,
@@ -782,6 +849,7 @@ pub fn Requests(comptime Msg: type) type {
         /// runtime drains them. This cleanup is for that unwind path; normally
         /// the runtime consumes and frees these copies while draining effects.
         pub fn discardPendingEffects(self: *Self) void {
+            self.discardWatches();
             {
                 var batch = self.detachTicks();
                 batch.deinit();
@@ -815,6 +883,43 @@ pub fn Requests(comptime Msg: type) type {
 }
 
 // Test helpers.
+test "watch admission is transactional and same-update operations retain only the latest generation" {
+    const Callback = struct {
+        fn notify(_: watch_contract.WatchNotice, _: std.mem.Allocator) ?u8 {
+            unreachable;
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var requests = Requests(u8).init(failing.allocator(), std.testing.io);
+    defer requests.deinit();
+    const old = try requests.watch().start(10, .{ .path = "old" }, Callback.notify);
+    const next = requests._next_watch_id;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, requests.watch().start(10, .{ .path = "new" }, Callback.notify));
+    try std.testing.expectEqual(old, requests._watches[0].?.request_id);
+    try std.testing.expectEqualStrings("old", requests._watches[0].?.pending.?.path);
+    try std.testing.expectEqual(next, requests._next_watch_id);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidWatchOptions, requests.watch().start(10, .{ .path = "" }, Callback.notify));
+    try std.testing.expectEqual(old, requests._watches[0].?.request_id);
+    const replacement = try requests.watch().start(10, .{ .path = "new" }, Callback.notify);
+    try std.testing.expect(old != replacement);
+    requests.watch().cancel(10);
+    try std.testing.expect(requests._watches[0] == null);
+    requests.watch().cancel(10);
+    const restarted = try requests.watch().start(10, .{ .path = "latest" }, Callback.notify);
+    try std.testing.expect(restarted != replacement);
+    for (0..runtime_limits.max_watches - 1) |i| _ = try requests.watch().start(i, .{ .path = "." }, Callback.notify);
+    const before_reject = requests._next_watch_id;
+    try std.testing.expectError(error.WatchLimitExceeded, requests.watch().start(99, .{ .path = "." }, Callback.notify));
+    try std.testing.expectEqual(before_reject, requests._next_watch_id);
+    requests._next_watch_id = std.math.maxInt(u64);
+    try std.testing.expectError(error.WatchIdExhausted, requests.watch().start(10, .{ .path = "." }, Callback.notify));
+    try std.testing.expectEqual(restarted, requests._watches[0].?.request_id);
+    requests.quit();
+    try std.testing.expectError(error.WatchRuntimeStopped, requests.watch().start(10, .{ .path = "." }, Callback.notify));
+}
+
 fn ignoreTimerOutcome(comptime Msg: type) timer_contract.Notify(Msg) {
     return struct {
         fn notify(_: timer_contract.Notice(Msg), _: timer_contract.TimerOutcome, _: std.mem.Allocator) ?Msg {

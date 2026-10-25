@@ -93,6 +93,8 @@ pub fn InternalEvent(comptime Msg: type) type {
         /// Payload-free wake after a timer publishes completion. A full queue
         /// needs no extra wake; every effect-drain entrance reaps completed nodes.
         timers_completed,
+        /// Coalesced wake; watch health and dirty state stay outside the queue.
+        watches_pending,
 
         /// Async task result injected via postEvent.
         user_msg: Msg,

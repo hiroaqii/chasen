@@ -145,7 +145,11 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
 
     // Preserve the shutdown order: mask, polling join, producer barrier.
     defer terminal.stopResizePolling();
-    defer terminal.beginTeardown();
+    defer {
+        terminal.beginTeardown();
+        // Also runs on init/update error, before the resize polling join.
+        effects.watches.requestStop();
+    }
 
     trace(opts, .startup);
 
@@ -236,6 +240,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
                 effects.receiveContinuation();
                 if (stats) |*s| s.event_kind = .user_msg;
             },
+            .watches_pending => effects.watches.wake.receive(),
             .resize_pending, .timers_completed => {},
         }
 
@@ -277,6 +282,7 @@ pub fn run(comptime App: type, opts: types.RunOptions, initial_app: App) !void {
     // producer barrier before joining, then preserve that failure on return.
     runtime_shutting_down.store(true, .seq_cst);
     tasks.requestShutdown();
+    effects.watches.requestStop();
     terminal.stopReader();
     try terminal.checkInputFailure();
     trace(opts, .shutdown);
@@ -293,7 +299,7 @@ fn shutdownRuntime(
     app_ctx: *ctx_mod.Ctx(App.Msg),
     tasks: *TaskRuntime(App.Msg),
     timers: *TimerRuntime(App.Msg),
-    effects: *Effects(App.Msg),
+    effects: anytype,
     frames: *FrameRuntime(App.Msg),
     terminal: *TerminalSession(App.Msg),
     allocator: std.mem.Allocator,
@@ -304,6 +310,7 @@ fn shutdownRuntime(
     // Broadcast before any join: a non-cooperative task cannot withhold the
     // cancellation notification from a later task. No shutdown allocation.
     tasks.requestShutdown();
+    effects.watches.requestStop();
     app_ctx.requests.discardPendingTasks();
 
     // Join before close preserves a racing input failure. Canceling the
@@ -414,28 +421,43 @@ const CancellationTestTask = struct {
     }
 };
 
-test "task cancel request returns during slow cleanup and shutdown broadcasts before joining" {
+test "watch and task shutdown broadcast before joins and task cancel returns during slow cleanup" {
     const Task = CancellationTestTask;
     const Msg = Task.Msg;
+    const Watch = @import("program/watchers.zig").TestBackend;
+    const Callback = struct {
+        fn notify(_: runtime.WatchNotice, _: std.mem.Allocator) ?Msg {
+            unreachable;
+        }
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |via_shutdown| {
+        Watch.reset();
         var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
+        defer ctx_requests.deinit();
         var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
         var tasks = TaskRuntime(Msg).init(allocator, io);
         tasks.bind(ctx.requests);
-        var effects = try Effects(Msg).init(allocator);
+        var effects = try effects_mod.WithWatchBackend(Msg, Watch).init(allocator);
         var env: std.process.Environ.Map = .init(allocator);
         defer env.deinit();
         var terminal: TerminalSession(Msg) = undefined;
         try terminal.init(allocator, io, .{ .env_map = &env });
         defer terminal.deinit();
+        var watch_stopped: std.Io.Event = .unset;
+        Watch.stopped_event = &watch_stopped;
+        Watch.require_all_stopped = true;
+        for (0..2) |id| _ = try ctx.watch().start(id, .{ .path = "." }, Callback.notify);
+        effects.watches.reconcile(ctx.requests, &terminal.loop);
         var shutting_down: std.atomic.Value(bool) = .init(false);
         var slow: Task.State = .{};
         var fast: Task.State = .{};
         var release: std.Io.Event = .unset;
         const slow_id = try Task.submit(&ctx, &slow, io, if (via_shutdown) &fast.cleaned else &release);
-        const fast_id = try Task.submit(&ctx, &fast, io, null);
+        // This cleanup can finish only after a watch stop notification. A
+        // task join before broadcasting watch stops would deadlock here.
+        const fast_id = try Task.submit(&ctx, &fast, io, if (via_shutdown) &watch_stopped else null);
         try tasks.startPending(ctx.requests, &effects.completions, &terminal.loop, &shutting_down);
         slow.started.waitUncancelable(io);
         fast.started.waitUncancelable(io);
@@ -456,6 +478,8 @@ test "task cancel request returns during slow cleanup and shutdown broadcasts be
         try std.testing.expectEqual(@as(usize, 1), slow.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), fast.count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), tasks.pending.items.len);
+        try std.testing.expectEqual(@as(usize, 2), Watch.stops);
+        try std.testing.expectEqual(@as(usize, 2), Watch.joins);
         try std.testing.expectError(error.Closed, terminal.loop.tryEvent());
     }
 }
@@ -608,7 +632,7 @@ test "Renderer preserves sibling and next-row text at wide grapheme boundaries" 
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), rows) != null);
 }
 
-test "Program init and effect errors clean pending owners before App deinit" {
+test "Program init and effect errors clean pending owners including watch input before App deinit" {
     const State = struct {
         task_cleaned: usize = 0,
         app_cleaned: usize = 0,
@@ -627,7 +651,11 @@ test "Program init and effect errors clean pending owners before App deinit" {
             _ = try ctx.terminal().copyToClipboard(.{ .text = "old suffix", .finished = copied });
             try ctx.timer().tick("pending", std.time.ns_per_s, {}, timerNotice);
             _ = try ctx.image().loadPath("pending.png", imageLoaded, imageFailed);
+            _ = try ctx.watch().start(0, .{ .path = "." }, watchNotice);
             if (self.fail_init) return error.ExpectedInitFailure;
+        }
+        fn watchNotice(_: runtime.WatchNotice, _: std.mem.Allocator) ?Msg {
+            unreachable;
         }
         fn timerNotice(_: void, outcome: runtime.TimerOutcome, _: std.mem.Allocator) ?Msg {
             return switch (outcome) {

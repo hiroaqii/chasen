@@ -19,6 +19,7 @@ pub fn Ctx(comptime Msg: type) type {
         pub const RedrawEffects = Requests.RedrawEffects;
         pub const TaskEffects = Requests.TaskEffects;
         pub const TimerEffects = Requests.TimerEffects;
+        pub const WatchEffects = Requests.WatchEffects;
         pub const ImageEffects = Requests.ImageEffects;
         pub const TerminalEffects = Requests.TerminalEffects;
         pub const TerminalImageLoadedFn = Requests.TerminalImageLoadedFn;
@@ -46,6 +47,9 @@ pub fn Ctx(comptime Msg: type) type {
         }
         pub fn timer(self: *@This()) TimerEffects {
             return self.requests.timer();
+        }
+        pub fn watch(self: *@This()) WatchEffects {
+            return self.requests.watch();
         }
         pub fn image(self: *@This()) ImageEffects {
             return self.requests.image();

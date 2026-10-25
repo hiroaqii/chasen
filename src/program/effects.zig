@@ -15,6 +15,7 @@ const terminal_image = @import("../terminal_image.zig");
 const foreground_command = @import("../foreground_command.zig");
 const applyMsg = @import("events.zig").applyMsg;
 const drainInternalEventsForShutdown = @import("terminal_session.zig").drainInternalEventsForShutdown;
+const watchers_mod = @import("watchers.zig");
 
 const max_effect_drain_rounds: usize = 8;
 const EffectDrainResult = struct { needs_render: bool = false };
@@ -22,18 +23,26 @@ const EffectDrainResult = struct { needs_render: bool = false };
 /// Owns runtime-thread completions and the coalesced continuation wake.
 /// Borrows each live owner only for the synchronous drain operation.
 pub fn Effects(comptime Msg: type) type {
+    return WithWatchBackend(Msg, watchers_mod.NativeBackend);
+}
+
+/// Private producer selection for tests and the platform implementation. Every
+/// selection uses this same coordinator, queue, delivery and shutdown path.
+pub fn WithWatchBackend(comptime Msg: type, comptime WatchBackend: type) type {
     return struct {
         const Self = @This();
         completions: RuntimeCompletionBuffer(Msg) = .{},
         continuation_pending: bool = false,
+        watches: watchers_mod.WatchRuntime(Msg, WatchBackend),
 
         pub fn init(allocator: std.mem.Allocator) !Self {
-            var self: Self = .{};
+            var self: Self = .{ .watches = .init(allocator) };
             try self.completions.init(allocator);
             return self;
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.watches.shutdown();
             self.completions.deinitUndelivered(allocator);
         }
 
@@ -90,12 +99,13 @@ pub fn Effects(comptime Msg: type) type {
         /// 1. runtime-thread completions
         /// 2. foreground commands
         /// 3. terminal clipboard copies
-        /// 4. async tasks
-        /// 5. pending timer cancels
-        /// 6. pending ticks
-        /// 7. pending everys
-        /// 8. terminal images
-        /// 9. frame request
+        /// 4. watch reconciliation and bounded notices
+        /// 5. async tasks
+        /// 6. pending timer cancels
+        /// 7. pending ticks
+        /// 8. pending everys
+        /// 9. terminal images
+        /// 10. frame request
         ///
         /// Timer cancels must run after foreground callbacks have had a chance to
         /// queue effects, but before tick/every spawn. That makes `cancel(id)` apply
@@ -129,6 +139,7 @@ pub fn Effects(comptime Msg: type) type {
         ) !EffectDrainResult {
             timers.reapCompleted();
             var result: EffectDrainResult = .{};
+            var watch_budget: usize = @import("../runtime_limits.zig").max_watches;
 
             for (0..max_effect_drain_rounds) |round| {
                 const completion_result = try self.applyCompletions(App, app, app_ctx, stats, opts);
@@ -137,6 +148,24 @@ pub fn Effects(comptime Msg: type) type {
                 result.needs_render = result.needs_render or foreground_needs_render;
                 const clipboard_needs_render = try terminal_effects.processClipboard(App, app, app_ctx, terminal, stats, opts);
                 result.needs_render = result.needs_render or clipboard_needs_render;
+                self.watches.reconcile(app_ctx.requests, &terminal.loop);
+                while (watch_budget > 0 and !shutting_down.load(.acquire) and !app_ctx.shouldQuit()) {
+                    const delivery = self.watches.take(app_ctx.requests) orelse break;
+                    watch_budget -= 1;
+                    if (delivery.notify(delivery.notice, app_ctx.allocator())) |value| {
+                        var msg = value;
+                        if (shutting_down.load(.acquire) or app_ctx.shouldQuit()) {
+                            runtime.deinitUndeliveredMessage(Msg, &msg, app_ctx.allocator());
+                        } else {
+                            const rendered = try applyMsg(App, app, msg, app_ctx, app_ctx.io(), stats, opts);
+                            result.needs_render = result.needs_render or rendered;
+                        }
+                    }
+                    // Callback/update may replace, cancel or quit. Invalidate
+                    // and stop stale producers before taking another notice.
+                    self.watches.reconcile(app_ctx.requests, &terminal.loop);
+                }
+                self.watches.rearm();
                 try tasks.startPending(app_ctx.requests, &self.completions, &terminal.loop, shutting_down);
                 timers.cancelPending(app_ctx.requests);
                 try timers.startTicks(app_ctx.requests, &self.completions, &terminal.loop, shutting_down);
@@ -146,7 +175,8 @@ pub fn Effects(comptime Msg: type) type {
 
                 const has_follow_up = self.completions.items.items.len > 0 or
                     app_ctx.requests.hasPendingForegroundCommands() or
-                    app_ctx.requests.hasPendingClipboardCopies();
+                    app_ctx.requests.hasPendingClipboardCopies() or
+                    (watch_budget > 0 and self.watches.hasPending());
                 if (!has_follow_up) break;
                 if (round + 1 == max_effect_drain_rounds) {
                     try self.scheduleContinuation(&terminal.loop);
@@ -224,13 +254,14 @@ test "timer completed wake reaches the real effect-drain reaper without app inpu
     try std.testing.expectEqual(@as(usize, 1), app.updates);
 }
 
-test "runtime completion holds task16 tick8 every8 image8 failures with full queue and follow-up" {
+test "watch failures coexist with task16 tick8 every8 image8 completions and a full queue" {
     const TestMsg = enum {
         task_failed,
         tick_failed,
         every_failed,
         image_failed,
         followup_failed,
+        watch_failed,
         pub const TimerNotice = enum { tick, every, followup };
         pub const undelivered_policy = .plain;
     };
@@ -255,14 +286,18 @@ test "runtime completion holds task16 tick8 every8 image8 failures with full que
         fn imageFailed(_: terminal_image.TerminalImageRequestId, _: terminal_image.LoadError) TestMsg {
             return .image_failed;
         }
+        fn watchFailed(notice: runtime.WatchNotice, _: std.mem.Allocator) ?TestMsg {
+            std.debug.assert(notice.outcome.failed == .unsupported);
+            return .watch_failed;
+        }
     };
     const App = struct {
         pub const Msg = TestMsg;
-        counts: [5]usize = @splat(0),
+        counts: [6]usize = @splat(0),
         total: usize = 0,
         completions: *RuntimeCompletionBuffer(TestMsg),
         pub fn update(self: *@This(), msg: TestMsg, ctx: *ctx_mod.Ctx(TestMsg)) !void {
-            if (self.total == 0) try std.testing.expectEqual(@as(usize, 40), self.completions.items.items.len);
+            if (msg == .task_failed and self.counts[0] == 0) try std.testing.expectEqual(@as(usize, 40), self.completions.items.items.len);
             self.total += 1;
             self.counts[@intFromEnum(msg)] += 1;
             if (msg == .tick_failed and self.counts[@intFromEnum(msg)] == 1)
@@ -276,6 +311,7 @@ test "runtime completion holds task16 tick8 every8 image8 failures with full que
     var requests = requests_mod.Requests(TestMsg).init(allocator, io);
     defer requests.deinit();
     var ctx = ctx_mod.Ctx(TestMsg).init(&requests);
+    for (0..8) |id| _ = try ctx.watch().start(id, .{ .path = "." }, Callbacks.watchFailed);
     for (0..16) |_| _ = try ctx.task().spawn(.{ .run = Callbacks.task, .failed = Callbacks.taskFailed });
     for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" }) |id| {
         try ctx.timer().tick(id, 0, .tick, Callbacks.timer);
@@ -286,7 +322,7 @@ test "runtime completion holds task16 tick8 every8 image8 failures with full que
     defer tasks.join(&requests);
     var timers = TimerRuntime(TestMsg).init(allocator, io);
     defer timers.shutdown();
-    var effects = try Effects(TestMsg).init(allocator);
+    var effects = try WithWatchBackend(TestMsg, watchers_mod.Unsupported).init(allocator);
     defer effects.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 40), RuntimeCompletionBuffer(TestMsg).capacity);
     var app: App = .{ .completions = &effects.completions };
@@ -306,10 +342,256 @@ test "runtime completion holds task16 tick8 every8 image8 failures with full que
         .runtime = .{ .allocator = allocator, .io = io },
         .terminal = .{ .env_map = &env },
     });
-    try std.testing.expectEqualSlices(usize, &.{ 16, 8, 8, 8, 1 }, &app.counts);
-    try std.testing.expectEqual(@as(usize, 41), app.total);
+    try std.testing.expectEqualSlices(usize, &.{ 16, 8, 8, 8, 1, 8 }, &app.counts);
+    try std.testing.expectEqual(@as(usize, 49), app.total);
     try std.testing.expectEqual(@as(usize, 0), effects.completions.items.items.len);
     try std.testing.expect(!(try terminal.loop.tryPostEvent(.continue_effect_drain)));
+}
+
+// Small in-place fixture for the actual production drain; no alternate delivery path.
+fn WatchTestRig(comptime Msg: type) type {
+    return struct {
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        requests: requests_mod.Requests(Msg),
+        ctx: ctx_mod.Ctx(Msg) = undefined,
+        tasks: TaskRuntime(Msg),
+        timers: TimerRuntime(Msg),
+        effects: WithWatchBackend(Msg, watchers_mod.TestBackend),
+        env: std.process.Environ.Map,
+        terminal: TerminalSession(Msg) = undefined,
+        terminal_effects: TerminalEffects = .{},
+        frames: FrameRuntime(Msg),
+        shutdown: std.atomic.Value(bool) = .init(false),
+        stats: ?runtime.RuntimeStats = null,
+
+        fn init(self: *Self, allocator: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            self.* = .{
+                .allocator = allocator,
+                .requests = .init(allocator, io),
+                .tasks = .init(allocator, io),
+                .timers = .init(allocator, io),
+                .effects = try .init(allocator),
+                .env = .init(allocator),
+                .frames = .init(io),
+            };
+            errdefer self.effects.deinit(allocator);
+            self.ctx = .init(&self.requests);
+            try self.terminal.init(allocator, io, .{ .env_map = &self.env });
+        }
+
+        fn drain(self: *Self, comptime App: type, app: *App) !void {
+            _ = try self.effects.drain(App, app, &self.ctx, &self.tasks, &self.timers, &self.terminal_effects, &self.terminal, &self.shutdown, &self.frames, &self.stats, .{
+                .runtime = .{ .allocator = self.allocator, .io = std.testing.io },
+                .terminal = .{ .env_map = &self.env },
+            });
+        }
+
+        fn clearWakes(self: *Self) !usize {
+            var count: usize = 0;
+            while (try self.terminal.loop.tryEvent()) |event| {
+                if (event == .watches_pending) {
+                    self.effects.watches.wake.receive();
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        fn deinit(self: *Self) void {
+            self.effects.watches.requestStop();
+            self.tasks.requestShutdown();
+            self.frames.shutdown();
+            self.timers.shutdown();
+            self.tasks.join(&self.requests);
+            self.effects.deinit(self.allocator);
+            self.terminal_effects.deinit(&self.terminal);
+            self.terminal.deinit();
+            self.requests.deinit();
+            self.env.deinit();
+        }
+    };
+}
+
+const WatchTestApp = struct {
+    pub const Msg = struct {
+        notice: runtime.WatchNotice,
+        pub const undelivered_policy = .plain;
+    };
+    mode: enum { observe, replace_cancel, quit, restart } = .observe,
+    counts: [8]usize = @splat(0),
+    last: [8]?runtime.WatchNotice = @splat(null),
+    replacement: ?runtime.WatchRequestId = null,
+
+    fn notify(notice: runtime.WatchNotice, _: std.mem.Allocator) ?Msg {
+        return .{ .notice = notice };
+    }
+
+    pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+        const notice = msg.notice;
+        self.counts[@intCast(notice.id)] += 1;
+        self.last[@intCast(notice.id)] = notice;
+        if (notice.id != 0) return;
+        switch (self.mode) {
+            .observe => {},
+            .replace_cancel => {
+                self.mode = .observe;
+                ctx.watch().cancel(1);
+                self.replacement = try ctx.watch().start(2, .{ .path = "replacement" }, notify);
+            },
+            .quit => ctx.quit(),
+            .restart => {
+                _ = try ctx.watch().start(0, .{ .path = "." }, notify);
+            },
+        }
+    }
+};
+
+test "watch production drain rejects stale success and failure before callbacks and supports re-request and quit" {
+    const Fake = watchers_mod.TestBackend;
+    Fake.reset();
+    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    try rig.init(std.testing.allocator);
+    defer rig.deinit();
+    var app: WatchTestApp = .{};
+    _ = try rig.ctx.watch().start(0, .{ .path = "canceled before drain" }, WatchTestApp.notify);
+    rig.ctx.watch().cancel(0);
+    _ = try rig.ctx.watch().start(0, .{ .path = "replaced before drain" }, WatchTestApp.notify);
+    for (0..3) |id| _ = try rig.ctx.watch().start(id, .{ .path = "." }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(@as(usize, 3), Fake.starts);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1, 0, 0, 0, 0, 0 }, &app.counts);
+    const old = app.last[2].?.request_id;
+    Fake.live[0].?.mailbox.?.publish(.changed);
+    Fake.live[1].?.mailbox.?.publish(.{ .failed = .root_lost });
+    Fake.live[2].?.mailbox.?.publish(.changed);
+    // Simulates a producer publishing one last failure after receiving stop.
+    Fake.on_stop = .{ .failed = .io_failure };
+    app.mode = .replace_cancel;
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 2, 0, 0, 0, 0, 0 }, &app.counts);
+    try std.testing.expect(app.last[2].?.outcome == .ready);
+    try std.testing.expectEqual(app.replacement.?, app.last[2].?.request_id);
+    try std.testing.expect(app.replacement.? != old);
+    app.mode = .quit;
+    Fake.require_all_stopped = true;
+    for (Fake.live) |node| if (node) |value| value.mailbox.?.publish(.changed);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expect(rig.ctx.shouldQuit());
+    try std.testing.expectEqualSlices(usize, &.{ 3, 1, 2, 0, 0, 0, 0, 0 }, &app.counts);
+    try std.testing.expectEqual(Fake.starts, Fake.joins);
+    try std.testing.expectEqual(Fake.starts, Fake.stops);
+}
+
+test "watch production drain retains closed and full queue state and bounds fair delivery across turns" {
+    const Fake = watchers_mod.TestBackend;
+    Fake.reset();
+    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    try rig.init(std.testing.allocator);
+    defer rig.deinit();
+    var app: WatchTestApp = .{};
+    for (0..8) |id| _ = try rig.ctx.watch().start(id, .{ .path = "." }, WatchTestApp.notify);
+    rig.effects.watches.reconcile(&rig.requests, &rig.terminal.loop);
+    for (Fake.live) |node| node.?.mailbox.?.publish(.changed);
+    try std.testing.expectEqual(@as(usize, 1), try rig.clearWakes());
+    try rig.drain(WatchTestApp, &app);
+    for (app.counts) |count| try std.testing.expectEqual(@as(usize, 1), count);
+    // ready and dirty are distinct; eight notices leave the dirty set for next turn.
+    try std.testing.expectEqual(@as(usize, 1), try rig.clearWakes());
+    try rig.drain(WatchTestApp, &app);
+    for (app.counts) |count| try std.testing.expectEqual(@as(usize, 2), count);
+    rig.terminal.loop.queue.close(error.Closed);
+    for (Fake.live) |node| node.?.mailbox.?.publish(.changed);
+    try std.testing.expect(!rig.effects.watches.wake.pending.load(.acquire));
+    rig.terminal.loop.queue.reopen();
+    // No new FS event or key after reopening.
+    try rig.drain(WatchTestApp, &app);
+    for (app.counts) |count| try std.testing.expectEqual(@as(usize, 3), count);
+    while (try rig.terminal.loop.tryPostEvent(.continue_effect_drain)) {}
+    for (0..100) |_| for (Fake.live) |node| node.?.mailbox.?.publish(.rescan);
+    try std.testing.expect(!rig.effects.watches.wake.pending.load(.acquire));
+    try rig.drain(WatchTestApp, &app);
+    for (app.counts) |count| try std.testing.expectEqual(@as(usize, 4), count);
+    _ = try rig.clearWakes();
+    for (1..8) |id| rig.ctx.watch().cancel(id);
+    app.mode = .restart;
+    Fake.live[0].?.mailbox.?.publish(.changed);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(@as(usize, 12), app.counts[0]);
+    try std.testing.expectEqual(@as(usize, 1), try rig.clearWakes());
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(@as(usize, 20), app.counts[0]);
+    rig.terminal.loop.queue.close(error.EndOfStream);
+    try std.testing.expectError(error.EndOfStream, rig.terminal.checkInputFailure());
+}
+
+test "watch startup failures deliver without extra allocation and release partial backend state" {
+    watchers_mod.TestBackend.reset();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var rig: WatchTestRig(WatchTestApp.Msg) = undefined;
+    try rig.init(failing.allocator());
+    defer rig.deinit();
+    var app: WatchTestApp = .{};
+    for (0..8) |id| _ = try rig.ctx.watch().start(id, .{ .path = "." }, WatchTestApp.notify);
+    failing.fail_index = failing.alloc_index;
+    try rig.drain(WatchTestApp, &app);
+    for (app.last, rig.requests._watches) |notice, desired| {
+        try std.testing.expectEqual(runtime.WatchFailure.out_of_memory, notice.?.outcome.failed);
+        try std.testing.expect(desired == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), watchers_mod.TestBackend.starts);
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try rig.ctx.watch().start(0, .{ .path = "old live" }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expect(app.last[0].?.outcome == .ready);
+    watchers_mod.TestBackend.start_failure = .worker_unavailable;
+    _ = try rig.ctx.watch().start(0, .{ .path = "." }, WatchTestApp.notify);
+    try rig.drain(WatchTestApp, &app);
+    try std.testing.expectEqual(runtime.WatchFailure.worker_unavailable, app.last[0].?.outcome.failed);
+    try std.testing.expectEqual(@as(usize, 2), watchers_mod.TestBackend.starts);
+    try std.testing.expectEqual(@as(usize, 2), watchers_mod.TestBackend.stops);
+    try std.testing.expectEqual(@as(usize, 2), watchers_mod.TestBackend.joins);
+    try std.testing.expect(rig.requests._watches[0] == null);
+}
+
+test "watch owned messages transfer to update on success and error while pending notices allocate no Msg" {
+    const App = struct {
+        pub const Msg = struct {
+            bytes: []u8,
+            pub const undelivered_policy = .deinit;
+            pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
+                allocator.free(self.bytes);
+            }
+        };
+        var generated: usize = 0;
+        updates: usize = 0,
+        fn notify(_: runtime.WatchNotice, allocator: std.mem.Allocator) ?Msg {
+            const bytes = allocator.dupe(u8, "owned") catch return null;
+            generated += 1;
+            return .{ .bytes = bytes };
+        }
+        pub fn update(self: *@This(), msg: Msg, ctx: *ctx_mod.Ctx(Msg)) !void {
+            defer ctx.allocator().free(msg.bytes);
+            self.updates += 1;
+            if (self.updates == 2) return error.TestWatchUpdateFailure;
+        }
+    };
+    const Fake = watchers_mod.TestBackend;
+    Fake.reset();
+    App.generated = 0;
+    var rig: WatchTestRig(App.Msg) = undefined;
+    try rig.init(std.testing.allocator);
+    defer rig.deinit();
+    var app: App = .{};
+    for (0..3) |id| _ = try rig.ctx.watch().start(id, .{ .path = "." }, App.notify);
+    try std.testing.expectError(error.TestWatchUpdateFailure, rig.drain(App, &app));
+    try std.testing.expectEqual(@as(usize, 2), app.updates);
+    try std.testing.expectEqual(@as(usize, 2), App.generated);
+    Fake.require_all_stopped = true;
+    rig.effects.watches.shutdown();
+    try std.testing.expectEqual(@as(usize, 2), App.generated);
+    try std.testing.expectEqual(Fake.starts, Fake.joins);
 }
 
 const OwnershipTestPayload = struct {

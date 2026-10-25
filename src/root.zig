@@ -50,6 +50,12 @@ pub const TaskId = runtime.TaskId;
 pub const Borrowed = runtime.Borrowed;
 pub const TimerStartError = runtime.TimerStartError;
 pub const TimerOutcome = runtime.TimerOutcome;
+pub const WatchRequestId = runtime.WatchRequestId;
+pub const WatchOptions = runtime.WatchOptions;
+pub const WatchExclusion = runtime.WatchExclusion;
+pub const WatchNotice = runtime.WatchNotice;
+pub const WatchOutcome = runtime.WatchOutcome;
+pub const WatchFailure = runtime.WatchFailure;
 pub const UndeliveredPolicy = runtime.UndeliveredPolicy;
 
 pub const testing = @import("testing.zig");

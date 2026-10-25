@@ -6,6 +6,13 @@ pub export fn chasen_runtime_compile_check(allocator: *const std.mem.Allocator, 
     var requests = runtime.Requests(Msg).init(allocator.*, io.*);
     defer requests.deinit();
     var ctx = runtime.Ctx(Msg).init(&requests);
+    const Callback = struct {
+        fn notify(_: runtime.WatchNotice, _: std.mem.Allocator) ?Msg {
+            return null;
+        }
+    };
+    _ = ctx.watch().start(1, .{ .path = ".", .select = "file", .exclude = &.{.{ .subtree = "build" }} }, Callback.notify) catch {};
+    ctx.watch().cancel(1);
     ctx.quit();
     ctx.redraw().skip();
     ctx.frame().request();
@@ -20,4 +27,5 @@ pub export fn chasen_runtime_compile_check(allocator: *const std.mem.Allocator, 
 
     if (!runtime.BrowserInitialEffects.isSupported(.dispatch)) unreachable;
     if (runtime.BrowserInitialEffects.isSupported(.spawn)) unreachable;
+    if (runtime.BrowserInitialEffects.isSupported(.watch_start)) unreachable;
 }
