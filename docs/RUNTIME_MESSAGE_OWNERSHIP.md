@@ -77,15 +77,15 @@ Normal event dispatch stops after the app requests quit, but producers may
 still be active. The terminal runner therefore performs an ownership barrier
 before `App.deinit`:
 
-1. Raise the shutdown flag, prevent new starts, notify every started task of
-   cancellation before the first join, and discard pending task contexts.
+1. Raise the shutdown flag, prevent new starts, notify every started task and
+   filesystem watch of cancellation before the first join, and discard pending task contexts.
 2. Cancel the existing tty reader without allocating a helper and drain events.
 3. Cancel frame and timer futures.
 4. Await task supervisors, each the sole owner of its worker Future; deinitialize
    undelivered results on runtime, after worker-side context cleanup completes,
    then unbind the task cancellation connection from Requests.
-5. Drain already-posted messages, then release unapplied runtime-thread
-   completions through their `Effects` owner.
+5. Drain already-posted messages, then let `Effects` join watch producers and
+   release their input/mailboxes plus unapplied runtime-thread completions.
 6. Clean remaining foreground/clipboard effects and run `App.deinit`, followed
    by terminal and image-registry cleanup.
 
@@ -431,6 +431,29 @@ without callbacks, and destroys unapplied Msgs; it does not free already
 returned Msgs. Keep TestCtx and driver at their initialized addresses, do not
 drive them concurrently, and do not reset the borrowed TestCtx while in use.
 This is a Timer test driver, not a task runner or a full application runtime.
+
+## Watch Notice ownership
+
+`WatchNotice` is a non-owning value containing caller ID, request ID, and outcome.
+The runtime copies root/filter paths on admission; the caller can release or
+change the originals afterward. Rejected admission leaves the previous watch
+unchanged. A live node owns the copied input until its native producer has joined.
+
+Native producers publish bounded mailbox values, never application Msgs. Before
+calling `notify`, the runtime rejects stale generations and gives terminal failure
+priority. Cancel, replace, quit, and error unwind discard undelivered notices
+without calling `notify`. No borrowed path or native event payload is exposed.
+
+`notify(notice, allocator) ?Msg` runs on the runtime thread. Once `update` begins,
+the app owns the Msg even if update fails; a generated Msg that cannot be delivered
+uses the root `undelivered_policy`. Plain watch notices do not require `.deinit`,
+but a callback that allocates an owned Msg does. Keep callbacks short and perform
+new requests in update. During normal and error shutdown, all watch producers
+receive stop before any producer join; native input and nodes are released only
+after their producer joins, before `App.deinit`.
+
+See [Filesystem watching](RUNTIME.md#filesystem-watching) for delivery,
+filtering, platform support, and the runnable example.
 
 ## Review checklist
 

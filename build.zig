@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
         "http",
         "owned_task_result",
         "task_cancellation",
+        "filesystem_watch",
         "animation",
         "runtime_stats",
         "runtime_trace",

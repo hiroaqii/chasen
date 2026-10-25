@@ -15,6 +15,7 @@ Chasen focuses on the runtime substrate needed to build terminal applications:
 - event-driven terminal runtime backed by libvaxis
 - explicit runtime effect requests through `Ctx`
 - timers, requested frame events, and background tasks with cooperative cancellation
+- bounded filesystem change notifications on Linux
 - foreground commands with terminal handoff on Linux and macOS
 - best-effort OSC 52 clipboard writes
 - terminal image handles and placement, with an opt-in external path loader
@@ -199,6 +200,7 @@ heap-owning results; see [Runtime Message Ownership](docs/RUNTIME_MESSAGE_OWNERS
 | Quit or control redraw | `ctx.quit()`, `ctx.redraw().skip()` | [Runtime](docs/RUNTIME.md) |
 | Timers and animation frames | `ctx.timer().tick/every/cancel`, `ctx.frame().request()` | [Timing](docs/RUNTIME.md#timers-and-frames) |
 | Background work | `ctx.task().spawn/spawnOwned/requestCancel` | [Task ownership](docs/RUNTIME_MESSAGE_OWNERSHIP.md#task-context-and-cancellation) |
+| Filesystem changes (Linux) | `ctx.watch().start/cancel` | [Filesystem watching](docs/RUNTIME.md#filesystem-watching) |
 | Interactive external commands | `ctx.terminal().runForegroundCommand` | [Foreground commands](docs/RUNTIME.md#foreground-commands) |
 | Clipboard writes | `ctx.terminal().copyToClipboard` | [OSC 52 semantics](docs/RUNTIME.md#clipboard) |
 | Text, cells, and clipped regions | `Surface`, `Rect`, `Surface.child` | [Drawing](docs/SURFACE.md) |
@@ -244,6 +246,7 @@ Run any standard example with `zig build run-<name>`:
 | `http` | Background HTTP work |
 | `owned_task_result` | Heap-owning results and shutdown cleanup |
 | `task_cancellation` | Owned searches, replace/close, cooperative cancellation |
+| `filesystem_watch` | Ready/dirty notifications, selection/exclusion, cancel and manual fallback |
 | `foreground_command` | External commands with terminal handoff |
 | `animation` | Requested frame events |
 | `surface_basics`, `surface_layout` | Drawing and clipped child surfaces |

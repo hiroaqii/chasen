@@ -228,11 +228,11 @@ accessors because they are not runtime effects.
 is reset before each `update`; queued effects still drain. Resize redraws even
 when the app suppresses redraw.
 
-The internal `Effects(Msg)` owns the runtime-thread completion buffer and the
-continuation-wake flag. It borrows the request and live owners during each drain;
+The internal `Effects(Msg)` owns the runtime-thread completion buffer, the
+continuation-wake flag, and the live watch owner. It borrows other owners during each drain;
 Program keeps startup, event turns, rendering, and shutdown order explicit.
 Each effect-drain pass processes runtime-thread completions, foreground commands,
-clipboard writes, tasks, timer cancels, one-shot timers, repeating timers, images,
+clipboard writes, watch reconciliation/notices, tasks, timer cancels, one-shot timers, repeating timers, images,
 and frame requests in that order. Follow-up synchronous effects are processed
 in at most eight rounds. Remaining work schedules one coalesced continuation
 event. If the queue is full, its existing events already guarantee another turn;
@@ -240,7 +240,7 @@ the flag stays clear so a later drain can enqueue a wake.
 The eight-round limit bounds repeated passes, not elapsed time: a long-running
 callback or foreground command can still delay the event loop.
 
-Each stage detaches its own fixed-capacity value batch immediately before use.
+Queued request stages detach their fixed-capacity value batch immediately before use.
 Follow-up requests occupy separate pending storage, so an update cannot overwrite
 the batch being processed. On error, the stage releases its unconsumed suffix;
 the request owner separately releases new pending work. Detaching adds no heap
@@ -287,6 +287,10 @@ limits are separate, and starting accepted work can still fail. `frame().request
 coalesces requests; `task().requestCancel` notifies directly instead of using a
 queue in this table.
 
+Watches instead retain at most eight desired IDs across pending and active
+generations. A new ID beyond that limit returns `WatchLimitExceeded`; replacement
+of an existing ID reuses its slot. See [Filesystem watching](#filesystem-watching).
+
 Ownership on admission depends on the API:
 
 - `spawnOwned` transfers its context only on success. On an admission error,
@@ -323,6 +327,7 @@ runtime. See [message ownership](RUNTIME_MESSAGE_OWNERSHIP.md#ownership-states).
 | --- | --- | --- | --- |
 | Task | `spawnOwned` transfers context cleanup; borrowed referents stay app-owned. | `run` returns Msg or Canceled (no Msg); `failed` handles start failure. Work errors belong in Msg. | Cooperative `requestCancel`; cleanup also runs for accepted work discarded before start. Queued Msgs are not revoked. |
 | Timer | Runtime owns node/ID and copies non-owning Notice; referents stay app-owned. | `notify` receives `.fired` or start `.failed`, and may return Msg or null. | Cancel/replacement does not retract queued notices. Shutdown drops notices without calling `notify`. |
+| Filesystem watch | Runtime copies root and filter paths. | Runtime-thread `notify` receives ready/dirty/terminal values; no native event payload enters Msg. | Cancel/replacement invalidates old notices before Msg creation. Runtime stops and joins the native producer before freeing its input. |
 | Foreground command | Runtime owns copied argv/environment/path or duplicated cwd descriptor. | `finished` reports exit, signal, stopped job, failure, or abandonment; normal delivery follows TUI resume. | No per-request cancel API. Shutdown abandons queued commands; abandonment/fatal-restore Msgs use undelivered cleanup. |
 | Clipboard copy | Runtime owns copied text. | `finished` reports local send/failure; `.sent` does not prove clipboard acceptance. | No per-request cancel API; pending text is released without `finished` during shutdown. |
 | Image path load | Runtime owns copied path; app manages a delivered image handle. | `loaded` / `failed` reports loader outcome, including unsupported loading. | No per-request cancel API; unload stale handles. Shutdown releases remaining registry handles. |
@@ -338,6 +343,105 @@ cleanup order and callback behavior, see
 [task ownership](RUNTIME_MESSAGE_OWNERSHIP.md#task-context-and-cancellation),
 [timer ownership](RUNTIME_MESSAGE_OWNERSHIP.md#timer-notice-ownership), and the
 terminal-effect sections below.
+
+## Filesystem Watching
+
+Linux has a native inotify backend. On macOS and other native targets, accepted
+starts currently finish with `failed(.unsupported)`. The runtime-only Wasm API
+compiles, but browser watching is unsupported.
+
+```zig
+const request_id = try ctx.watch().start(1, .{
+    .path = "config",         // a directory; relative to cwd at native startup
+    .select = "settings.ini", // exact relative entry, including atomic replacement
+}, watchNotice);
+// Cancel from a later update (start then cancel in one update starts nothing):
+ctx.watch().cancel(1);        // allocation-free; an unknown ID is a no-op
+
+fn watchNotice(notice: chasen.WatchNotice, _: std.mem.Allocator) ?Msg {
+    return .{ .watch = notice };
+}
+```
+
+The caller's `u64` ID names a watch. Each accepted start returns a distinct
+`WatchRequestId` for that run. `WatchNotice` contains only `id`, `request_id`, and
+`outcome`; store application metadata outside it. The callback runs on the runtime
+thread, may return Msg or null, and should be short. Request again from the Msg's
+`update`, using the received Ctx.
+
+`start` copies its path/rules before acceptance. Invalid input, allocation, ID
+exhaustion, or a full watch table rejects the call without changing the old watch.
+Acceptance is not readiness: `ready` follows native coverage establishment. Begin
+the initial read then, and retain any `changed`/`rescan` arriving during a slow read
+so a successor read can reconcile it. Notifications are coalesced dirty hints,
+not an operation log or a snapshot-freshness guarantee.
+
+| Outcome | Meaning and consumer action |
+| --- | --- |
+| `ready` | Coverage established; begin the initial read. |
+| `changed` | Selected data may have changed; read current state. |
+| `rescan` | Coverage remains healthy, but the change is coarse; reconcile current state. |
+| `failed` | This generation ended and its resources were released. Choose a new start or a fallback. |
+
+Failure reasons are `unsupported`, `path_not_found`, `not_directory`,
+`access_denied`, `out_of_memory`, `resource_limit`, `worker_unavailable`,
+`io_failure`, `root_lost`, `overflow`, and `coverage_lost`. Overflow or uncertain
+coverage is terminal; Chasen does not automatically rebuild or retry. Failure
+takes priority over pending ready/dirty notices. Cancellation, replacement, and
+quit discard old notices before invoking the callback. An accepted replacement's
+startup failure does not revive the previous generation.
+
+Within one update, start then cancel starts nothing; cancel then start or several
+replacements starts only the last accepted generation. Cancel/replacement changes
+the desired generation immediately; the next effect drain stops and joins stale
+producers. At most eight notices are delivered per drain in round-robin order.
+Full queues and normal foreground close/reopen retain mailbox state; after reopen
+it is drained without requiring another filesystem event or keypress.
+
+`recursive` defaults to true. With false, only direct entries are monitored and
+`select` cannot contain a slash. `select` is one exact relative path. `exclude`
+accepts up to 16 `.exact` or `.subtree` relative paths; subtree matching uses path
+component boundaries. Rules cannot be absolute or contain empty, `.` or `..`
+components. There are no globs or Git-specific rules.
+
+For a repository-root watch, an application can set
+`.exclude = &.{ .{ .subtree = ".git" }, .{ .subtree = "zig-out" } }` to suppress
+precise Git metadata and build-output notifications. Add `.zig-cache` the same
+way if needed. These are caller-chosen paths, not built-in Git policy.
+
+Filters select precise notifications, not registrations. Coarse changes and
+coverage/identity failures bypass filters; even excluded directories consume the
+registration budget. The root must be a directory; watch a file through its parent
+and `select`. A root symlink resolves once to its canonical target at startup;
+retargeting the alias does not switch the watch. Descendant symlinks are not
+traversed. Detected root/ancestor identity loss is terminal. Inotify cannot report
+every filesystem operation (for example, mounting over a directory), so consumers
+that need stronger freshness must retain their own reconciliation policy.
+
+Limits are internal, not public settings: eight watches/run; 4,095 bytes/path and
+depth 64; 16 KiB copied input/watch; 4,096 registered directories including
+ancestors and 1 MiB stored paths/watch; 65,536 registrations/instance and
+65,536 entries/events per scan/catch-up pass. Input-limit rejection is synchronous;
+native exhaustion ends with `failed(.resource_limit)`. Each active Linux watch
+uses one thread and two persistent FDs. Unused watching adds only fixed metadata,
+with no allocation, thread, FD, filesystem I/O, or periodic wake. Stop wakes idle
+poll without allocation; join precedes freeing native input and storage. This
+assumes local filesystems and completing OS calls, not forcibly interruptible I/O.
+
+The [filesystem_watch example](../examples/filesystem_watch/main.zig) reads a small
+file after ready/dirty and leaves retry/manual reading to the user:
+
+```sh
+mkdir -p watch-demo
+printf 'hello\n' > watch-demo/message.txt
+zig build run-filesystem_watch
+```
+
+Edit or atomically replace that file from another terminal. `s` starts/replaces,
+`c` cancels, `r` reads manually (also after unsupported/failure), and `q` quits.
+The example reads at most 4 KiB synchronously for clarity; slow work belongs in
+an application task. For generated Msg cleanup, see
+[Watch Notice ownership](RUNTIME_MESSAGE_OWNERSHIP.md#watch-notice-ownership).
 
 ## Timers and Frames
 
