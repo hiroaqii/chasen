@@ -94,7 +94,7 @@ const WatchDemo = struct {
 
     pub fn view(self: *const WatchDemo, sfc: *chasen.Surface) !void {
         var col = sfc.column(.{ .gap = 1 });
-        col.borrowText("Filesystem watch (Linux)", .{ .bold = true });
+        col.borrowText("Filesystem watch (Linux / macOS)", .{ .bold = true });
         col.borrowText("s: start/replace  c: cancel  r: manual read  q: quit", .{ .fg = .gray });
         col.borrowText("Edit watch-demo/message.txt from another terminal.", .{});
         try col.print("watch: {s} | read: {s}", .{ self.watch_status, self.read_status });

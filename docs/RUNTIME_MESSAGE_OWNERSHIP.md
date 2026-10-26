@@ -452,6 +452,13 @@ new requests in update. During normal and error shutdown, all watch producers
 receive stop before any producer join; native input and nodes are released only
 after their producer joins, before `App.deinit`.
 
+On macOS, the startup root FD and temporary CoreFoundation path objects are
+released within startup. The live node owns its FSEvents stream and serial queue,
+including on partial startup failure. Stop/invalidate precedes join; join drains
+the queue, releases the stream, drains again, and releases the queue. Only then
+can the runtime free the callback context and copied input. Native callbacks never
+own application Msgs.
+
 See [Filesystem watching](RUNTIME.md#filesystem-watching) for delivery,
 filtering, platform support, and the runnable example.
 

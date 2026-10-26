@@ -346,9 +346,9 @@ terminal-effect sections below.
 
 ## Filesystem Watching
 
-Linux has a native inotify backend. On macOS and other native targets, accepted
-starts currently finish with `failed(.unsupported)`. The runtime-only Wasm API
-compiles, but browser watching is unsupported.
+Linux uses inotify and macOS uses FSEvents. Other native targets, including
+Windows, finish accepted starts with `failed(.unsupported)`. The runtime-only
+Wasm API compiles, but browser watching is unsupported.
 
 ```zig
 const request_id = try ctx.watch().start(1, .{
@@ -398,8 +398,8 @@ producers. At most eight notices are delivered per drain in round-robin order.
 Full queues and normal foreground close/reopen retain mailbox state; after reopen
 it is drained without requiring another filesystem event or keypress.
 
-`recursive` defaults to true. With false, only direct entries are monitored and
-`select` cannot contain a slash. `select` is one exact relative path. `exclude`
+`recursive` defaults to true. With false, precise notifications cover only direct
+entries and `select` cannot contain a slash. `select` is one exact relative path. `exclude`
 accepts up to 16 `.exact` or `.subtree` relative paths; subtree matching uses path
 component boundaries. Rules cannot be absolute or contain empty, `.` or `..`
 components. There are no globs or Git-specific rules.
@@ -409,24 +409,45 @@ For a repository-root watch, an application can set
 precise Git metadata and build-output notifications. Add `.zig-cache` the same
 way if needed. These are caller-chosen paths, not built-in Git policy.
 
-Filters select precise notifications, not registrations. Coarse changes and
-coverage/identity failures bypass filters; even excluded directories consume the
-registration budget. The root must be a directory; watch a file through its parent
+Filters select precise notifications, not native coverage. Coarse changes and
+coverage/identity failures bypass filters; on Linux, excluded directories still
+consume the registration budget. On macOS, directory/coarse events and uncertain
+case, Unicode spelling, or root-prefix matches produce `rescan`, even when a filter
+or `recursive = false` would exclude a precise event. macOS requires UTF-8 paths
+and filters; unsupported encoding ends the accepted generation with
+`failed(.unsupported)`.
+
+The root must be a directory; watch a file through its parent
 and `select`. A root symlink resolves once to its canonical target at startup;
 retargeting the alias does not switch the watch. Descendant symlinks are not
 traversed. Detected root/ancestor identity loss is terminal. Inotify cannot report
 every filesystem operation (for example, mounting over a directory), so consumers
 that need stronger freshness must retain their own reconciliation policy.
 
-Limits are internal, not public settings: eight watches/run; 4,095 bytes/path and
-depth 64; 16 KiB copied input/watch; 4,096 registered directories including
-ancestors and 1 MiB stored paths/watch; 65,536 registrations/instance and
-65,536 entries/events per scan/catch-up pass. Input-limit rejection is synchronous;
-native exhaustion ends with `failed(.resource_limit)`. Each active Linux watch
-uses one thread and two persistent FDs. Unused watching adds only fixed metadata,
-with no allocation, thread, FD, filesystem I/O, or periodic wake. Stop wakes idle
-poll without allocation; join precedes freeing native input and storage. This
-assumes local filesystems and completing OS calls, not forcibly interruptible I/O.
+Limits are internal, not public settings. Both backends allow eight watches/run,
+4,095 bytes/path, depth 64, and 16 KiB copied input/watch. Input-limit rejection is
+synchronous; native exhaustion ends with `failed(.resource_limit)`.
+
+Linux additionally limits each watch to 4,096 registered directories including
+ancestors and 1 MiB stored paths, each instance to 65,536 registrations, and each
+scan/catch-up pass to 65,536 entries/events. Each active Linux watch uses one
+thread and two persistent FDs; stop wakes idle poll without allocation.
+
+macOS uses one FSEvents stream and serial dispatch queue per watch, with a fixed
+root/ancestor identity snapshot. Canonical and event paths have the same byte/depth
+limits above. Each callback accepts at most 65,536 events and 1 MiB of path bytes,
+without allocating or walking the tree. Dropped events terminate with `overflow`;
+root/ancestor loss with `root_lost`; event-ID wrap, mount/unmount, or unknown flags
+with `coverage_lost`. Stop invalidates the stream, and join drains callbacks before
+releasing the stream, queue, and callback context. Framework-owned process-wide
+pools may remain after the last watch; cleanup does not promise a cold-process
+FD/thread count.
+
+Unused watching adds only fixed metadata, with no allocation, thread, native
+handle, filesystem I/O, or periodic wake. Both backends join before freeing native
+input and storage. This assumes local filesystems and completing OS calls, not
+forcibly interruptible I/O. Native notifications cannot detect every silent service
+failure; consumers needing stronger freshness retain their own reconciliation.
 
 The [filesystem_watch example](../examples/filesystem_watch/main.zig) reads a small
 file after ready/dirty and leaves retry/manual reading to the user:
