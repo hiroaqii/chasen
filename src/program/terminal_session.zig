@@ -394,11 +394,11 @@ fn queryTerminal(
     modes.in_band_resize = true; // query emits 2048 even without a response
     errdefer modes.poison(vx, writer);
     try vx.queryTerminalSend(writer);
-    try std.Io.futexWaitTimeout(
+    const waited = std.Io.futexWaitTimeout(
         io,
-        std.atomic.Value(u32),
-        &vx.query_futex,
-        .init(0),
+        u32,
+        &vx.query_futex.raw,
+        0,
         .{
             .duration = .{
                 .clock = .real,
@@ -407,7 +407,9 @@ fn queryTerminal(
         },
     );
 
-    vx.queries_done.store(true, .unordered);
+    // End capability probes before enabling features or propagating cancellation.
+    vx.finishQueries();
+    try waited;
     if (keyboard_protocol == .legacy) {
         vx.caps.kitty_keyboard = false;
     }
@@ -421,6 +423,35 @@ fn queryTerminal(
     modes.kitty_flags = @bitCast(vx.opts.kitty_keyboard_flags);
     if (kitty) try modes.setKitty(vx, writer, true);
     try reader.start();
+}
+
+test "terminal query timeout preserves Shift+F3 and allows cursor position queries" {
+    const SilentReader = struct {
+        pub fn stop(_: *@This()) void {}
+        pub fn start(_: *@This()) !void {}
+    };
+    const allocator = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(allocator);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var vx = try vaxis.Vaxis.init(std.testing.io, allocator, &env, .{});
+    defer vx.deinit(allocator, &output.writer);
+
+    var reader: SilentReader = .{};
+    var modes: TerminalModes = .{};
+    try queryTerminal(&vx, &output.writer, std.testing.io, .fromMilliseconds(1), .legacy, &modes, &reader);
+
+    var parser: vaxis.Parser = .{ .cursor_position_requests = &vx.cursor_position_requests };
+    const parsed = try parser.parse("\x1b[1;2R", null);
+    const event = parsed.event orelse return error.TestUnexpectedResult;
+    try std.testing.expect(event == .key_press);
+    try std.testing.expectEqual(vaxis.Key.f3, event.key_press.codepoint);
+    try std.testing.expect(event.key_press.mods.shift);
+
+    const before_query = output.written().len;
+    try vx.queryCursorPosition(&output.writer);
+    try std.testing.expectEqualStrings("\x1b[6n", output.written()[before_query..]);
 }
 
 fn useUnicodeWidth(vx: *vaxis.Vaxis) void {

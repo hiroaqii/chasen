@@ -16,7 +16,7 @@ const max_display = 512;
 /// allocator-owned slice would require an ownership protocol in the app. Keeping
 /// a small fixed-size buffer makes the demo explicit and leak-free.
 const BoundedStr = struct {
-    buf: [max_display]u8 = .{0} ** max_display,
+    buf: [max_display]u8 = @splat(0),
     len: usize = 0,
 
     fn slice(self: *const BoundedStr) []const u8 {
@@ -230,7 +230,7 @@ const HttpDemo = struct {
         var display: BoundedStr = .{};
         display.appendFmt("Request:\n{s} {s}\nuser-agent: chasen-http-demo\naccept: text/html\n\n", .{ @tagName(method), url });
         display.appendFmt("Response:\n{d} {s}\n", .{
-            @intFromEnum(response.head.status),
+            @backingInt(response.head.status),
             response.head.status.phrase() orelse response.head.reason,
         });
         if (response.head.content_type) |content_type| {

@@ -322,9 +322,8 @@ fn shutdownRuntime(
 
     timers.shutdown();
 
-    // A worker outcome is exclusive: `.posted` means the queue owns the Msg;
-    // `.undelivered` means the future still owns it. Drain once more after all
-    // futures settle so every `.posted` outcome reaches typed cleanup too.
+    // Joining reclaims undelivered messages from their task nodes. The queue
+    // owns posted messages, including those that raced with the first drain.
     tasks.join(app_ctx.requests);
 
     drainInternalEventsForShutdown(App.Msg, &terminal.loop, allocator);

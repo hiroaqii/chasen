@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const mod = b.addModule("chasen", .{
+    const module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
         .optimize = optimize,
         .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
@@ -22,7 +22,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
-    });
+    };
+    const mod = b.addModule("chasen", module_options);
     if (target.result.os.tag == .macos) {
         mod.linkFramework("CoreServices", .{});
         mod.linkFramework("CoreFoundation", .{});
@@ -135,8 +136,19 @@ pub fn build(b: *std.Build) void {
     const io_threaded_check_step = b.step("check-io-threaded", "Run the std.Io.Threaded smoke test");
     io_threaded_check_step.dependOn(&run_io_threaded_check.step);
 
+    const linux_test_c = if (target.result.os.tag == .linux) b.addTranslateC(.{
+        .root_source_file = b.path("test/linux_test.h"),
+        .target = target,
+        .optimize = optimize,
+    }).createModule() else null;
+    // Only the Linux test root needs the translated PTY declarations.
+    const test_mod = if (linux_test_c) |c| blk: {
+        const linux_tests = b.createModule(module_options);
+        linux_tests.addImport("linux_test_c", c);
+        break :blk linux_tests;
+    } else mod;
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .use_llvm = true,
         .use_lld = if (target.result.os.tag == .linux) true else null,
         .filters = test_filters,
@@ -295,6 +307,7 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                    .{ .name = "linux_test_c", .module = linux_test_c.? },
                 },
             }),
             .use_llvm = true,
@@ -319,7 +332,10 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                .imports = &.{.{ .name = "chasen", .module = mod }},
+                .imports = &.{
+                    .{ .name = "chasen", .module = mod },
+                    .{ .name = "linux_test_c", .module = linux_test_c.? },
+                },
             }),
             .use_llvm = true,
             .use_lld = if (target.result.os.tag == .linux) true else null,

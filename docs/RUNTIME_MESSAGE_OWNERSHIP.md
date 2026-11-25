@@ -59,17 +59,15 @@ Run it from a repository checkout with `zig build run-owned_task_result`.
 
 | State | Owner | Next step |
 |---|---|---|
-| A task or callback is constructing `Msg` | Producer | Move it to the event queue, a runtime-thread completion buffer, or a task future outcome |
+| A task or callback is constructing `Msg` | Producer | Move it to the event queue, a runtime-thread completion buffer, or the stable task node |
 | `Msg` is in the event queue | Chasen runtime | Deliver it to `App.update` or call `deinitUndelivered` during shutdown drain |
 | `Msg` is passed to `App.update` | Application | Consume, move, or deinitialize the payload, including when `update` returns an error |
-| A worker cannot post because shutdown began | Task future outcome | Runtime thread awaits the future and calls `deinitUndelivered` |
+| A worker cannot post because of shutdown, cancellation, or input failure | Stable task node | Runtime thread joins the supervisor and calls `deinitUndelivered` |
 | A runtime-thread callback cannot be delivered | Runtime completion buffer | Deliver in the next bounded effect-drain round or call `deinitUndelivered` during unwind |
 
-There is no path where both the event queue and a task future own the same
-message. A worker retries non-blocking queue transfer while the runtime is
-active. Successful transfer returns `.posted`; shutdown or transfer failure
-returns `.undelivered(Msg)` to the future. Only the owner selected by that
-outcome performs the final action.
+The worker retries queue transfer while the runtime is active. When the queue
+accepts the message, the worker records `.posted` in its task node. If delivery
+fails, the node holds `.undelivered(Msg)` until the runtime thread disposes of it.
 
 ## Shutdown sequence
 
@@ -192,6 +190,8 @@ connection.
 
 A supervisor waits for publication of its optional worker Future, then for
 completion or a cancellation request, and alone awaits/cancels that Future.
+Both Futures return `void`. The worker writes its delivery outcome before waking
+the supervisor. The runtime joins the supervisor before reading or freeing the node.
 Runtime reaps only completed supervisors during ordinary effect drain; a last
 completion may wait for the next event or shutdown. Each started task costs two
 Io concurrency units. Threaded retains its peak thread pool until backend deinit;

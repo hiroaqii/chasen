@@ -638,6 +638,12 @@ try chasen.runWith(.{
 }, App{});
 ```
 
+Custom image loaders using `TerminalImageLoaderVaxis.transmitImage` now pass
+`(allocator, tty, bytes, width, height, format)`. Use a PNG file's bytes for
+`.png`, or packed pixels for `.rgb` and `.rgba`. `loadImage` reads PNG files
+and PNG buffers. To send bytes that are already Base64-encoded, use
+`transmitPreEncodedImage(tty, bytes, width, height, format)`.
+
 The optional `image_loader_context` is caller-owned. Image load callbacks receive
 a request id for stale-result checks. Delivered image handles are app-managed:
 queue `ctx.image().unload(handle)` when no longer needed, including stale loads.

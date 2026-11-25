@@ -81,13 +81,13 @@ fn validateValue(comptime T: type) void {
         .void, .bool, .int, .float, .@"enum" => {},
         .array => |array| validateValue(array.child),
         .optional => |optional| validateValue(optional.child),
-        .@"struct" => |info| for (info.fields) |field| {
-            validateValue(field.type);
+        .@"struct" => |info| for (info.field_types) |Field| {
+            validateValue(Field);
         },
         .@"union" => |info| {
             if (info.tag_type == null)
                 @compileError("TimerNotice must use tagged unions");
-            for (info.fields) |field| validateValue(field.type);
+            for (info.field_types) |Field| validateValue(Field);
         },
         .pointer => @compileError("TimerNotice references require explicit Borrowed"),
         else => @compileError("TimerNotice supports only values and explicit Borrowed references"),

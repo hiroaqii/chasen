@@ -2,22 +2,7 @@
 //! production foreground commands execute their requested argv directly.
 const std = @import("std");
 const chasen = @import("chasen");
-const c = @cImport({
-    @cInclude("pty.h");
-    @cInclude("errno.h");
-    @cInclude("sys/resource.h");
-    @cInclude("unistd.h");
-    @cInclude("signal.h");
-    @cInclude("sys/wait.h");
-    @cInclude("sys/prctl.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("poll.h");
-    @cInclude("fcntl.h");
-    @cInclude("time.h");
-    @cInclude("stdlib.h");
-    @cInclude("stdio.h");
-    @cInclude("sys/stat.h");
-});
+const c = @import("linux_test_c");
 extern "c" var environ: [*:null]?[*:0]u8;
 
 fn write(fd: c_int, bytes: []const u8) !void {
@@ -80,8 +65,8 @@ const App = struct {
                 if (std.mem.eql(u8, self.mode, "cwd-env")) {
                     var original_buf: [64]u8 = undefined;
                     var renamed_buf: [64]u8 = undefined;
-                    const original = try std.fmt.bufPrintZ(&original_buf, "original-{d}", .{self.count});
-                    const renamed = try std.fmt.bufPrintZ(&renamed_buf, "renamed-{d}", .{self.count});
+                    const original = try std.fmt.bufPrintSentinel(&original_buf, "original-{d}", .{self.count}, 0);
+                    const renamed = try std.fmt.bufPrintSentinel(&renamed_buf, "renamed-{d}", .{self.count}, 0);
                     if (c.mkdir(original, 0o700) != 0) return error.CwdSetupFailed;
                     const fd = c.open(original, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
                     if (fd < 0) return error.CwdSetupFailed;
@@ -372,13 +357,29 @@ fn runCase(executable: [:0]const u8, mode: [:0]const u8, enhanced: bool, resize_
     return error.FixtureTimeout;
 }
 
+// Observe terminal restoration through the host libc's own ABI.
+fn readTerminalAttributes() !c.struct_termios {
+    var attr = std.mem.zeroes(c.struct_termios);
+    if (c.tcgetattr(0, &attr) != 0) return error.TermiosReadFailed;
+    return attr;
+}
+
+fn expectTerminalRestored(before: *const c.struct_termios) !void {
+    const after = try readTerminalAttributes();
+    if (before.c_iflag != after.c_iflag or before.c_oflag != after.c_oflag or
+        before.c_cflag != after.c_cflag or before.c_lflag != after.c_lflag or
+        before.c_line != after.c_line or !std.mem.eql(c.cc_t, &before.c_cc, &after.c_cc) or
+        c.cfgetispeed(before) != c.cfgetispeed(&after) or c.cfgetospeed(before) != c.cfgetospeed(&after))
+        return error.TermiosLeaked;
+}
+
 pub fn main(init: std.process.Init) !void {
     const no_core: c.struct_rlimit = .{ .rlim_cur = 0, .rlim_max = 0 };
     _ = c.setrlimit(c.RLIMIT_CORE, &no_core);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--child")) runChild(args[2]);
     if (args.len >= 4 and std.mem.eql(u8, args[1], "--app")) {
-        const original = try std.posix.tcgetattr(0);
+        const original = try readTerminalAttributes();
         if (std.mem.eql(u8, args[2], "exit") and std.mem.eql(u8, args[3], "legacy")) {
             for (0..2) |limit| {
                 var small: std.Io.Threaded = .init(init.gpa, .{ .concurrent_limit = .limited(limit) });
@@ -386,7 +387,7 @@ pub fn main(init: std.process.Init) !void {
                 if (chasen.runWith(.{ .runtime = .{ .allocator = init.gpa, .io = small.io() }, .terminal = .{ .env_map = init.environ_map } }, App{ .executable = args[0], .mode = "init-failure" })) |_| {
                     return error.ExpectedCapacityFailure;
                 } else |err| if (err != error.ConcurrencyUnavailable) return err;
-                if (!std.meta.eql(original, try std.posix.tcgetattr(0))) return error.TermiosLeaked;
+                try expectTerminalRestored(&original);
                 try expectFreeSlots(small.io(), limit);
             }
         }
@@ -413,7 +414,7 @@ pub fn main(init: std.process.Init) !void {
             if (result) |_| return error.ExpectedInputFailure else |err| if (err != error.EndOfStream) return err;
         } else try result;
         if (!fail_restart and !cleaned) return error.AppNotCleaned;
-        if (!std.meta.eql(original, try std.posix.tcgetattr(0))) return error.TermiosLeaked;
+        try expectTerminalRestored(&original);
         // Limit the same backend after return so leaked resident futures cannot
         // hide behind the default unlimited admission used for normal restarts.
         probe.threaded.concurrent_limit = .limited(2);

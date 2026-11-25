@@ -261,12 +261,12 @@ pub const Backend = struct {
 
     fn acquired(self: *Backend, resource: Resource) void {
         if (builtin.is_test) if (self.hooks) |hooks| {
-            hooks.acquired[@intFromEnum(resource)] += 1;
+            hooks.acquired[@backingInt(resource)] += 1;
         };
     }
     fn released(self: *Backend, resource: Resource) void {
         if (builtin.is_test) if (self.hooks) |hooks| {
-            hooks.released[@intFromEnum(resource)] += 1;
+            hooks.released[@backingInt(resource)] += 1;
         };
     }
     fn inject(self: *Backend, stage: Stage) bool {
@@ -573,7 +573,7 @@ test "watch macos stop drains an active callback before releasing its context" {
     try std.testing.expect(hooks.entered.isSet());
     live.backend.requestStop();
     try std.testing.expect(!hooks.exited.isSet());
-    try std.testing.expectEqual(@as(usize, 0), hooks.released[@intFromEnum(Resource.stream)]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.released[@backingInt(Resource.stream)]);
     const Joiner = struct {
         backend: *Backend,
         entered: std.Io.Event = .unset,

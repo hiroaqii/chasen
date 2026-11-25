@@ -6,15 +6,15 @@ const chasen = @import("chasen");
 // The trace callback runs on the runtime path, so it should do only cheap work.
 // This example counts lifecycle boundary events in caller-owned storage. The
 // app then reads that collector during view.
-const trace_event_count = @typeInfo(chasen.TraceEvent).@"enum".fields.len;
+const trace_event_count = @typeInfo(chasen.TraceEvent).@"enum".field_names.len;
 
 const TraceCollector = struct {
-    counts: [trace_event_count]u64 = [_]u64{0} ** trace_event_count,
+    counts: [trace_event_count]u64 = @splat(0),
     total: u64 = 0,
     last: ?chasen.TraceEvent = null,
 
     fn count(self: *const TraceCollector, event: chasen.TraceEvent) u64 {
-        return self.counts[@intFromEnum(event)];
+        return self.counts[@backingInt(event)];
     }
 };
 
@@ -22,7 +22,7 @@ fn onTrace(context: ?*anyopaque, event: chasen.TraceEvent) void {
     // trace_context is caller-owned and type-erased by RunOptions. The callback
     // casts it back to the concrete collector type it expects.
     const collector: *TraceCollector = @ptrCast(@alignCast(context.?));
-    collector.counts[@intFromEnum(event)] += 1;
+    collector.counts[@backingInt(event)] += 1;
     collector.total += 1;
     collector.last = event;
 }

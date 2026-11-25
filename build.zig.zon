@@ -2,12 +2,12 @@
     .name = .chasen,
     .version = "0.1.4",
     .fingerprint = 0xf14d75094947f996, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .vaxis = .{
             // Input errors close the queue; normal restart preserves its buffer.
-            .url = "git+https://github.com/rockorager/libvaxis.git#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
-            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
+            .url = "git+https://github.com/rockorager/libvaxis.git#25b4bd7371cc3c32049e103ab292a525a1ecb7a7",
+            .hash = "vaxis-0.6.0-BWNV_G8gDgCNWI48cFKWal2NROjTRQXumw3ssMDeD6jt",
         },
     },
     .paths = .{

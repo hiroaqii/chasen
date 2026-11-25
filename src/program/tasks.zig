@@ -84,9 +84,8 @@ pub fn TaskRuntime(comptime Msg: type) type {
                     index += 1;
                     continue;
                 }
-                // The helper has finished its work, but the backend may still be
-                // storing its return value. Join before reading the result or freeing
-                // the stable node that carries the completion flag.
+                // The flag selects a node for reaping. Join before inspecting its
+                // delivery or freeing storage shared with the worker.
                 const task = self.pending.swapRemove(index);
                 task.awaitAndDestroy(self.allocator, self.io);
             }
@@ -97,8 +96,8 @@ pub fn TaskRuntime(comptime Msg: type) type {
             for (self.pending.items) |task| task.requestCancel(self.io);
         }
 
-        /// Called after requestShutdown. Only supervisors own worker Futures;
-        /// joining them returns undelivered messages to this runtime thread.
+        /// Each supervisor joins its worker. Joining the supervisor lets this
+        /// runtime thread reclaim the node and any undelivered message.
         pub fn join(self: *Self, requests: *requests_mod.Requests(Msg)) void {
             for (self.pending.items) |task| task.awaitAndDestroy(self.allocator, self.io);
             self.pending.deinit(self.allocator);
@@ -121,8 +120,13 @@ fn PendingTask(comptime Msg: type) type {
         const Self = @This();
 
         id: requests_mod.TaskId = undefined,
-        future: std.Io.Future(TaskDelivery(Msg)) = undefined,
-        worker: ?std.Io.Future(TaskDelivery(Msg)) = null,
+        // Keep application messages in the aligned node on Zig 0.17.1.
+        // https://codeberg.org/ziglang/zig/issues/37586
+        future: std.Io.Future(void) = undefined,
+        worker: ?std.Io.Future(void) = null,
+        // Written only by the worker; read only after joining the supervisor,
+        // which joins the worker. Worker admission/run failure leaves .none.
+        delivery: TaskDelivery(Msg) = .none,
         published: std.Io.Event = .unset,
         wake: std.Io.Event = .unset,
         cancel_requested: std.atomic.Value(bool) = .init(false),
@@ -140,19 +144,19 @@ fn PendingTask(comptime Msg: type) type {
             self.wake.set(io);
         }
 
-        fn supervise(self: *Self, io: std.Io) TaskDelivery(Msg) {
+        fn supervise(self: *Self, io: std.Io) void {
             defer self.completed.store(true, .release);
             // Runtime never cancels this supervisor. Publication must happen
             // even after worker admission failure, before runtime can unwind.
             self.published.waitUncancelable(io);
-            const worker = if (self.worker) |*worker| worker else return .none;
+            const worker = if (self.worker) |*worker| worker else return;
             self.wake.waitUncancelable(io);
-            return if (self.cancel_requested.load(.acquire)) worker.cancel(io) else worker.await(io);
+            if (self.cancel_requested.load(.acquire)) worker.cancel(io) else worker.await(io);
         }
 
         fn awaitAndDestroy(self: *Self, allocator: std.mem.Allocator, io: std.Io) void {
-            var outcome = self.future.await(io);
-            switch (outcome) {
+            self.future.await(io);
+            switch (self.delivery) {
                 .none, .posted => {},
                 .undelivered => |*msg| runtime.deinitUndeliveredMessage(Msg, msg, allocator),
             }
@@ -163,9 +167,8 @@ fn PendingTask(comptime Msg: type) type {
 
 /// Transfer one worker-produced message without entering vaxis' blocking push.
 ///
-/// The worker keeps the only owner until `tryPostEvent` succeeds. Shutdown or a
-/// input error returns that owner through the future so the runtime thread can
-/// dispose it. This makes `.posted` and `.undelivered` mutually exclusive.
+/// The worker owns the message until `tryPostEvent` succeeds. On shutdown or
+/// input failure it returns the undelivered message for the runtime to dispose.
 fn transferTaskMessage(
     comptime Msg: type,
     msg: Msg,
@@ -197,10 +200,10 @@ fn SpawnHelper(comptime Msg: type) type {
             loop_ptr: *vaxis.Loop(InternalEvent(Msg)),
             shutting_down: *const std.atomic.Value(bool),
             pending: *PendingTask(Msg),
-        ) TaskDelivery(Msg) {
+        ) void {
             defer pending.wake.set(spawn_io);
-            const msg = task.run(alloc, spawn_io) catch return .none;
-            return transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
+            const msg = task.run(alloc, spawn_io) catch return;
+            pending.delivery = transferTaskMessage(Msg, msg, spawn_io, loop_ptr, shutting_down);
         }
     };
 }
@@ -221,8 +224,20 @@ fn appendTaskStartFailure(
 
 const OwnershipTestPayload = struct {
     bytes: []u8,
+    samples: [256]u8 align(16),
     deinit_count: *usize,
-    owner_thread: ?std.Thread.Id = null,
+    owner_thread: std.Thread.Id,
+
+    fn init(bytes: []u8, deinit_count: *usize) OwnershipTestPayload {
+        var result: OwnershipTestPayload = .{
+            .bytes = bytes,
+            .samples = undefined,
+            .deinit_count = deinit_count,
+            .owner_thread = std.Thread.getCurrentId(),
+        };
+        for (&result.samples, 0..) |*sample, i| sample.* = bytes[i % bytes.len];
+        return result;
+    }
 };
 
 const OwnershipTestMsg = union(enum) {
@@ -233,7 +248,8 @@ const OwnershipTestMsg = union(enum) {
     pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
         switch (self.*) {
             .owned => |owned| {
-                if (owned.owner_thread) |thread| std.debug.assert(thread == std.Thread.getCurrentId());
+                std.debug.assert(owned.owner_thread == std.Thread.getCurrentId());
+                for (owned.samples, 0..) |sample, i| std.debug.assert(sample == owned.bytes[i % owned.bytes.len]);
                 allocator.free(owned.bytes);
                 owned.deinit_count.* += 1;
             },
@@ -267,11 +283,8 @@ const ReapingTestTask = struct {
     fn create(counts: *Counts) !*ReapingTestTask {
         const self = try std.testing.allocator.create(ReapingTestTask);
         errdefer std.testing.allocator.destroy(self);
-        self.* = .{ .counts = counts, .payload = .{
-            .bytes = try std.testing.allocator.dupe(u8, "task result"),
-            .deinit_count = &counts.payloads,
-            .owner_thread = std.Thread.getCurrentId(),
-        } };
+        const bytes = try std.testing.allocator.dupe(u8, "task result");
+        self.* = .{ .counts = counts, .payload = .init(bytes, &counts.payloads) };
         return self;
     }
 
@@ -313,6 +326,11 @@ test "task reclamation bounds repeated plain and owned tasks results including e
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const Msg = OwnershipTestMsg;
+    comptime {
+        const Node = PendingTask(Msg);
+        std.debug.assert(@FieldType(Node, "future") == std.Io.Future(void));
+        std.debug.assert(@FieldType(Node, "worker") == ?std.Io.Future(void));
+    }
     var ctx_requests = requests_mod.Requests(Msg).init(allocator, io);
     var ctx = ctx_mod.Ctx(Msg).init(&ctx_requests);
     var tasks = TaskRuntime(Msg).init(allocator, io);
@@ -574,10 +592,10 @@ test "task failure completion overflow discards all remaining taken contexts" {
     try completions.init(allocator);
     defer completions.deinitUndelivered(allocator);
     var buffer_payloads: usize = 0;
-    for (0..RuntimeCompletionBuffer(Msg).capacity) |_| try completions.append(.{ .owned = .{
-        .bytes = try allocator.dupe(u8, "already buffered"),
-        .deinit_count = &buffer_payloads,
-    } });
+    for (0..RuntimeCompletionBuffer(Msg).capacity) |_| {
+        const bytes = try allocator.dupe(u8, "already buffered");
+        try completions.append(.{ .owned = .init(bytes, &buffer_payloads) });
+    }
     var counts: ReapingTestTask.Counts = .{};
     for (0..3) |_| _ = try ctx.task().spawnOwned(try ReapingTestTask.create(&counts), .{
         .run = ReapingTestTask.run,
@@ -603,7 +621,7 @@ test "task delivery returns undelivered message after shutdown barrier" {
     // or Io and must return the sole message owner to the runtime thread.
     const outcome = transferTaskMessage(
         OwnershipTestMsg,
-        .{ .owned = .{ .bytes = bytes, .deinit_count = &deinit_count } },
+        .{ .owned = .init(bytes, &deinit_count) },
         undefined,
         undefined,
         &shutting_down,
@@ -626,10 +644,7 @@ test "task delivery transfers posted message to queue exactly once" {
 
     const outcome = transferTaskMessage(
         OwnershipTestMsg,
-        .{ .owned = .{
-            .bytes = try std.testing.allocator.dupe(u8, "posted-result"),
-            .deinit_count = &deinit_count,
-        } },
+        .{ .owned = .init(try std.testing.allocator.dupe(u8, "posted-result"), &deinit_count) },
         std.testing.io,
         &loop,
         &shutting_down,
@@ -645,12 +660,13 @@ test "task delivery escapes full queue when shutdown begins" {
     const Event = InternalEvent(OwnershipTestMsg);
     const Transfer = struct {
         fn run(
-            msg: OwnershipTestMsg,
+            msg: *const OwnershipTestMsg,
             io: std.Io,
             loop: *vaxis.Loop(Event),
             shutting_down: *const std.atomic.Value(bool),
-        ) TaskDelivery(OwnershipTestMsg) {
-            return transferTaskMessage(OwnershipTestMsg, msg, io, loop, shutting_down);
+            result: *TaskDelivery(OwnershipTestMsg),
+        ) void {
+            result.* = transferTaskMessage(OwnershipTestMsg, msg.*, io, loop, shutting_down);
         }
     };
 
@@ -662,20 +678,19 @@ test "task delivery escapes full queue when shutdown begins" {
     var deinit_count: usize = 0;
     const bytes = try std.testing.allocator.dupe(u8, "blocked-result");
     var shutting_down: std.atomic.Value(bool) = .init(false);
+    const msg: OwnershipTestMsg = .{ .owned = .init(bytes, &deinit_count) };
+    var outcome: TaskDelivery(OwnershipTestMsg) = .none;
     var future = try std.testing.io.concurrent(Transfer.run, .{
-        OwnershipTestMsg{ .owned = .{ .bytes = bytes, .deinit_count = &deinit_count } },
-        std.testing.io,
-        &loop,
-        &shutting_down,
+        &msg, std.testing.io, &loop, &shutting_down, &outcome,
     });
 
     // The producer may already be retrying or may start after this store. In
     // either case it must return the message instead of blocking on queue push.
     shutting_down.store(true, .seq_cst);
-    var outcome = future.await(std.testing.io);
+    future.await(std.testing.io);
     switch (outcome) {
         .none, .posted => return error.TestUnexpectedResult,
-        .undelivered => |*msg| runtime.deinitUndeliveredMessage(OwnershipTestMsg, msg, std.testing.allocator),
+        .undelivered => |*undelivered| runtime.deinitUndeliveredMessage(OwnershipTestMsg, undelivered, std.testing.allocator),
     }
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
 
