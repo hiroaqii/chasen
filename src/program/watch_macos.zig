@@ -628,41 +628,78 @@ test "watch macos callback bounds and dropped events terminate the production ma
     try std.testing.expect(!boundedPath(&deep));
 }
 
+const TestDirectoryFd = struct {
+    path: [:0]const u8,
+    id: Identity,
+
+    fn init(path: [:0]const u8) !TestDirectoryFd {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, path, &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) return error.FdInventoryFailed;
+        return .{ .path = path, .id = identity(stat) };
+    }
+
+    const Entry = extern struct { fd: i32, kind: u32 };
+    const Match = struct { fd: i32, path: []const u8 };
+    extern "c" fn proc_pidinfo(c_int, c_int, u64, ?*anyopaque, c_int) c_int;
+
+    fn findExtra(dirs: []const TestDirectoryFd, fixture_fd: i32) !?Match {
+        const proc_pidlistfds = 1;
+        const prox_fdtype_vnode = 1;
+        var entries: [1024]Entry = undefined;
+        const bytes = proc_pidinfo(std.c.getpid(), proc_pidlistfds, 0, &entries, @sizeOf(@TypeOf(entries)));
+        if (bytes <= 0 or bytes >= @sizeOf(@TypeOf(entries)) or @rem(bytes, @sizeOf(Entry)) != 0)
+            return error.FdInventoryFailed;
+        for (entries[0 .. @as(usize, @intCast(bytes)) / @sizeOf(Entry)]) |entry| {
+            if (entry.fd == fixture_fd or entry.kind != prox_fdtype_vnode) continue;
+            var stat: std.c.Stat = undefined;
+            if (std.c.fstat(entry.fd, &stat) != 0) {
+                if (std.c.errno(@as(c_int, -1)) == .BADF) continue; // Closed since enumeration.
+                return error.FdInventoryFailed;
+            }
+            for (dirs) |dir| {
+                if (std.meta.eql(dir.id, identity(stat))) return .{ .fd = entry.fd, .path = dir.path };
+            }
+        }
+        return null;
+    }
+};
+
 test "watch macos nonrecursive native filtering and repeated stop retain no watch fds" {
     const io = std.testing.io;
     var fixture = try TestDirectory.init();
     defer fixture.deinit();
-    try fixture.dir.createDirPath(io, "nested/deep");
-    const Fds = struct {
-        extern "c" fn proc_pidinfo(c_int, c_int, u64, ?*anyopaque, c_int) c_int;
-        fn count() !usize {
-            var buffer: [1024]extern struct { fd: i32, kind: u32 } = undefined;
-            const bytes = proc_pidinfo(std.c.getpid(), 1, 0, &buffer, @sizeOf(@TypeOf(buffer)));
-            if (bytes <= 0 or bytes >= @sizeOf(@TypeOf(buffer))) return error.FdInventoryFailed;
-            return @as(usize, @intCast(bytes)) / @sizeOf(@TypeOf(buffer[0]));
-        }
-    };
-    var baseline: ?usize = null;
+    try fixture.dir.createDirPath(io, "watched/nested/deep");
+    const root = try fixture.dir.realPathFileAlloc(io, "watched", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    // WatchRoot may open its ancestors. The private parent and root have
+    // known owners; directories above the fixture are shared with other users.
+    const dirs = [_]TestDirectoryFd{ try .init(fixture.path), try .init(root) };
+    try std.testing.expect(try TestDirectoryFd.findExtra(&dirs, fixture.dir.handle) == null);
     for (0..9) |iteration| {
+        var hooks: TestHooks = .{};
         var live: TestWatch = .{};
-        try live.init(.{ .path = fixture.path, .recursive = false }, null);
-        defer live.input.deinit(std.testing.allocator);
-        defer {
-            live.backend.requestStop();
-            live.backend.join();
-        }
+        try live.init(.{ .path = root, .recursive = false }, &hooks);
+        defer live.deinit();
         try live.ready();
         if (iteration == 0) {
-            try fixture.dir.writeFile(io, .{ .sub_path = "nested/deep/file", .data = "outside nonrecursive scope" });
+            try fixture.dir.writeFile(io, .{ .sub_path = "watched/nested/deep/file", .data = "outside nonrecursive scope" });
             live.flush();
             try std.testing.expect(live.mailbox.take() == null);
-            try fixture.dir.writeFile(io, .{ .sub_path = "direct", .data = "selected" });
+            try fixture.dir.writeFile(io, .{ .sub_path = "watched/direct", .data = "selected" });
             _ = try live.changed();
         }
         live.backend.requestStop();
         live.backend.join();
-        // Measure against a warmed framework, not the cold process: dispatch
-        // and FSEvents may retain their own process-wide pools after first use.
-        if (baseline) |expected| try std.testing.expectEqual(expected, try Fds.count()) else baseline = try Fds.count();
+        try std.testing.expectEqual(@as([5]usize, @splat(1)), hooks.acquired);
+        try std.testing.expectEqual(hooks.acquired, hooks.released);
+
+        const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (try TestDirectoryFd.findExtra(&dirs, fixture.dir.handle)) |extra| {
+            if (std.Io.Clock.awake.now(io).compare(.gte, deadline)) {
+                std.debug.print("watch cycle {d}: vnode fd {d} still open for {s}\n", .{ iteration + 1, extra.fd, extra.path });
+                return error.WatchFdRetained;
+            }
+            try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+        }
     }
 }
