@@ -27,6 +27,14 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         mod.linkFramework("CoreServices", .{});
         mod.linkFramework("CoreFoundation", .{});
+        if (b.graph.host.result.os.tag == .macos and !target.query.isNative()) {
+            // Explicit macOS targets do not auto-detect the host SDK paths needed
+            // for Chasen's linked frameworks. The active Xcode SDK can change.
+            b.graph.poisonCache();
+            const sdk = std.mem.trimEnd(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n");
+            mod.addSystemFrameworkPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "System/Library/Frameworks" })));
+            mod.addLibraryPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/lib" })));
+        }
     }
 
     const runtime_mod = b.addModule("chasen_runtime", .{

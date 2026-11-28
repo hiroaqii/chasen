@@ -109,6 +109,18 @@ To compile the OSC 52 check for a macOS target without running it:
 zig build check-osc52-ownership -Dtarget=aarch64-macos
 ```
 
+On macOS hosts, explicit macOS targets (such as
+`-Dtarget=aarch64-macos.15.0 -Dcpu=baseline`) resolve the active macOS SDK
+framework and library paths via `xcrun --sdk macosx --show-sdk-path`
+automatically for executables and tests that directly import the `chasen`
+module, including downstream consumers. Consumers linking `chasen` indirectly
+through a static library (`linkLibrary`) still need SDK framework and library
+paths on the final linked artifact, because Zig does not propagate module
+search paths across static libraries. Native macOS builds
+(`target.query.isNative()`), non-macOS hosts, and `check-runtime-wasm` without
+an explicit macOS `-Dtarget` do not run this extra SDK lookup in Chasen's
+`build.zig` (Zig itself still performs native SDK detection on macOS).
+
 ## CI Coverage
 
 [CI configuration](../.github/workflows/ci.yml) runs independent jobs on
